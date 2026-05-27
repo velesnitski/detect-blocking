@@ -1,0 +1,22 @@
+# Local configuration — may contain real endpoint details
+detect_blocking.conf
+
+# Log files
+*.log
+*.log.[0-9]*
+
+# Temp / OS noise
+.DS_Store
+*.tmp
+*.swp
+*~
+/tmp/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.iml
+
+# Test artefacts
+tests/*.out
+tests/*.tmp

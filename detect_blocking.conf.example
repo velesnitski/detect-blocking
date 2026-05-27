@@ -1,0 +1,78 @@
+# detect_blocking.conf — copy to detect_blocking.conf and edit.
+# Sourced by detect_blocking.sh on startup. Override precedence:
+#   CLI arg > environment variable > this file > built-in default.
+#
+# The `${VAR:-value}` form keeps env-var overrides intact:
+#   FAKE_SNI=www.apple.com ./detect_blocking.sh   # env wins over file value
+#
+# To use a config file in another location:
+#   CONFIG_FILE=/path/to/my.conf ./detect_blocking.sh
+
+# ---------- target ----------
+
+# REPLACE with your real endpoint. The default is IANA's www.example.com —
+# a real, always-reachable host used as a demo so the script can be run with
+# no config and still produce a clean "no blocking signals" baseline.
+VPN_HOST="${VPN_HOST:-www.example.com}"
+VPN_PORT_TCP="${VPN_PORT_TCP:-443}"
+VPN_PORT_UDP="${VPN_PORT_UDP:-443}"
+
+# Separate hosts if your protocols live on different endpoints.
+# Falls back to VPN_HOST if unset.
+# IKEV2_HOST="${IKEV2_HOST:-ikev2.example.com}"
+# OPENVPN_HOST="${OPENVPN_HOST:-ovpn.example.com}"
+
+OPENVPN_PORT_UDP="${OPENVPN_PORT_UDP:-1194}"
+OPENVPN_PORT_TCP="${OPENVPN_PORT_TCP:-1194}"
+
+# ---------- reference points ----------
+
+# Sites that should ALWAYS be reachable — used to confirm the network is up
+# before blaming the VPN endpoint.
+BASELINE_DOMAIN="${BASELINE_DOMAIN:-cloudflare.com}"
+
+# Tried in order; baseline check passes if ANY responds. 1.1.1.1 itself is
+# blocked in some restrictive networks, so always keep at least one backup.
+BASELINE_IPS="${BASELINE_IPS:-1.1.1.1 8.8.8.8 9.9.9.9}"
+
+# Innocent SNI used to test SNI-based DPI. Pick something the censor would
+# never block (Microsoft, Apple, a local government site, etc).
+FAKE_SNI="${FAKE_SNI:-www.microsoft.com}"
+
+# Domains commonly blocked in restrictive networks — control set for
+# "is this a targeted block or a broad censorship environment?"
+# Space-separated list.
+CONTROL_SITES="${CONTROL_SITES:-www.protonvpn.com www.torproject.org www.discord.com}"
+
+# ---------- transport ----------
+
+# DoH endpoint used to bypass local DNS poisoning during the resolution test.
+DOH_URL="${DOH_URL:-https://1.1.1.1/dns-query}"
+
+# Per-probe timeout (seconds). Increase on flaky / high-latency networks.
+TIMEOUT="${TIMEOUT:-5}"
+
+# ---------- verdict tuning ----------
+
+# OpenVPN handshake silence is ambiguous: it could be DPI signature-block,
+# but it could also be tls-auth / tls-crypt, an HMAC firewall on the server,
+# or simply a non-OpenVPN service on that port.
+#
+# Default (0): silence reported as WARN, no verdict emitted.
+# Set to 1 only when you're certain the target is plain OpenVPN — then
+# silence becomes a hard "OpenVPN handshake silently dropped" verdict.
+STRICT_OPENVPN_VERDICT="${STRICT_OPENVPN_VERDICT:-0}"
+
+# ---------- logging ----------
+
+# Optional log file. If set, every emitted line is recorded with timestamp
+# and level. ANSI color codes are stripped. File rotates at 10MB → .1
+# (single backup).
+#
+# Example: LOG_FILE="$HOME/.local/share/detect_blocking/run.log"
+LOG_FILE="${LOG_FILE:-}"
+
+# Suppress all stdout (useful for cron). Logging to LOG_FILE still works.
+#   0 = normal output
+#   1 = silent
+LOG_QUIET="${LOG_QUIET:-0}"

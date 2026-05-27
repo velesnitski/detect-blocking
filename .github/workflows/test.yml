@@ -1,0 +1,55 @@
+name: test
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run shellcheck
+        uses: ludeeus/action-shellcheck@master
+        env:
+          SHELLCHECK_OPTS: -S warning
+        with:
+          ignore_paths: tests
+
+  syntax-and-smoke:
+    name: syntax + smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Print tool versions
+        run: |
+          bash --version | head -n 1
+          openssl version
+          curl --version | head -n 1
+
+      - name: Syntax check
+        run: bash -n detect_blocking.sh
+
+      - name: Help / version flags
+        run: |
+          bash detect_blocking.sh --version
+          bash detect_blocking.sh --help
+
+      - name: Smoke test against demo target
+        run: bash tests/test_smoke.sh
+        timeout-minutes: 2
+
+      - name: DoH-compromise simulation
+        run: bash tests/test_doh_compromise.sh
+        timeout-minutes: 2

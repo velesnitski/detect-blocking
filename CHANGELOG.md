@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`--json` output mode** for monitoring / alerting integration. Emits a
+  versioned JSON document with the full probe state (DNS sets, TLS results,
+  RST timing, UA codes, verdicts, etc.) and suppresses human-readable
+  stdout. Requires `jq`. `schema_version: 1`. New test `tests/test_json.sh`
+  validates schema sanity in CI.
 - **`--only` / `--skip` probe-selection flags** for fast re-runs of a single
   layer or skipping known-irrelevant probes. Probe names: `env`, `dns`, `tcp`,
   `tls`, `ua`, `rst`, `udp`, `openvpn`, `control`.

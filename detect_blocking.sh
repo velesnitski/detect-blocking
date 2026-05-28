@@ -82,6 +82,7 @@ LOG_FILE="${LOG_FILE:-}"
 LOG_QUIET="${LOG_QUIET:-0}"
 ONLY_PROBES="${ONLY_PROBES:-}"
 SKIP_PROBES="${SKIP_PROBES:-}"
+JSON_MODE="${JSON_MODE:-0}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -92,6 +93,7 @@ while [ $# -gt 0 ]; do
     --skip)       SKIP_PROBES="${2:-}"; shift 2 ;;
     --skip=*)     SKIP_PROBES="${1#--skip=}"; shift ;;
     --quiet|-q)   LOG_QUIET=1; shift ;;
+    --json)       JSON_MODE=1; LOG_QUIET=1; shift ;;
     --version|-V)
       printf 'detect_blocking %s\n' "$DETECT_BLOCKING_VERSION"
       exit 0
@@ -100,12 +102,17 @@ while [ $# -gt 0 ]; do
       sed -n '2,27p' "$0"
       printf '\nversion: %s\n' "$DETECT_BLOCKING_VERSION"
       printf '\nProbe names (for --only / --skip): env, dns, tcp, tls, ua, rst, udp, openvpn, control\n'
+      printf '\nFlags: --json (requires jq), --quiet/-q, --log-file PATH, --only LIST, --skip LIST\n'
       exit 0
       ;;
     -*) die "unknown option: $1" ;;
     *)  VPN_HOST="${1}"; shift ;;
   esac
 done
+
+if [ "$JSON_MODE" = "1" ]; then
+  check_cmd jq || die "--json requires jq (install: brew install jq / apt-get install jq)"
+fi
 
 # Probe gate: --only takes precedence over --skip; comma-separated lists.
 _should_run() {
@@ -160,6 +167,35 @@ DOT_INTEGRITY_STATE=""   # one of: "", ok, unreachable, compromised, skipped
 DOT_INTEGRITY_IPS=""     # what DoT returned for the canary query
 RST_TMP_OUT=""           # probe-5 temp files; cleaned by EXIT trap on interrupt
 RST_TMP_TIME=""
+
+# Structured probe results captured for --json output.
+# Each var is initialised so set -u doesn't fire when a probe is skipped.
+ENV_DEFAULT_IF=""
+ENV_VPN_IFACES=""
+ENV_CONNECTED_VPN=""
+ENV_ON_VPN=0
+DNS_SYS_IPS=""
+DNS_DOH_IPS=""
+TCP_BASELINE_OK=0
+TCP_BASELINE_IP=""
+TLS_PROPER_SNI_OK=0
+TLS_NO_SNI_OK=0
+TLS_FAKE_SNI_OK=0
+TLS_FRAG_SNI_OK=-1       # -1 = not tested (proper-SNI worked, no need to probe fragmentation)
+UA_DEFAULT_CODE=""
+UA_CHROME_CODE=""
+UA_IMPERSONATE_CODE=""
+UA_IMPERSONATE_BIN=""
+RST_ELAPSED=""
+RST_HS_OK=0
+RST_RC=0
+UDP_IKE500_OK=0
+UDP_IKE4500_OK=0
+UDP_QUIC_CODE=""
+OPENVPN_HANDSHAKE=""     # raw 2-hex-byte response or empty
+CONTROL_PASS=0
+CONTROL_TOTAL=0
+CONTROL_BLOCKED=""
 
 # ---------- colors (TTY-aware, suppressed when --quiet) ----------
 
@@ -384,7 +420,7 @@ _ike_probe() {
 probe_environment() {
   hdr "0. Environment"
 
-  local default_if="" vpn_ifaces="" connected_vpn=""
+  local default_if="" vpn_ifaces="" connected_vpn="" on_vpn=0
 
   if [[ "$OSTYPE" == darwin* ]]; then
     default_if=$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')
@@ -409,7 +445,6 @@ probe_environment() {
   info "VPN-like interfaces:     ${vpn_ifaces:-<none>}"
   [ -n "$connected_vpn" ] && info "system VPN services:     $connected_vpn"
 
-  local on_vpn=0
   case "$default_if" in
     utun*|ppp*|ipsec*|tun*|tap*|wg*) on_vpn=1 ;;
   esac
@@ -422,6 +457,11 @@ probe_environment() {
   else
     ok "no active VPN signal detected"
   fi
+
+  ENV_DEFAULT_IF="$default_if"
+  ENV_VPN_IFACES="$vpn_ifaces"
+  ENV_CONNECTED_VPN="$connected_vpn"
+  ENV_ON_VPN="$on_vpn"
 }
 
 probe_dns() {
@@ -475,6 +515,9 @@ probe_dns() {
   info "system resolver A: ${sys_ips:-<empty>}"
   info "DoH resolver A:    ${doh_ips:-<empty>}"
 
+  DNS_SYS_IPS="$sys_ips"
+  DNS_DOH_IPS="$doh_ips"
+
   if [ -z "$sys_ips" ] && [ -n "$doh_ips" ]; then
     fail "system resolver returns no A records, but DoH works"
     add_verdict "System DNS failure while DoH works"
@@ -516,6 +559,8 @@ probe_tcp_reachability() {
       baseline_ok=1; ok_ip=$ip; break
     fi
   done
+  TCP_BASELINE_OK="$baseline_ok"
+  TCP_BASELINE_IP="$ok_ip"
   if [ "$baseline_ok" -eq 1 ]; then
     ok "baseline TCP $ok_ip:443 reachable (network is up)"
   else
@@ -566,6 +611,10 @@ probe_tls_handshake() {
   info "TLS without SNI:                   $([ "$no_sni" -gt 0 ] && echo OK || echo FAIL)"
   info "TLS with innocent SNI ($FAKE_SNI): $([ "$fake_sni" -gt 0 ] && echo OK || echo FAIL)"
 
+  TLS_PROPER_SNI_OK=$([ "$with_sni" -gt 0 ] && echo 1 || echo 0)
+  TLS_NO_SNI_OK=$([ "$no_sni" -gt 0 ] && echo 1 || echo 0)
+  TLS_FAKE_SNI_OK=$([ "$fake_sni" -gt 0 ] && echo 1 || echo 0)
+
   # If proper-SNI handshake failed, probe TLS-record fragmentation as a
   # bypass test. `-max_send_frag 64` splits the ClientHello across many
   # tiny TLS records — DPIs that don't reassemble records can be evaded.
@@ -575,6 +624,7 @@ probe_tls_handshake() {
       -servername "$VPN_HOST" -brief -max_send_frag 64 2>&1 \
       | grep -cE 'Protocol version|Verification' || true)
     info "TLS with 64-byte record fragments: $([ "$frag_sni" -gt 0 ] && echo OK || echo FAIL)"
+    TLS_FRAG_SNI_OK=$([ "$frag_sni" -gt 0 ] && echo 1 || echo 0)
   fi
 
   if [ "$with_sni" -eq 0 ] && [ "$frag_sni" -gt 0 ]; then
@@ -623,6 +673,9 @@ probe_request_filter() {
   info "curl default UA:    HTTP $curl_default"
   info "Chrome-like UA:     HTTP $curl_chrome"
 
+  UA_DEFAULT_CODE="$curl_default"
+  UA_CHROME_CODE="$curl_chrome"
+
   # Optional 3rd probe: real JA3 via curl-impersonate. Mimics full Chrome
   # ClientHello (ciphers, extensions, curve order, signature algorithms).
   if impersonate_cmd=$(_find_curl_impersonate); then
@@ -631,6 +684,8 @@ probe_request_filter() {
       -o /dev/null -w '%{http_code}' "$target_url" 2>/dev/null)
     [ -n "$curl_impersonate" ] || curl_impersonate="000"
     info "Impersonate Chrome: HTTP $curl_impersonate  ($impersonate_cmd)"
+    UA_IMPERSONATE_CODE="$curl_impersonate"
+    UA_IMPERSONATE_BIN="$impersonate_cmd"
   else
     info "Impersonate Chrome: skipped (no curl-impersonate-chrome installed)"
   fi
@@ -681,6 +736,10 @@ probe_rst_injection() {
   rm -f "$RST_TMP_OUT" "$RST_TMP_TIME"
   RST_TMP_OUT="" RST_TMP_TIME=""
 
+  RST_ELAPSED="$elapsed"
+  RST_HS_OK="$hs_ok"
+  RST_RC="$rc"
+
   info "TLS attempt took ${elapsed}s (rc=$rc, handshake=$([ "$hs_ok" -eq 1 ] && echo OK || echo FAIL))"
 
   if [ "$hs_ok" -eq 1 ]; then
@@ -701,12 +760,14 @@ probe_udp_protocols() {
 
   if _ike_probe "$IKEV2_HOST" 500; then
     ok "UDP 500 (IKEv2) replies to IKE_SA_INIT – service alive"
+    UDP_IKE500_OK=1
   else
     info "UDP 500 (IKEv2) silent – DPI block, no service, or no perl available"
   fi
 
   if _ike_probe "$IKEV2_HOST" 4500; then
     ok "UDP 4500 (IPsec NAT-T) replies to IKE_SA_INIT – service alive"
+    UDP_IKE4500_OK=1
   else
     info "UDP 4500 silent – DPI block, no service, or no perl available"
   fi
@@ -716,6 +777,7 @@ probe_udp_protocols() {
     quic_code=$(curl -sk --max-time "$TIMEOUT" --http3 \
       -o /dev/null -w '%{http_code}' \
       "https://$BASELINE_DOMAIN/" 2>/dev/null || echo "000")
+    UDP_QUIC_CODE="$quic_code"
     if [ "$quic_code" != "000" ]; then
       ok "UDP 443 (QUIC/HTTP3) to baseline works"
     else
@@ -758,6 +820,7 @@ probe_openvpn() {
       print chr(int(rand(256))) for 1..8;        # random session id
     ' 2>/dev/null | nc -u -w "$TIMEOUT" "$OPENVPN_HOST" "$OPENVPN_PORT_UDP" 2>/dev/null \
       | xxd -p | head -c 4)
+    OPENVPN_HANDSHAKE="$response"
     if [ -n "$response" ]; then
       if [ "${response:0:2}" = "40" ]; then
         ok "OpenVPN handshake replied (server opcode 0x40 received)"
@@ -800,6 +863,10 @@ probe_known_blocked() {
   done
   info "$control_pass/$control_total known-sensitive domains reachable"
 
+  CONTROL_PASS="$control_pass"
+  CONTROL_TOTAL="$control_total"
+  CONTROL_BLOCKED="$(printf '%s' "$blocked_list" | sed 's/^[[:space:]]*//')"
+
   if [ "$control_pass" -eq 0 ]; then
     warn "no sensitive domains reachable → broad censorship environment"
     add_verdict "Broad censorship – none of the control sites reachable"
@@ -811,6 +878,125 @@ probe_known_blocked() {
   fi
 }
 
+# ---------- JSON emitter (--json mode) ----------
+
+_emit_json() {
+  local verdicts_json="[]"
+  if [ "${#VERDICTS[@]}" -gt 0 ]; then
+    verdicts_json=$(printf '%s\n' "${VERDICTS[@]}" | jq -R . | jq -sc .)
+  fi
+
+  jq -n \
+    --arg version           "$DETECT_BLOCKING_VERSION" \
+    --arg host              "$VPN_HOST" \
+    --argjson port_tcp      "$VPN_PORT_TCP" \
+    --argjson port_udp      "$VPN_PORT_UDP" \
+    --arg resolved_ip       "$RESOLVED_IP" \
+    --arg resolved_source   "$RESOLVED_SOURCE" \
+    --arg env_default_if    "$ENV_DEFAULT_IF" \
+    --arg env_vpn_ifs       "$ENV_VPN_IFACES" \
+    --arg env_connected     "$ENV_CONNECTED_VPN" \
+    --argjson env_on_vpn    "${ENV_ON_VPN:-0}" \
+    --arg dns_sys_ips       "$DNS_SYS_IPS" \
+    --arg dns_doh_ips       "$DNS_DOH_IPS" \
+    --arg doh_state         "$DOH_INTEGRITY_STATE" \
+    --arg doh_ips           "$DOH_INTEGRITY_IPS" \
+    --arg dot_state         "$DOT_INTEGRITY_STATE" \
+    --arg dot_ips           "$DOT_INTEGRITY_IPS" \
+    --argjson tcp_baseline  "${TCP_BASELINE_OK:-0}" \
+    --arg tcp_baseline_ip   "$TCP_BASELINE_IP" \
+    --argjson tcp_target    "${TCP_OK:-0}" \
+    --argjson tls_proper    "${TLS_PROPER_SNI_OK:-0}" \
+    --argjson tls_no_sni    "${TLS_NO_SNI_OK:-0}" \
+    --argjson tls_fake      "${TLS_FAKE_SNI_OK:-0}" \
+    --argjson tls_frag      "${TLS_FRAG_SNI_OK:--1}" \
+    --arg ua_default        "$UA_DEFAULT_CODE" \
+    --arg ua_chrome         "$UA_CHROME_CODE" \
+    --arg ua_impersonate    "$UA_IMPERSONATE_CODE" \
+    --arg ua_impersonate_bin "$UA_IMPERSONATE_BIN" \
+    --arg rst_elapsed       "$RST_ELAPSED" \
+    --argjson rst_hs        "${RST_HS_OK:-0}" \
+    --argjson rst_rc        "${RST_RC:-0}" \
+    --argjson udp_ike500    "${UDP_IKE500_OK:-0}" \
+    --argjson udp_ike4500   "${UDP_IKE4500_OK:-0}" \
+    --arg udp_quic          "$UDP_QUIC_CODE" \
+    --argjson openvpn_udp   "${OPENVPN_UDP_OK:-0}" \
+    --argjson openvpn_tcp   "${OPENVPN_TCP_OK:-0}" \
+    --arg openvpn_hs        "$OPENVPN_HANDSHAKE" \
+    --argjson ctrl_pass     "${CONTROL_PASS:-0}" \
+    --argjson ctrl_total    "${CONTROL_TOTAL:-0}" \
+    --arg ctrl_blocked      "$CONTROL_BLOCKED" \
+    --argjson verdicts      "$verdicts_json" '
+    def words: split(" ") | map(select(length > 0));
+    def opt(s): if s == "" then null else s end;
+    def bool_int(n): n == 1;
+    def tri_bool(n): if n < 0 then null else n == 1 end;
+    {
+      schema_version: 1,
+      version: $version,
+      timestamp: (now | todate),
+      target: {
+        host: $host,
+        port_tcp: $port_tcp,
+        port_udp: $port_udp,
+        resolved_ip: opt($resolved_ip),
+        resolved_source: opt($resolved_source)
+      },
+      environment: {
+        default_interface: opt($env_default_if),
+        vpn_like_interfaces: ($env_vpn_ifs | words),
+        system_vpn_services: opt($env_connected),
+        on_vpn: bool_int($env_on_vpn)
+      },
+      probes: {
+        dns: {
+          system_a: ($dns_sys_ips | words),
+          doh_a: ($dns_doh_ips | words),
+          doh_integrity: {state: opt($doh_state), returned: ($doh_ips | words)},
+          dot_integrity: {state: opt($dot_state), returned: ($dot_ips | words)}
+        },
+        tcp: {
+          baseline_reachable: bool_int($tcp_baseline),
+          baseline_ip: opt($tcp_baseline_ip),
+          target_reachable: bool_int($tcp_target)
+        },
+        tls: {
+          proper_sni_ok: bool_int($tls_proper),
+          no_sni_ok: bool_int($tls_no_sni),
+          fake_sni_ok: bool_int($tls_fake),
+          fragmented_ok: tri_bool($tls_frag)
+        },
+        request_filter: {
+          default_ua_code: opt($ua_default),
+          chrome_ua_code: opt($ua_chrome),
+          impersonate_code: opt($ua_impersonate),
+          impersonate_binary: opt($ua_impersonate_bin)
+        },
+        rst: {
+          elapsed_seconds: (if $rst_elapsed == "" then null else ($rst_elapsed | tonumber? // null) end),
+          handshake_ok: bool_int($rst_hs),
+          openssl_exit_code: $rst_rc
+        },
+        udp: {
+          ike500_responsive: bool_int($udp_ike500),
+          ike4500_responsive: bool_int($udp_ike4500),
+          quic_baseline_code: opt($udp_quic)
+        },
+        openvpn: {
+          udp_port_accessible: bool_int($openvpn_udp),
+          tcp_port_reachable: bool_int($openvpn_tcp),
+          handshake_response_hex: opt($openvpn_hs)
+        },
+        control: {
+          passed: $ctrl_pass,
+          total: $ctrl_total,
+          unreachable: ($ctrl_blocked | words)
+        }
+      },
+      verdicts: $verdicts
+    }'
+}
+
 # ---------- main ----------
 
 _init_log
@@ -818,18 +1004,20 @@ _init_log
 # Clean up probe-5 temp files even if the run is interrupted (Ctrl-C) mid-probe.
 trap 'rm -f "$RST_TMP_OUT" "$RST_TMP_TIME" 2>/dev/null' EXIT
 
-printf '%s\n' "${BLU}VPN-blocking diagnostic for ${VPN_HOST}${RST}"
-printf '%s\n' "${DIM}Run from $(hostname) on $(date)${RST}"
+if [ "$LOG_QUIET" != "1" ]; then
+  printf '%s\n' "${BLU}VPN-blocking diagnostic for ${VPN_HOST}${RST}"
+  printf '%s\n' "${DIM}Run from $(hostname) on $(date)${RST}"
 
-# Nudge users running with the demo default — the script will probe IANA's
-# www.example.com (a real but VPN-unrelated host), which is fine for a smoke
-# test but not what they probably want.
-if [ "$VPN_HOST" = "www.example.com" ]; then
-  printf '\n%s\n' "${YEL}Note:${RST} VPN_HOST is the demo default (IANA www.example.com)."
-  printf '%s\n' "  Set your real endpoint:"
-  printf '%s\n' "    ./detect_blocking.sh my-host.com              (CLI)"
-  printf '%s\n' "    VPN_HOST=my-host.com ./detect_blocking.sh     (env)"
-  printf '%s\n' "    edit detect_blocking.conf                     (persistent)"
+  # Nudge users running with the demo default — the script will probe IANA's
+  # www.example.com (a real but VPN-unrelated host), which is fine for a smoke
+  # test but not what they probably want.
+  if [ "$VPN_HOST" = "www.example.com" ]; then
+    printf '\n%s\n' "${YEL}Note:${RST} VPN_HOST is the demo default (IANA www.example.com)."
+    printf '%s\n' "  Set your real endpoint:"
+    printf '%s\n' "    ./detect_blocking.sh my-host.com              (CLI)"
+    printf '%s\n' "    VPN_HOST=my-host.com ./detect_blocking.sh     (env)"
+    printf '%s\n' "    edit detect_blocking.conf                     (persistent)"
+  fi
 fi
 
 # UX hint from feedback #1: surface missing optional deps once, on startup.
@@ -849,6 +1037,12 @@ _should_run openvpn && probe_openvpn
 _should_run control && probe_known_blocked
 
 # ---------- summary ----------
+
+if [ "$JSON_MODE" = "1" ]; then
+  _emit_json
+  _log_line DONE "$VPN_HOST"
+  exit 0
+fi
 
 hdr "VERDICT"
 if [ "${#VERDICTS[@]}" -eq 0 ]; then

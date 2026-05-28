@@ -132,10 +132,33 @@ Options:
   -V, --version           Print version and exit.
   -q, --quiet             Suppress stdout (logging to file still works).
       --log-file PATH     Append timestamped entries to PATH. Rotates at 10 MB.
+      --only LIST         Run only the listed probes (comma-separated).
+      --skip LIST         Skip the listed probes (comma-separated).
+      --json              Emit machine-readable JSON; implies --quiet. Requires jq.
+
+Probe names: env, dns, tcp, tls, ua, rst, udp, openvpn, control
 
 Override precedence:
   CLI arg > environment variable > detect_blocking.conf > built-in default
 ```
+
+### JSON output
+
+`--json` produces a single JSON document on stdout, schema-versioned for
+forward compatibility. Convenient for monitoring stacks:
+
+```sh
+./detect_blocking.sh --json vpn.example.org | jq '.verdicts'
+./detect_blocking.sh --json vpn.example.org | jq '.probes.dns.doh_integrity'
+
+# Emit a Prometheus-style counter
+./detect_blocking.sh --json vpn.example.org \
+  | jq -r '"vpn_blocking_verdicts \(.verdicts | length)"'
+```
+
+Top-level keys: `schema_version`, `version`, `timestamp` (ISO-8601 UTC),
+`target`, `environment`, `probes` (`dns`/`tcp`/`tls`/`request_filter`/`rst`/
+`udp`/`openvpn`/`control`), and `verdicts`.
 
 ### Environment variables
 

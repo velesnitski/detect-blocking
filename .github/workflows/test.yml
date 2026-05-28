@@ -53,3 +53,20 @@ jobs:
       - name: DoH-compromise simulation
         run: bash tests/test_doh_compromise.sh
         timeout-minutes: 2
+
+      - name: JSON output schema
+        run: |
+          # Ensure jq is available (preinstalled on GitHub runners; this is a guard).
+          command -v jq || { sudo apt-get update && sudo apt-get install -y jq || brew install jq; }
+          bash tests/test_json.sh
+        timeout-minutes: 2
+
+      - name: --only / --skip flag wiring
+        run: |
+          # Sanity: --only dns,tcp must print only those two probe headers.
+          out=$(bash detect_blocking.sh --only dns,tcp www.example.com 2>&1)
+          echo "$out" | grep -q "1. DNS resolution" || { echo "FAIL: DNS missing"; exit 1; }
+          echo "$out" | grep -q "2. TCP reachability" || { echo "FAIL: TCP missing"; exit 1; }
+          echo "$out" | grep -q "3. TLS handshake" && { echo "FAIL: TLS should be skipped"; exit 1; }
+          echo "PASS: --only flag respected"
+        timeout-minutes: 2

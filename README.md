@@ -30,6 +30,7 @@ endpoint and emits a clearly labelled verdict for each detected blocking type.
 | 6 | UDP protocols | IKEv2 (valid IKE\_SA\_INIT probe) + QUIC/HTTP3 over UDP 443 |
 | 7 | OpenVPN handshake | Random-SID `0x38` initiator, expects `0x40` server reset |
 | 8 | Control sites | Broad vs targeted censorship (Tor/Proton/Discord reachability) |
+| 9 | IPv6 reachability | AAAA resolution + IPv6 TCP/HTTPS; detects "IPv4-only block" cases |
 
 The verdict ends with a list of detected blocks plus an actionable
 recommendation for each (rotate IP, switch to Reality, use uTLS, etc).
@@ -134,9 +135,11 @@ Options:
       --log-file PATH     Append timestamped entries to PATH. Rotates at 10 MB.
       --only LIST         Run only the listed probes (comma-separated).
       --skip LIST         Skip the listed probes (comma-separated).
+      --watch SECONDS     Repeat probe every SECONDS until interrupted.
+      --from-file PATH    Iterate over hosts in file (one per line, # comments).
       --json              Emit machine-readable JSON; implies --quiet. Requires jq.
 
-Probe names: env, dns, tcp, tls, ua, rst, udp, openvpn, control
+Probe names: env, dns, tcp, tls, ua, rst, udp, openvpn, control, ipv6
 
 Override precedence:
   CLI arg > environment variable > detect_blocking.conf > built-in default
@@ -228,6 +231,33 @@ if [ -n "$verdicts" ]; then
     printf '%s\n' "$verdicts"
     # Forward to Prometheus/Pushgateway, Slack, PagerDuty, etc.
 fi
+```
+
+### Batch-check a fleet (ndjson to disk)
+
+```sh
+cat servers.txt
+# de1.example.com
+# us-east-1.example.com
+# fra-2.example.com:8443
+
+./detect_blocking.sh --from-file servers.txt --json --only dns,tcp,tls \
+  > fleet-$(date +%F).ndjson
+
+# Aggregate verdicts across all hosts:
+jq -s 'map({host: .target.host, verdicts: .verdicts})' fleet-*.ndjson
+```
+
+### Continuous monitoring with `--watch`
+
+```sh
+# Probe every 60s, alert on transition
+./detect_blocking.sh --watch 60 --json vpn.example.org \
+  | while read -r line; do
+      verdict_count=$(printf '%s' "$line" | jq '.verdicts | length')
+      [ "$verdict_count" -gt 0 ] \
+        && curl -X POST https://hooks.slack.com/... -d "$line"
+    done
 ```
 
 ---

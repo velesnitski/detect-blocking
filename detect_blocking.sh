@@ -30,6 +30,12 @@ set -u
 
 readonly DETECT_BLOCKING_VERSION="0.1.0"
 
+# Capture original CLI invocation before parsing — needed so --watch and
+# --from-file can re-invoke ourselves with the same flags minus the looping
+# flag (set via _WATCH_CHILD / _BATCH_CHILD to break recursion).
+# shellcheck disable=SC2034
+_ORIGINAL_ARGS=("$@")
+
 # ---------- early helpers ----------
 
 die()       { printf 'Error: %s\n' "$1" >&2; exit 2; }
@@ -83,17 +89,23 @@ LOG_QUIET="${LOG_QUIET:-0}"
 ONLY_PROBES="${ONLY_PROBES:-}"
 SKIP_PROBES="${SKIP_PROBES:-}"
 JSON_MODE="${JSON_MODE:-0}"
+WATCH_INTERVAL="${WATCH_INTERVAL:-}"
+BATCH_FILE="${BATCH_FILE:-}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --log-file)   LOG_FILE="${2:-}"; shift 2 ;;
-    --log-file=*) LOG_FILE="${1#--log-file=}"; shift ;;
-    --only)       ONLY_PROBES="${2:-}"; shift 2 ;;
-    --only=*)     ONLY_PROBES="${1#--only=}"; shift ;;
-    --skip)       SKIP_PROBES="${2:-}"; shift 2 ;;
-    --skip=*)     SKIP_PROBES="${1#--skip=}"; shift ;;
-    --quiet|-q)   LOG_QUIET=1; shift ;;
-    --json)       JSON_MODE=1; LOG_QUIET=1; shift ;;
+    --log-file)    LOG_FILE="${2:-}"; shift 2 ;;
+    --log-file=*)  LOG_FILE="${1#--log-file=}"; shift ;;
+    --only)        ONLY_PROBES="${2:-}"; shift 2 ;;
+    --only=*)      ONLY_PROBES="${1#--only=}"; shift ;;
+    --skip)        SKIP_PROBES="${2:-}"; shift 2 ;;
+    --skip=*)      SKIP_PROBES="${1#--skip=}"; shift ;;
+    --watch)       WATCH_INTERVAL="${2:-}"; shift 2 ;;
+    --watch=*)     WATCH_INTERVAL="${1#--watch=}"; shift ;;
+    --from-file)   BATCH_FILE="${2:-}"; shift 2 ;;
+    --from-file=*) BATCH_FILE="${1#--from-file=}"; shift ;;
+    --quiet|-q)    LOG_QUIET=1; shift ;;
+    --json)        JSON_MODE=1; LOG_QUIET=1; shift ;;
     --version|-V)
       printf 'detect_blocking %s\n' "$DETECT_BLOCKING_VERSION"
       exit 0
@@ -101,8 +113,15 @@ while [ $# -gt 0 ]; do
     --help|-h)
       sed -n '2,27p' "$0"
       printf '\nversion: %s\n' "$DETECT_BLOCKING_VERSION"
-      printf '\nProbe names (for --only / --skip): env, dns, tcp, tls, ua, rst, udp, openvpn, control\n'
-      printf '\nFlags: --json (requires jq), --quiet/-q, --log-file PATH, --only LIST, --skip LIST\n'
+      printf '\nProbe names (for --only / --skip): env, dns, tcp, tls, ua, rst, udp, openvpn, control, ipv6\n'
+      printf '\nFlags:\n'
+      printf '  --json (needs jq)   machine-readable JSON output (compact in batch/watch loops)\n'
+      printf '  --quiet, -q         suppress stdout (logging still works)\n'
+      printf '  --log-file PATH     append timestamped entries to PATH\n'
+      printf '  --only LIST         run only listed probes (comma-separated)\n'
+      printf '  --skip LIST         skip listed probes\n'
+      printf '  --watch SECONDS     repeat probe every SECONDS, until interrupted\n'
+      printf '  --from-file PATH    iterate over hosts in file (one per line, # comments)\n'
       exit 0
       ;;
     -*) die "unknown option: $1" ;;
@@ -112,6 +131,73 @@ done
 
 if [ "$JSON_MODE" = "1" ]; then
   check_cmd jq || die "--json requires jq (install: brew install jq / apt-get install jq)"
+fi
+
+# Filter --watch / --from-file out of $_ORIGINAL_ARGS for child invocations.
+# Used by batch & watch loop drivers to avoid recursing into themselves.
+_args_without_loop_flags() {
+  local skip_next=0 a
+  for a in "${_ORIGINAL_ARGS[@]:-}"; do
+    if [ "$skip_next" = "1" ]; then skip_next=0; continue; fi
+    case "$a" in
+      --watch|--from-file) skip_next=1 ;;
+      --watch=*|--from-file=*) : ;;
+      *) printf '%s\n' "$a" ;;
+    esac
+  done
+}
+
+# ---------- batch driver: --from-file FILE ----------
+# Iterates over host lines, invokes ourselves once per host. Set _BATCH_CHILD=1
+# in env so the child doesn't recurse. JSON-mode output is compacted to one
+# line per host (ndjson) for stream-processing.
+if [ -n "$BATCH_FILE" ] && [ "${_BATCH_CHILD:-0}" != "1" ]; then
+  [ -r "$BATCH_FILE" ] || die "--from-file: cannot read $BATCH_FILE"
+
+  # Cache filtered args once (array form, NUL-safe via newline split).
+  _batch_args=()
+  while IFS= read -r _ba; do
+    _batch_args+=("$_ba")
+  done < <(_args_without_loop_flags)
+
+  _batch_rc=0
+  while IFS= read -r _bh || [ -n "$_bh" ]; do
+    case "$_bh" in ''|\#*) continue ;; esac
+    if [ "$JSON_MODE" = "1" ]; then
+      _BATCH_CHILD=1 bash "$0" "${_batch_args[@]:-}" "$_bh" | jq -c .
+    else
+      _BATCH_CHILD=1 bash "$0" "${_batch_args[@]:-}" "$_bh"
+    fi
+    rc=$?
+    [ "$rc" -ne 0 ] && _batch_rc=$rc
+  done < "$BATCH_FILE"
+  exit "$_batch_rc"
+fi
+
+# ---------- watch driver: --watch SECONDS ----------
+# Re-invokes ourselves on a fixed cadence until SIGINT/SIGTERM. Same recursion
+# guard as batch via _WATCH_CHILD=1.
+if [ -n "$WATCH_INTERVAL" ] && [ "${_WATCH_CHILD:-0}" != "1" ]; then
+  case "$WATCH_INTERVAL" in
+    ''|*[!0-9]*) die "--watch: SECONDS must be a positive integer" ;;
+  esac
+  [ "$WATCH_INTERVAL" -gt 0 ] || die "--watch: SECONDS must be >0"
+
+  _watch_args=()
+  while IFS= read -r _wa; do
+    _watch_args+=("$_wa")
+  done < <(_args_without_loop_flags)
+
+  trap 'exit 0' INT TERM
+  while true; do
+    if [ "$JSON_MODE" = "1" ]; then
+      _WATCH_CHILD=1 bash "$0" "${_watch_args[@]:-}" | jq -c .
+    else
+      _WATCH_CHILD=1 bash "$0" "${_watch_args[@]:-}"
+      printf '\n--- next run in %ss (Ctrl-C to stop) ---\n' "$WATCH_INTERVAL"
+    fi
+    sleep "$WATCH_INTERVAL"
+  done
 fi
 
 # Probe gate: --only takes precedence over --skip; comma-separated lists.
@@ -196,6 +282,9 @@ OPENVPN_HANDSHAKE=""     # raw 2-hex-byte response or empty
 CONTROL_PASS=0
 CONTROL_TOTAL=0
 CONTROL_BLOCKED=""
+IPV6_AAAA=""
+IPV6_TARGET_OK=0
+IPV6_HTTPS_CODE=""
 
 # ---------- colors (TTY-aware, suppressed when --quiet) ----------
 
@@ -306,6 +395,28 @@ _resolve_a_records() {
   fi
 }
 
+# Loose IPv6 line filter — accepts canonical, compressed (::), and embedded
+# IPv4 forms. We only need format-validity, not RFC-precise parsing.
+_ipv6_lines() {
+  awk '/:/ && !/^[[:space:]]*$/ {
+    # crude validity: must contain at least one ":", no spaces, no commas
+    if ($0 ~ /[[:space:],]/) next
+    print
+  }' | sort -u
+}
+
+_resolve_aaaa_records() {
+  local host="$1"
+  if check_cmd dig; then
+    dig +short +time="$TIMEOUT" +tries=1 "$host" AAAA 2>/dev/null | _ipv6_lines
+  elif check_cmd host; then
+    host -t AAAA "$host" 2>/dev/null | awk '/has IPv6 address/{print $5}' | _ipv6_lines
+  elif check_cmd nslookup; then
+    nslookup -type=AAAA "$host" 2>/dev/null \
+      | awk '/^Name:/{found=1} found && /^Address:/{print $2}' | _ipv6_lines
+  fi
+}
+
 # Platform-aware TCP connect probe. macOS nc honours `-G` (connect timeout)
 # but silently ignores `-w` for SYN-without-response — it waits the full
 # Darwin SYN_RETRANSMIT (~75s). Linux nc (openbsd/ncat) uses `-w` for both.
@@ -315,6 +426,16 @@ _nc_tcp_probe() {
     nc -z -G "$TIMEOUT" "$host" "$port" 2>/dev/null
   else
     nc -z -w "$TIMEOUT" "$host" "$port" 2>/dev/null
+  fi
+}
+
+# IPv6 TCP probe — same -G/-w split as IPv4, with -6 forced.
+_nc6_tcp_probe() {
+  local host="$1" port="$2"
+  if [[ "$OSTYPE" == darwin* ]]; then
+    nc -6 -z -G "$TIMEOUT" "$host" "$port" 2>/dev/null
+  else
+    nc -6 -z -w "$TIMEOUT" "$host" "$port" 2>/dev/null
   fi
 }
 
@@ -878,6 +999,57 @@ probe_known_blocked() {
   fi
 }
 
+probe_ipv6() {
+  hdr "9. IPv6 reachability"
+
+  local aaaa first_v6 https_code
+  aaaa=$(_resolve_aaaa_records "$VPN_HOST" | _join_words)
+  IPV6_AAAA="$aaaa"
+
+  if [ -z "$aaaa" ]; then
+    info "no AAAA records for $VPN_HOST – host is IPv4-only"
+    return
+  fi
+
+  info "AAAA records: $aaaa"
+  first_v6=$(printf '%s\n' "$aaaa" | _first_word)
+
+  if _nc6_tcp_probe "$first_v6" "$VPN_PORT_TCP"; then
+    ok "IPv6 TCP $VPN_PORT_TCP reachable via [$first_v6]"
+    IPV6_TARGET_OK=1
+  else
+    fail "IPv6 TCP $VPN_PORT_TCP unreachable via [$first_v6]"
+    IPV6_TARGET_OK=0
+    # If IPv4 also failed, that's broader. If IPv4 worked but v6 failed,
+    # may be a v6 routing issue, not a block.
+    if [ "$TCP_OK" = "0" ]; then
+      add_verdict "IPv6 transport also unreachable — both stacks blocked / down"
+    fi
+    return
+  fi
+
+  # Also try HTTPS over v6 (the resolver hint in --resolve uses [host:port:ip])
+  https_code=$(curl -sk --max-time "$TIMEOUT" -6 \
+    --resolve "$VPN_HOST:$VPN_PORT_TCP:$first_v6" \
+    -o /dev/null -w '%{http_code}' \
+    "$(_target_https_url)" 2>/dev/null || echo "000")
+  [ -n "$https_code" ] || https_code="000"
+  IPV6_HTTPS_CODE="$https_code"
+
+  if [ "$https_code" = "000" ]; then
+    fail "IPv6 HTTPS request failed — TLS handshake or response blocked on v6"
+    add_verdict "IPv6 HTTPS layer blocked while v6 TCP reachable"
+  else
+    info "IPv6 HTTPS: HTTP $https_code"
+
+    # If IPv4 was blocked but IPv6 works — strong signal: IPv4-only DPI/IP block.
+    if [ "$TCP_OK" = "0" ]; then
+      ok "IPv6 path works while IPv4 is blocked — switch to v6-preferred client"
+      add_verdict "IPv4 blocked but IPv6 reachable — prefer v6 transport"
+    fi
+  fi
+}
+
 # ---------- JSON emitter (--json mode) ----------
 
 _emit_json() {
@@ -926,6 +1098,9 @@ _emit_json() {
     --argjson ctrl_pass     "${CONTROL_PASS:-0}" \
     --argjson ctrl_total    "${CONTROL_TOTAL:-0}" \
     --arg ctrl_blocked      "$CONTROL_BLOCKED" \
+    --arg ipv6_aaaa         "$IPV6_AAAA" \
+    --argjson ipv6_target   "${IPV6_TARGET_OK:-0}" \
+    --arg ipv6_https        "$IPV6_HTTPS_CODE" \
     --argjson verdicts      "$verdicts_json" '
     def words: split(" ") | map(select(length > 0));
     def opt(s): if s == "" then null else s end;
@@ -991,6 +1166,11 @@ _emit_json() {
           passed: $ctrl_pass,
           total: $ctrl_total,
           unreachable: ($ctrl_blocked | words)
+        },
+        ipv6: {
+          aaaa: ($ipv6_aaaa | words),
+          target_reachable: bool_int($ipv6_target),
+          https_code: opt($ipv6_https)
         }
       },
       verdicts: $verdicts
@@ -1035,6 +1215,7 @@ _should_run rst     && probe_rst_injection
 _should_run udp     && probe_udp_protocols
 _should_run openvpn && probe_openvpn
 _should_run control && probe_known_blocked
+_should_run ipv6    && probe_ipv6
 
 # ---------- summary ----------
 
@@ -1076,6 +1257,9 @@ else
       *"OpenVPN TCP port open"*)  rec="confirms targeted port-block; try OpenVPN as fallback" ;;
       *"Broad censorship"*)       rec="expect aggressive DPI; minimum stack: Reality + uTLS" ;;
       *"Selective control-site"*) rec="retest with VPN off/on; if stable, expect category filtering" ;;
+      *"IPv4 blocked but IPv6 reachable"*) rec="enable IPv6-preferred mode in client; IPv4 path is being filtered while v6 is clean" ;;
+      *"IPv6 transport also unreachable"*) rec="both v4 and v6 down — verify network connectivity end-to-end before blaming DPI" ;;
+      *"IPv6 HTTPS layer blocked"*) rec="v6 TCP works but TLS/HTTPS doesn't — likely SNI-DPI applied to v6 too, same mitigation as v4" ;;
       *) rec="" ;;
     esac
     if [ -n "$rec" ]; then

@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`--from-file PATH` batch mode**: iterates over hosts in a file (one per
+  line, `#` comments skipped), invoking the script per host. In `--json`
+  mode emits ndjson (one compact JSON object per line) for stream-processing.
+- **`--watch SECONDS` continuous mode**: re-runs the probe pipeline on a
+  fixed cadence until interrupted (SIGINT/SIGTERM). Useful for monitoring a
+  server's blocking state over time. Compatible with `--json` for ndjson
+  streams into log pipelines.
+- **`probe_ipv6` (probe 9 — IPv6 reachability)**: resolves AAAA records,
+  probes IPv6 TCP + HTTPS to the same endpoint. New verdicts:
+  `IPv4 blocked but IPv6 reachable` (prefer v6 client), `IPv6 transport
+  also unreachable` (broader connectivity issue), `IPv6 HTTPS layer blocked`
+  (v6 TCP works but TLS doesn't). New probe name: `ipv6` (for `--only`/`--skip`).
 - **`--json` output mode** for monitoring / alerting integration. Emits a
   versioned JSON document with the full probe state (DNS sets, TLS results,
   RST timing, UA codes, verdicts, etc.) and suppresses human-readable

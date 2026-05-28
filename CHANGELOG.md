@@ -36,11 +36,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   otherwise mask local DNS poisoning.
 - **Platform-aware** support: macOS (BSD `nc -G`, `route` / `scutil` /
   `ifconfig`) and Linux (`nc -w`, `ip route` / `ip link` / `nmcli`).
+- Set-based DNS comparison (`_sets_intersect`) — CDN/anycast legitimately
+  returns different IPs from different PoPs; one shared IP is sufficient.
+- `_is_special_ipv4` / `_contains_special_ipv4`: detects RFC 1918, loopback,
+  CGNAT, TEST-NET, multicast for DNS sinkhole detection.
 - Configuration precedence: CLI arg > env var > `detect_blocking.conf`
   > built-in default.
-- Optional logging to file with timestamps, ANSI-stripping, and 10MB
-  rotation; `--quiet` flag for cron use.
-- `--version`, `--help` flags.
+- Optional logging to file with timestamps, ANSI-stripping, and 10 MB
+  rotation; `--quiet` / `-q` flag for cron use.
+- `--version` / `-V` and `--help` / `-h` flags.
+- `DETECT_BLOCKING_VERSION` constant (`0.1.0`).
+- Demo nudge: when `VPN_HOST` is the default `www.example.com`, the script
+  prints a hint to set a real endpoint.
 - Test harness:
   - `tests/test_smoke.sh` — end-to-end run against the demo target.
   - `tests/test_doh_compromise.sh` — spins up a local fake DoH server

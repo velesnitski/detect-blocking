@@ -20,7 +20,7 @@ Runs a deterministic 9-stage probe chain from your local machine to a target
 endpoint and emits a clearly labelled verdict for each detected blocking type.
 
 | # | Probe | Detects |
-|---|---|---|
+|---|-------|---------|
 | 0 | Environment | Whether a VPN is currently active (results then describe the VPN exit path, not the local ISP) |
 | 1 | DNS resolution | DNS sinkhole / system-DNS failure / DoH-MITM (via Cloudflare canary) / CDN-anycast divergence |
 | 2 | TCP reachability | Full IP block vs port-specific (443 dead but 80 alive) |
@@ -51,8 +51,8 @@ Run from your-host on <date>
 
 == 1. DNS resolution ==
           DoH integrity:    ok (1.0.0.1 1.1.1.1 for one.one.one.one)
-          system resolver A: <cloudflare-anycast> <cloudflare-anycast>
-          DoH resolver A:    <cloudflare-anycast> <cloudflare-anycast>
+          system resolver A: <cloudflare-anycast>
+          DoH resolver A:    <cloudflare-anycast>
   [OK]    system DNS and DoH share at least one A record
 
 == 2. TCP reachability ==
@@ -94,7 +94,7 @@ git clone https://github.com/velesnitski/detect-blocking.git
 cd detect-blocking
 chmod +x detect_blocking.sh
 
-# Smoke run against the demo target
+# Demo run against the IANA target
 ./detect_blocking.sh
 
 # Real run against your endpoint
@@ -118,7 +118,7 @@ chmod +x detect_blocking.sh
 - `perl` — IKEv2 and OpenVPN handshake probes (skipped if absent)
 - `xxd` — OpenVPN response hex parsing (skipped if absent)
 
-If any are missing, the script reports them once at startup and continues.
+If any optional tool is missing the script reports it once at startup and continues.
 
 ---
 
@@ -131,7 +131,7 @@ Options:
   -h, --help              Show help.
   -V, --version           Print version and exit.
   -q, --quiet             Suppress stdout (logging to file still works).
-      --log-file PATH     Append timestamped entries to PATH. Rotates at 10MB.
+      --log-file PATH     Append timestamped entries to PATH. Rotates at 10 MB.
 
 Override precedence:
   CLI arg > environment variable > detect_blocking.conf > built-in default
@@ -140,7 +140,7 @@ Override precedence:
 ### Environment variables
 
 | Variable | Default | Purpose |
-|---|---|---|
+|----------|---------|---------|
 | `VPN_HOST` | `www.example.com` | Target hostname |
 | `VPN_PORT_TCP` | `443` | Target TCP port |
 | `IKEV2_HOST` | `$VPN_HOST` | Separate IKEv2 host (if different) |
@@ -170,6 +170,45 @@ The file is sourced before defaults are applied. It is gitignored. See
 
 ---
 
+## Examples
+
+### Diagnose your VPN endpoint
+
+```sh
+./detect_blocking.sh my-vpn.example.org
+```
+
+### Increased timeout for slow or high-latency networks
+
+```sh
+TIMEOUT=15 ./detect_blocking.sh --log-file /tmp/diag.log my-vpn.example.org
+```
+
+### Cron: periodic monitoring with log rotation
+
+```sh
+# /etc/cron.d/vpn-monitoring
+0 */6 * * * root /opt/scripts/detect_blocking.sh \
+    --quiet --log-file /var/log/vpn_blocking.log vpn.mycompany.com
+```
+
+### Parse verdicts for alerting / monitoring integration
+
+```sh
+#!/bin/bash
+output=$(./detect_blocking.sh --quiet --log-file /dev/stdout "$1" 2>&1)
+verdicts=$(printf '%s\n' "$output" \
+  | sed -n '/^== VERDICT ==$/,/^== /p' | grep '•' | cut -d'•' -f2-)
+
+if [ -n "$verdicts" ]; then
+    printf 'ALERT: blocking detected on %s\n' "$1"
+    printf '%s\n' "$verdicts"
+    # Forward to Prometheus/Pushgateway, Slack, PagerDuty, etc.
+fi
+```
+
+---
+
 ## Notes on detection accuracy
 
 **Probe 4 (UA filtering) is *not* a JA3/JA4 test.** Both `curl` invocations
@@ -188,19 +227,16 @@ OpenVPN.
 **DoH integrity canary.** The script resolves `one.one.one.one` over the
 configured DoH endpoint and verifies the answer matches `1.1.1.1` / `1.0.0.1`.
 If it doesn't, DoH itself is MITM'd (e.g. national-CA TLS interception, BGP
-anycast hijack) and its answers are discarded for the rest of the run.
-
-**Platform notes.** Section 0 uses platform-specific tools (`route` /
-`scutil` / `ifconfig` on macOS; `ip route` / `ip link` / `nmcli` on Linux).
-All other probes are portable across both. macOS TCP probes use `nc -G` (the
-BSD connect timeout); Linux uses `nc -w`.
+anycast hijack) and its answers are discarded for the rest of the run. Note:
+this canary does not catch a sophisticated proxy that allowlists
+`one.one.one.one` while substituting answers only for target domains.
 
 ---
 
 ## Testing
 
 ```sh
-# Syntax check + smoke test (no network mock)
+# Full suite
 bash tests/run.sh
 
 # Individual:
@@ -209,6 +245,60 @@ bash tests/test_doh_compromise.sh   # spins up a local fake-DoH server
 ```
 
 The CI workflow runs shellcheck plus smoke tests on macOS and Ubuntu.
+
+---
+
+## Limitations
+
+- IPv6 probes are not yet implemented.
+- TLS fingerprint testing is surface-level (UA only); use `curl-impersonate`
+  for real JA3.
+- UDP IKE probe needs `perl`; missing → that probe is skipped.
+- Some macOS VPN clients hijack DNS in ways that confuse Section 0 detection.
+
+---
+
+## Troubleshooting
+
+### `nc: invalid option -- 'G'`
+
+**Cause:** `netcat-traditional` instead of `netcat-openbsd` is active.
+
+```sh
+# Debian / Ubuntu
+sudo apt install netcat-openbsd
+sudo update-alternatives --set nc /bin/nc.openbsd
+```
+
+### `openssl: unknown option -brief`
+
+**Cause:** OpenSSL older than 1.1.1.
+**Fix:** upgrade OpenSSL, or on macOS use the system LibreSSL (already 3+).
+
+### `dig: command not found`
+
+The script falls back to `host` → `nslookup` automatically. For full DNS
+resolution support:
+
+```sh
+sudo apt install dnsutils      # Debian / Ubuntu
+sudo dnf install bind-utils    # Fedora / RHEL
+brew install bind              # macOS
+```
+
+### Log file is not written
+
+1. Does the parent directory of `LOG_FILE` exist?
+2. Is it writable by the user running the script?
+3. Is `LOG_QUIET=1` set without a `LOG_FILE`?
+
+### Different IPs in DNS and DoH, but no sinkhole verdict
+
+Anycast infrastructure (Cloudflare, Akamai) legitimately returns different IPs
+depending on the resolver's location. The script uses set intersection
+(`_sets_intersect`) — one shared IP is enough for a clean result. If all IPs
+differ and no verdict appears, run `traceroute` to each address to confirm they
+converge on the same network.
 
 ---
 
@@ -231,18 +321,6 @@ The script runs **passively** from your local machine, probes **one** target
 you explicitly configure, and does not transmit results anywhere.
 
 See [SECURITY.md](SECURITY.md) for vulnerability reporting.
-
----
-
-## Limitations
-
-- TLS fingerprint testing is surface-level (UA only); use `curl-impersonate`
-  for real JA3.
-- UDP IKE probe needs `perl`; missing → that probe is skipped.
-- IPv6 probes are not yet implemented.
-- The DoH canary protects against most MITM but not against a sophisticated
-  proxy that allowlists `one.one.one.one`.
-- Some macOS VPN clients hijack DNS in ways that confuse Section 0 detection.
 
 ---
 

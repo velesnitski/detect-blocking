@@ -8,10 +8,8 @@ macOS / a default Linux. Contributions should preserve that.
 
 - **`main`** — stable, release-tagged. Always fast-forward-merged from `dev`.
 - **`dev`** — active development. **All work lands here first.**
-- **Topic branches** (`feature/...`, `fix/...`) — branch off `dev`, PR back
+- **Topic branches** (`feature/…`, `fix/…`) — branch off `dev`, PR back
   into `dev`. Maintainers merge `dev` → `main` on each release.
-
-Direct pushes to `main` are not used outside the merge step.
 
 ## Setting up
 
@@ -56,6 +54,71 @@ Pattern:
   (`www.example.com`).
 - Negative scenarios use the `tests/fake_doh.py` fixture (or extend it) to
   simulate a hostile network locally — no external dependencies.
+
+## Implementation gotchas
+
+### Binary packets and null bytes
+
+Shell variables are C-strings — they truncate at the first `\x00`.
+The IKE and OpenVPN probes build binary packets with `perl`. **Never**
+store the output in a shell variable; pipe `perl` directly into `nc`:
+
+```bash
+# WRONG — packet is silently truncated at the first \x00
+pkt=$(perl -e 'print "\x00\x01\x02"')
+echo "$pkt" | nc …
+
+# CORRECT — pipe directly
+perl -e 'print "\x00\x01\x02"' | nc …
+```
+
+### Fractional-second timing
+
+`date +%s` is integer-only (1 s resolution). RST injection events are
+typically < 200 ms and would be invisible. Use:
+
+```bash
+{ time -p openssl s_client … </dev/null >"$tmp_out" 2>&1; rc=$?; } 2>"$tmp_time"
+elapsed=$(awk '/^real/{print $2}' "$tmp_time")
+```
+
+Float comparison without `bc`:
+
+```bash
+awk "BEGIN{exit !($elapsed < 1.0)}"
+```
+
+### nc connect-timeout flag
+
+macOS BSD `nc` uses `-G <seconds>` for connect timeout; Linux `nc` uses
+`-w <seconds>`. Always go through `_nc_tcp_probe` — it branches on
+`$OSTYPE` — rather than calling `nc` directly in a new probe.
+
+### nslookup output
+
+`nslookup` prints the resolver's own IP under `Address:` before the
+target's answer. Use:
+
+```bash
+nslookup "$host" 2>/dev/null \
+  | awk '/^Name:/{found=1} found && /^Address:/{print $2; exit}'
+```
+
+### mktemp portability
+
+Always use exactly 6 trailing `X` characters — Linux requires it:
+
+```bash
+tmp=$(mktemp "${TMPDIR:-/tmp}/prefix.XXXXXX")
+```
+
+### stat portability
+
+```bash
+# GNU (Linux)
+size=$(stat -c%s "$file" 2>/dev/null) \
+  || size=$(stat -f%z "$file" 2>/dev/null)   # BSD (macOS)
+```
 
 ## Reporting bugs
 

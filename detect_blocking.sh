@@ -706,7 +706,7 @@ probe_request_filter() {
     warn "Chrome-UA works, default-UA fails (connection) → User-Agent filtering (not TLS-fp)"
     add_verdict "User-Agent based filtering (not JA3 — same TLS stack)"
   elif [ "$curl_default" = "000" ] && [ "$curl_chrome" = "000" ] \
-       && [ -z "$impersonate_cmd" -o "$curl_impersonate" = "000" ]; then
+       && { [ -z "$impersonate_cmd" ] || [ "$curl_impersonate" = "000" ]; }; then
     warn "all requests fail – HTTPS layer entirely cut"
   elif printf '%s' "$curl_default" | grep -qE '^(403|451)$' \
        && ! printf '%s' "$curl_chrome" | grep -qE '^(403|451)$'; then

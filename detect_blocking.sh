@@ -1134,7 +1134,9 @@ probe_compare_matrix() {
   # Heuristic verdict: if a non-canonical combo works but the canonical fails,
   # surface as bypass candidate.
   local canonical_failed=0 alt_works=0
-  while IFS='|' read -r m_sni m_port m_tls m_tcp; do
+  # m_tcp_unused: we recorded TCP state in the matrix for JSON consumers but
+  # the heuristic only needs the TLS column. Read into _ to satisfy shellcheck.
+  while IFS='|' read -r m_sni m_port m_tls _; do
     [ -z "$m_sni" ] && continue
     if [ "$m_sni" = "$VPN_HOST" ] && [ "$m_port" = "$VPN_PORT_TCP" ]; then
       [ "$m_tls" = "0" ] && canonical_failed=1

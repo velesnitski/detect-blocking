@@ -169,6 +169,27 @@ if [ -n "$XRAY_CONFIG" ]; then
     vless://*|vmess://*|trojan://*|ss://*|hysteria://*|hysteria2://*|tuic://*) ;;
     *) die "--xray-config: unrecognised scheme; expected one of vless://, vmess://, trojan://, ss://, hysteria://, hysteria2://, tuic:// (got: $(printf '%s' "$XRAY_CONFIG" | head -c 20))" ;;
   esac
+
+  # Auto-derive VPN_HOST from URL when no positional host was given. Keeps
+  # probes 0-10 aligned with the protocol probe (11) so cross-referencing
+  # (e.g. "TLS works but Xray fails") is meaningful. Skipped for vmess://
+  # whose host lives inside a base64-encoded JSON blob.
+  if [ -z "${VPN_HOST:-}" ]; then
+    case "$XRAY_CONFIG" in
+      vless://*|trojan://*|ss://*|hysteria://*|hysteria2://*|tuic://*)
+        _derived_host=$(printf '%s' "$XRAY_CONFIG" \
+          | sed -nE 's|^[a-z0-9]+://[^@]+@([^:?#/]+).*|\1|p')
+        if [ -n "$_derived_host" ]; then
+          VPN_HOST="$_derived_host"
+          printf '%s\n' "note: VPN_HOST auto-derived from --xray-config → $_derived_host" >&2
+        fi
+        unset _derived_host
+        ;;
+      vmess://*)
+        printf '%s\n' "note: vmess:// URL provided without positional host — host is inside base64 JSON, pass it explicitly to align probes 0-10" >&2
+        ;;
+    esac
+  fi
 fi
 
 # --port-survey: curated list of common alt-VPN/proxy ports, merged into

@@ -3,12 +3,15 @@
 A single-file Bash diagnostic that classifies **what kind of network filtering**
 is preventing a VPN endpoint from working — DNS poisoning, IP blocks,
 SNI-based DPI, mid-handshake RST injection, silent drops, UDP/QUIC bans,
-OpenVPN signature blocks, and more.
+OpenVPN signature blocks, and (via optional `xray-knife` delegation)
+authenticated end-to-end protocol tests for Reality / VLESS / VMess / Trojan
+/ Shadowsocks-2022 / Hysteria2.
 
 Built for operators who need to answer one question fast: *"is my server
 blocked, and if so, by what mechanism?"*
 
 [![Test](https://github.com/velesnitski/detect-blocking/actions/workflows/test.yml/badge.svg)](https://github.com/velesnitski/detect-blocking/actions/workflows/test.yml)
+[![Release](https://img.shields.io/github/v/release/velesnitski/detect-blocking?sort=semver&color=blue)](https://github.com/velesnitski/detect-blocking/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Shell: Bash](https://img.shields.io/badge/Shell-Bash%203.2%2B-1f425f.svg)](https://www.gnu.org/software/bash/)
 
@@ -16,22 +19,23 @@ blocked, and if so, by what mechanism?"*
 
 ## What it does
 
-Runs a deterministic 9-stage probe chain from your local machine to a target
+Runs a deterministic 11-stage probe chain from your local machine to a target
 endpoint and emits a clearly labelled verdict for each detected blocking type.
 
 | # | Probe | Detects |
 |---|-------|---------|
 | 0 | Environment | Whether a VPN is currently active (results then describe the VPN exit path, not the local ISP) |
-| 1 | DNS resolution | DNS sinkhole / system-DNS failure / DoH-MITM (via Cloudflare canary) / CDN-anycast divergence |
+| 1 | DNS resolution | DNS sinkhole / system-DNS failure / **DoH integrity canary** + **multi-DoH cross-check** (Cloudflare/Google/Quad9) / **DoT canary** / CDN-anycast divergence |
 | 2 | TCP reachability | Full IP block vs port-specific (443 dead but 80 alive) |
-| 3 | TLS handshake | SNI-based DPI (proper SNI dies, no-SNI works) |
-| 4 | UA filtering | User-Agent based filtering (not full JA3 — see note below) |
+| 3 | TLS handshake | SNI-based DPI (proper SNI dies, no-SNI works); auto-runs **64-byte record-fragmentation probe** when SNI is blocked |
+| 4 | UA / TLS-fp filtering | User-Agent filtering; **real JA3 via `curl-impersonate`** when installed |
 | 5 | Mid-handshake RST | Active DPI reset (<1s) vs silent drop (full timeout) |
 | 6 | UDP protocols | IKEv2 (valid IKE\_SA\_INIT probe) + QUIC/HTTP3 over UDP 443 |
 | 7 | OpenVPN handshake | Random-SID `0x38` initiator, expects `0x40` server reset |
 | 8 | Control sites | Broad vs targeted censorship (Tor/Proton/Discord reachability) |
 | 9 | IPv6 reachability | AAAA resolution + IPv6 TCP/HTTPS; detects "IPv4-only block" cases |
-| 11 | Xray protocol (opt-in) | Authenticated end-to-end test via `xray-knife`; works for Reality / VLESS / VMess / Trojan / Shadowsocks-2022 / Hysteria2 |
+| 9b | Compare matrix (opt-in) | `--compare-sni A,B,C` × `--compare-port 443,8443,…` grid for bypass discovery; `--port-survey` adds a curated alt-port list |
+| 11 | Xray protocol (opt-in) | Authenticated end-to-end test via `xray-knife` (v10 + legacy auto-detect); works for Reality / VLESS / VMess / Trojan / Shadowsocks-2022 / Hysteria2 |
 
 The verdict ends with a list of detected blocks plus an actionable
 recommendation for each (rotate IP, switch to Reality, use uTLS, etc).
@@ -96,12 +100,19 @@ git clone https://github.com/velesnitski/detect-blocking.git
 cd detect-blocking
 chmod +x detect_blocking.sh
 
-# Demo run against the IANA target
+# Demo run against the IANA target (no config — produces a clean baseline)
 ./detect_blocking.sh
 
-# Real run against your endpoint
-./detect_blocking.sh www.example.com
+# Real run against your endpoint (hostname or bare IP both work)
+./detect_blocking.sh your-vpn.example.com
+
+# Or with a protocol URL — VPN_HOST is auto-derived from the URL
+./detect_blocking.sh --xray-config 'vless://UUID@your-vpn.example.com:443?security=reality&pbk=PBK&sid=SID&fp=chrome#srv'
 ```
+
+> When `--xray-config` is given and no positional host, the script extracts
+> the host from the URL automatically — probes 0-10 align with the protocol
+> probe (11) so cross-referenced verdicts work out of the box.
 
 ---
 
@@ -263,16 +274,47 @@ credentials, Shadowsocks-2022 requires PSK-derived AEAD, etc. The honest
 diagnostic is an *authenticated* client connection through your config:
 
 ```sh
-# Requires xray-knife in PATH:
+# Requires xray-knife in PATH (auto-detected, optional):
 # go install github.com/lilendian0x00/xray-knife@latest
 
 ./detect_blocking.sh \
-  --xray-config "vless://uuid@server.example.org:443?type=tcp&security=reality&pbk=PBK&sid=SID&fp=chrome#prod" \
+  --xray-config 'vless://UUID@your-vpn.example.com:443?type=tcp&security=reality&pbk=PBK&sid=SID&fp=chrome&flow=xtls-rprx-vision#prod' \
   --json | jq '.probes.xray_protocol'
 ```
 
-The script masks the credentials in any log / JSON output (`<creds>`
-placeholder), so it's safe to pipe the result to monitoring stacks.
+The script:
+- **Auto-derives VPN_HOST** from the URL (probes 0-10 hit the same host as
+  the protocol probe; positional arg still wins if given explicitly).
+- **Strips whitespace** from the URL (terminal paste-wrap is the #1 footgun)
+  and emits a warning if anything was removed.
+- **Masks credentials** in any human or JSON output (`<creds>` placeholder),
+  so it's safe to pipe to logs / SIEM / chat alerts.
+- **Auto-detects xray-knife API** — both v10+ (top-level `http`) and legacy
+  (`net http`).
+- **Surfaces the delegated error** on failure (`xray-knife says: …`), so
+  config-drift vs network-failure is distinguishable at a glance.
+
+The killer signal is the **cross-referenced verdict** when the transport
+layer dies but the protocol layer punches through:
+
+```
+== 3. TLS handshake behaviour ==
+  [FAIL]  all TLS handshakes to this IP fail → TLS-LEVEL DPI or IP block
+
+== 5. Mid-handshake RST detection ==
+  [FAIL]  handshake dies fast (0.17s) → likely DPI-injected RST
+
+== 11. Xray-protocol end-to-end test ==
+  [OK]    tunnel established, RTT 278 ms
+
+== VERDICT ==
+  • TLS DPI rejects any handshake to this IP
+  • Active RST injection by DPI mid-handshake
+  • Xray protocol bypasses local DPI/DNS-MITM despite environment signals
+```
+
+→ *your protocol stack is working as designed — local DPI sees the cover,
+not the payload.* That's a passing Reality deployment under active DPI.
 
 ### Continuous monitoring with `--watch`
 

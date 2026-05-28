@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `--help` no longer bleeds code into the help text — the `sed` range now
+  stops at the end of the comment header (line 27) instead of including
+  `set -u` and the `readonly` version line.
+- **Probe 4 now detects UA filtering via block page.** Previously only a
+  connection-level failure (`000`) was flagged; a censor returning an HTTP
+  403/451 block page for the default UA while serving Chrome normally went
+  undetected. Now a `403`/`451` from the default UA combined with a
+  non-block status from the Chrome UA emits the User-Agent-filtering verdict.
+- **`nslookup` fallback no longer leaks the resolver's own IP.** Collection
+  now starts only after the first `Name:` block, instead of relying solely
+  on the `#53` port suffix to filter out the server `Address:` line.
+- HTTP/2 capability detection aligned with the HTTP/3 check
+  (`grep -qiE 'HTTP2|HTTP/2'`).
+- Probe-5 temp files are now removed via an `EXIT` trap, so an interrupted
+  run (Ctrl-C mid-handshake) no longer leaks `/tmp/detect_blocking.*` files.
+
 ## [0.1.0] - 2026-05-27
 
 ### Added

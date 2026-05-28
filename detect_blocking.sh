@@ -91,7 +91,7 @@ while [ $# -gt 0 ]; do
       exit 0
       ;;
     --help|-h)
-      sed -n '2,32p' "$0"
+      sed -n '2,27p' "$0"
       printf '\nversion: %s\n' "$DETECT_BLOCKING_VERSION"
       exit 0
       ;;
@@ -137,6 +137,8 @@ OPENVPN_UDP_OK=0
 OPENVPN_TCP_OK=0
 DOH_INTEGRITY_STATE=""   # one of: "", ok, unreachable, compromised
 DOH_INTEGRITY_IPS=""     # what DoH returned for the canary query
+RST_TMP_OUT=""           # probe-5 temp files; cleaned by EXIT trap on interrupt
+RST_TMP_TIME=""
 
 # ---------- colors (TTY-aware, suppressed when --quiet) ----------
 
@@ -240,7 +242,10 @@ _resolve_a_records() {
   elif check_cmd host; then
     host -t A "$host" 2>/dev/null | awk '/has address/{print $4}' | _ipv4_lines
   elif check_cmd nslookup; then
-    nslookup "$host" 2>/dev/null | awk '/^Address:/{print $2}' | _ipv4_lines
+    # Skip the resolver's own Server/Address lines that precede the answer;
+    # only collect Address lines that come after the first "Name:" block.
+    nslookup "$host" 2>/dev/null \
+      | awk '/^Name:/{found=1} found && /^Address:/{print $2}' | _ipv4_lines
   fi
 }
 
@@ -505,7 +510,7 @@ probe_request_filter() {
 
   local curl_default curl_chrome http2_opt="" target_url
   target_url=$(_target_https_url)
-  curl --version 2>/dev/null | grep -q HTTP2 && http2_opt="--http2"
+  curl --version 2>/dev/null | grep -qiE 'HTTP2|HTTP/2' && http2_opt="--http2"
 
   curl_default=$(curl -sk --max-time "$TIMEOUT" \
     --resolve "$VPN_HOST:$VPN_PORT_TCP:$RESOLVED_IP" \
@@ -523,10 +528,14 @@ probe_request_filter() {
   info "Chrome-like UA:   HTTP $curl_chrome"
 
   if [ "$curl_default" = "000" ] && [ "$curl_chrome" != "000" ]; then
-    warn "Chrome-UA works, default-UA fails → User-Agent filtering (not TLS-fp)"
+    warn "Chrome-UA works, default-UA fails (connection) → User-Agent filtering (not TLS-fp)"
     add_verdict "User-Agent based filtering (not JA3 — same TLS stack)"
   elif [ "$curl_default" = "000" ] && [ "$curl_chrome" = "000" ]; then
     warn "both requests fail – HTTPS layer entirely cut"
+  elif printf '%s' "$curl_default" | grep -qE '^(403|451)$' \
+       && ! printf '%s' "$curl_chrome" | grep -qE '^(403|451)$'; then
+    warn "default-UA gets HTTP $curl_default block page, Chrome-UA gets $curl_chrome → UA filtering via block page"
+    add_verdict "User-Agent based filtering (not JA3 — same TLS stack)"
   else
     ok "HTTPS responds (HTTP $curl_default) – no UA filtering detected"
   fi
@@ -536,19 +545,20 @@ probe_rst_injection() {
   hdr "5. Mid-handshake RST detection"
   [ "$TCP_OK" -ne 1 ] && { warn "skipping – TCP unreachable"; return; }
 
-  local tmp_out tmp_time rc=0 elapsed hs_ok=0
-  tmp_out=$(_mktmp tls)
-  tmp_time=$(_mktmp time)
+  local rc=0 elapsed hs_ok=0
+  RST_TMP_OUT=$(_mktmp tls)
+  RST_TMP_TIME=$(_mktmp time)
 
   { time -p openssl s_client -connect "$RESOLVED_IP:$VPN_PORT_TCP" \
-       -servername "$VPN_HOST" -brief </dev/null >"$tmp_out" 2>&1
+       -servername "$VPN_HOST" -brief </dev/null >"$RST_TMP_OUT" 2>&1
     rc=$?
-  } 2>"$tmp_time"
+  } 2>"$RST_TMP_TIME"
 
-  elapsed=$(awk '/^real/{print $2}' "$tmp_time")
+  elapsed=$(awk '/^real/{print $2}' "$RST_TMP_TIME")
   elapsed="${elapsed:-0}"
-  grep -qE 'Protocol version|Verification' "$tmp_out" && hs_ok=1
-  rm -f "$tmp_out" "$tmp_time"
+  grep -qE 'Protocol version|Verification' "$RST_TMP_OUT" && hs_ok=1
+  rm -f "$RST_TMP_OUT" "$RST_TMP_TIME"
+  RST_TMP_OUT="" RST_TMP_TIME=""
 
   info "TLS attempt took ${elapsed}s (rc=$rc, handshake=$([ "$hs_ok" -eq 1 ] && echo OK || echo FAIL))"
 
@@ -683,6 +693,9 @@ probe_known_blocked() {
 # ---------- main ----------
 
 _init_log
+
+# Clean up probe-5 temp files even if the run is interrupted (Ctrl-C) mid-probe.
+trap 'rm -f "$RST_TMP_OUT" "$RST_TMP_TIME" 2>/dev/null' EXIT
 
 printf '%s\n' "${BLU}VPN-blocking diagnostic for ${VPN_HOST}${RST}"
 printf '%s\n' "${DIM}Run from $(hostname) on $(date)${RST}"

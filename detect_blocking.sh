@@ -154,6 +154,23 @@ if [ "$JSON_MODE" = "1" ]; then
   check_cmd jq || die "--json requires jq (install: brew install jq / apt-get install jq)"
 fi
 
+# Sanitise --xray-config: terminal paste-wrap is a common source of embedded
+# newlines / spaces. Strip all whitespace; if anything was removed, warn
+# (to stderr only, not LOG_QUIET-gated) so the operator notices. Then
+# verify the scheme is one xray-knife understands before any further work.
+if [ -n "$XRAY_CONFIG" ]; then
+  _xray_orig="$XRAY_CONFIG"
+  XRAY_CONFIG=$(printf '%s' "$XRAY_CONFIG" | tr -d '[:space:]')
+  if [ "$XRAY_CONFIG" != "$_xray_orig" ]; then
+    printf '%s\n' "warning: --xray-config contained whitespace (terminal paste-wrap?); stripped before use" >&2
+  fi
+  unset _xray_orig
+  case "$XRAY_CONFIG" in
+    vless://*|vmess://*|trojan://*|ss://*|hysteria://*|hysteria2://*|tuic://*) ;;
+    *) die "--xray-config: unrecognised scheme; expected one of vless://, vmess://, trojan://, ss://, hysteria://, hysteria2://, tuic:// (got: $(printf '%s' "$XRAY_CONFIG" | head -c 20))" ;;
+  esac
+fi
+
 # --port-survey: curated list of common alt-VPN/proxy ports, merged into
 # COMPARE_PORT so the compare matrix picks them up. Doesn't override an
 # explicit --compare-port, just extends it.
@@ -428,6 +445,12 @@ _contains_special_ipv4() {
 _resolve_a_records() {
   # System DNS A-records, sorted and deduped.
   local host="$1"
+  # Short-circuit: if VPN_HOST is already a bare IPv4 literal, no DNS work
+  # needed. Avoids the "Domain unresolvable" verdict on hostless targets.
+  if printf '%s' "$host" | grep -qE '^[0-9]+(\.[0-9]+){3}$'; then
+    printf '%s\n' "$host"
+    return
+  fi
   if check_cmd dig; then
     dig +short +time="$TIMEOUT" +tries=1 "$host" A 2>/dev/null | _ipv4_lines
   elif check_cmd host; then
@@ -608,11 +631,14 @@ _find_xray_tester() {
 # vmess://BASE64  →  vmess://<base64-config>
 # ss://b64@host:port  →  ss://<creds>@host:port
 _summarize_xray_url() {
-  local url="$1" scheme
+  # Defensive: collapse any whitespace before masking so a stray newline in
+  # the input can't push the query/fragment portion through the regex.
+  local url scheme
+  url=$(printf '%s' "$1" | tr -d '[:space:]')
   scheme=$(printf '%s' "$url" | sed -nE 's|^([a-z0-9]+)://.*|\1|p')
   case "$scheme" in
     vless|trojan|ss|hysteria|hysteria2|tuic)
-      # scheme://creds@host:port?...#fragment
+      # scheme://creds@host:port?...#fragment  →  scheme://<creds>@host:port
       printf '%s' "$url" \
         | sed -E 's|^([a-z0-9]+)://[^@]+@([^?#/]+)([?#].*)?$|\1://<creds>@\2|'
       ;;
@@ -1238,11 +1264,27 @@ probe_xray_protocol() {
     return 0
   fi
 
-  local out
-  # `net http` does the full handshake + HTTP request through the tunnel.
-  # -m 1 (one attempt), -d $TIMEOUT (max delay, seconds → ms internally).
-  out=$("$XRAY_TESTER_BIN" net http -c "$XRAY_CONFIG" \
-        -m 1 -d $(( TIMEOUT * 1000 )) 2>&1 || true)
+  # Detect xray-knife API. v10+ exposes `xray-knife http -c URL -d MS` at the
+  # top level. Older v9 had `xray-knife net http -c URL -m 1 -d MS` with -m
+  # meaning "attempts"; in v10 -m is HTTP method (default GET).
+  local out xk_layout
+  if "$XRAY_TESTER_BIN" http --help >/dev/null 2>&1; then
+    xk_layout="v10"
+  elif "$XRAY_TESTER_BIN" net http --help >/dev/null 2>&1; then
+    xk_layout="legacy"
+  else
+    XRAY_STATUS="unavailable"
+    warn "xray-knife in PATH doesn't expose http subcommand — unsupported version"
+    return 0
+  fi
+
+  if [ "$xk_layout" = "v10" ]; then
+    out=$("$XRAY_TESTER_BIN" http -c "$XRAY_CONFIG" \
+          -d $(( TIMEOUT * 1000 )) 2>&1 || true)
+  else
+    out=$("$XRAY_TESTER_BIN" net http -c "$XRAY_CONFIG" \
+          -m 1 -d $(( TIMEOUT * 1000 )) 2>&1 || true)
+  fi
 
   # Defensive parsing — xray-knife output evolves between versions.
   # 1) RTT: any "HTTP delay: NNN" / "Delay: NNN" / "delay: NNN" pattern.
@@ -1262,7 +1304,10 @@ probe_xray_protocol() {
                     | awk '{print $NF}')
 
   # 3) Verdict: explicit error words win; otherwise RTT presence implies ok.
-  if printf '%s' "$out" | grep -qiE 'timeout|connection refused|i/o timeout|invalid|error 50'; then
+  # v10 uses ❌ prefix + "closed pipe" / "EOF" / "reset by peer". Legacy uses
+  # "Error:" / "FAILED" / "TIMEOUT".
+  if printf '%s' "$out" \
+       | grep -qE '❌|closed pipe|EOF|reset by peer|timeout|connection refused|i/o timeout|invalid|error 50|unable to connect|no route to host'; then
     XRAY_STATUS="failed"
   elif [ -n "$XRAY_RTT_MS" ]; then
     XRAY_STATUS="ok"
@@ -1278,6 +1323,14 @@ probe_xray_protocol() {
     fi
   else
     fail "Xray-protocol end-to-end test failed"
+    # Surface a 1-line excerpt of the delegation output to help triage
+    # parse/config errors vs network errors. Trim leading whitespace,
+    # take the first non-empty line that looks informative.
+    local _diag
+    _diag=$(printf '%s\n' "$out" \
+            | grep -iE 'error|failed|timeout|invalid|refused|unable' \
+            | head -1 | sed 's|^[[:space:]│|]*||' | head -c 200)
+    [ -n "$_diag" ] && info "$XRAY_TESTER_BIN says: $_diag"
     if [ "${TCP_OK:-1}" = "1" ]; then
       if [ "${TLS_PROPER_SNI_OK:-0}" = "1" ]; then
         # TCP + TLS to the server work but the protocol doesn't — strong signal.

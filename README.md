@@ -116,6 +116,134 @@ chmod +x detect_blocking.sh
 
 ---
 
+## Using with Xray / Reality / VLESS / VMess / Trojan / SS-2022 / Hysteria2
+
+This is the killer feature. Native blind probing of these protocols is
+**impossible by design** — Reality is engineered to be indistinguishable from
+a real fallback TLS site without credentials, Shadowsocks-2022 requires
+PSK-derived AEAD to trigger any protocol-specific reaction, VLESS-with-
+fallback proxies bad UUIDs to a decoy. Honest end-to-end diagnostics needs
+an *authenticated* client connection through your config — `detect-blocking`
+delegates that to [`xray-knife`](https://github.com/lilendian0x00/xray-knife)
+and cross-references the result with its own transport-layer probes.
+
+### 1 — install `xray-knife` once
+
+```sh
+# Go required (any 1.20+)
+go install github.com/lilendian0x00/xray-knife@latest
+
+# Verify it's on PATH
+xray-knife --version    # expect: xray-knife version 10.x.x (or newer)
+```
+
+The script auto-detects both the modern v10+ API (`xray-knife http -c …`)
+and legacy v9 (`xray-knife net http -c …`). No flag needed.
+
+### 2 — get your protocol URL
+
+Most Xray clients let you export a single share-link:
+
+- **v2rayN / v2rayNG / NekoBox / NekoRay** — right-click server → *Share* /
+  *Generate QR* — copy the `vless://…` / `vmess://…` / `trojan://…` string.
+- **Hiddify** — long-press server → *Share link*.
+- **Shadowrocket / Streisand** — server detail page → *QR code* / *Copy link*.
+- **Manual** — assemble from `config.json`: scheme, UUID, host, port, TLS
+  type, public key, SID, fingerprint, flow.
+
+Examples by protocol (replace `UUID`, `PBK`, `SID`, `PASSWORD`, etc. with
+your real values):
+
+```text
+vless://UUID@your-vpn.example.com:443?type=tcp&security=reality&pbk=PBK&sid=SID&sni=www.microsoft.com&fp=chrome&flow=xtls-rprx-vision#prod
+vless://UUID@cdn.example.com:443?type=ws&path=%2Fxxx&host=cdn.example.com&security=tls&sni=cdn.example.com#ws-cdn
+trojan://PASSWORD@your-vpn.example.com:443?sni=your-vpn.example.com#trojan-srv
+ss://2022-blake3-aes-128-gcm:KEY@your-vpn.example.com:8388#ss-srv
+hysteria2://PASSWORD@your-vpn.example.com:443?sni=your-vpn.example.com#hy2-srv
+```
+
+### 3 — run the diagnostic
+
+The simplest invocation — URL only, host auto-derived:
+
+```sh
+./detect_blocking.sh --xray-config 'vless://UUID@your-vpn.example.com:443?security=reality&pbk=PBK&sid=SID&fp=chrome#prod'
+```
+
+For monitoring stacks, add `--json`:
+
+```sh
+./detect_blocking.sh --xray-config 'vless://…' --json | jq '.probes.xray_protocol, .verdicts'
+```
+
+> **Credentials are auto-masked** in every line of output and in the JSON
+> document (`url_display: "vless://<creds>@host:port"`). It's safe to pipe
+> the result to logs, Slack, PagerDuty, or any SIEM.
+
+Store the URL out-of-band so it doesn't end up in your shell history:
+
+```sh
+echo 'vless://UUID@your-vpn.example.com:443?...#prod' > ~/.xray-prod
+chmod 600 ~/.xray-prod
+
+./detect_blocking.sh --xray-config "$(cat ~/.xray-prod)"
+```
+
+`XRAY_CONFIG=…` as an environment variable works equivalently.
+
+### 4 — read the verdict
+
+The probe table runs end-to-end against the same host. The cross-referenced
+verdict at the end tells you which layer is failing:
+
+| Verdict combination | Diagnosis | Action |
+|---|---|---|
+| `Xray protocol bypasses local DPI/DNS-MITM despite environment signals` | Reality stack is working as designed. Local DPI sees the cover, not the payload. | None — that's a passing setup under active DPI. |
+| `TLS DPI rejects any handshake to this IP` + `Xray-protocol end-to-end test failed` | Transport itself is dead — IP/SNI block. | Rotate the IP, switch SNI, try alternative port via `--compare-port`. |
+| `Xray-protocol handshake fails while plain TLS to the same host succeeds` | Protocol-fingerprint DPI **or** config drift. | Verify UUID + public key match the server, try a different `fp=` (chrome/safari), check `sni=` is still allowed. |
+| `DNS sinkhole / local resolver interception suspected` + `Xray protocol bypasses…` | The network MITMs DNS but your VPN client uses DoH-in-tunnel — fine. | Make sure the client doesn't fall back to the system resolver. |
+| Domain unresolvable / Network connectivity broken | You're not online to the target ASN — not a DPI issue. | Try a different network / vantage point. |
+
+If `xray-knife` fails, the script surfaces the first line of its error
+output (`xray-knife says: …`) so you can distinguish `closed pipe` (network)
+from `proxy/vless: …` (config) at a glance.
+
+### 5 — common scenarios
+
+```sh
+# Smoke check a freshly provisioned server before handing the URL to users
+./detect_blocking.sh --xray-config "$(cat ~/.xray-prod)"
+
+# Fleet check — N servers from a file, one ndjson record per server
+./detect_blocking.sh --from-file servers-with-urls.txt --json | jq -c '{host: .target.host, ok: (.probes.xray_protocol.status == "ok")}'
+
+# Continuous monitoring (cron / systemd / Docker sidecar)
+./detect_blocking.sh \
+  --xray-config "$(cat ~/.xray-prod)" \
+  --watch 300 --json --quiet \
+  --log-file /var/log/vpn-monitoring.log
+
+# Forensic — when something starts failing, capture the wire too
+sudo ./detect_blocking.sh \
+  --xray-config "$(cat ~/.xray-prod)" \
+  --pcap /tmp/vpn-incident-$(date +%s).pcap
+
+# Bypass discovery — does any alt SNI / port slip past the local DPI?
+./detect_blocking.sh \
+  --xray-config "$(cat ~/.xray-prod)" \
+  --compare-sni www.microsoft.com,www.cloudflare.com,www.apple.com \
+  --compare-port 443,8443,2083
+```
+
+### What if `xray-knife` isn't installed?
+
+Probe 11 prints a one-line `[WARN] skipping — no xray-knife / xray / sing-box
+in PATH` and the other 10 probes run as usual. The script never hard-fails on
+a missing optional dependency — see the gracefully-degrading model in the
+[Requirements](#requirements) section.
+
+---
+
 ## Requirements
 
 **Required:**

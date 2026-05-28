@@ -31,6 +31,7 @@ endpoint and emits a clearly labelled verdict for each detected blocking type.
 | 7 | OpenVPN handshake | Random-SID `0x38` initiator, expects `0x40` server reset |
 | 8 | Control sites | Broad vs targeted censorship (Tor/Proton/Discord reachability) |
 | 9 | IPv6 reachability | AAAA resolution + IPv6 TCP/HTTPS; detects "IPv4-only block" cases |
+| 11 | Xray protocol (opt-in) | Authenticated end-to-end test via `xray-knife`; works for Reality / VLESS / VMess / Trojan / Shadowsocks-2022 / Hysteria2 |
 
 The verdict ends with a list of detected blocks plus an actionable
 recommendation for each (rotate IP, switch to Reality, use uTLS, etc).
@@ -141,9 +142,11 @@ Options:
       --compare-sni LIST  Comma-separated SNI values for the SNI × port matrix.
       --compare-port LIST Comma-separated TCP ports for the SNI × port matrix.
       --port-survey       Scan curated list of common VPN/proxy alt ports.
+      --xray-config URL   End-to-end Xray-protocol test (optional dep: xray-knife).
+                          Accepts vless://, vmess://, trojan://, ss://, hysteria2:// URLs.
       --json              Emit machine-readable JSON; implies --quiet. Requires jq.
 
-Probe names: env, dns, tcp, tls, ua, rst, udp, openvpn, control, ipv6, compare
+Probe names: env, dns, tcp, tls, ua, rst, udp, openvpn, control, ipv6, compare, xray
 
 Override precedence:
   CLI arg > environment variable > detect_blocking.conf > built-in default
@@ -251,6 +254,25 @@ cat servers.txt
 # Aggregate verdicts across all hosts:
 jq -s 'map({host: .target.host, verdicts: .verdicts})' fleet-*.ndjson
 ```
+
+### End-to-end Xray-protocol test (Reality / VLESS / VMess / etc.)
+
+Native blind probing of these protocols is **impossible by design** — Reality
+is engineered to be indistinguishable from a fallback TLS site without
+credentials, Shadowsocks-2022 requires PSK-derived AEAD, etc. The honest
+diagnostic is an *authenticated* client connection through your config:
+
+```sh
+# Requires xray-knife in PATH:
+# go install github.com/lilendian0x00/xray-knife@latest
+
+./detect_blocking.sh \
+  --xray-config "vless://uuid@server.example.org:443?type=tcp&security=reality&pbk=PBK&sid=SID&fp=chrome#prod" \
+  --json | jq '.probes.xray_protocol'
+```
+
+The script masks the credentials in any log / JSON output (`<creds>`
+placeholder), so it's safe to pipe the result to monitoring stacks.
 
 ### Continuous monitoring with `--watch`
 

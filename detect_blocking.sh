@@ -28,7 +28,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.1.0"
+readonly DETECT_BLOCKING_VERSION="0.2.0"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -96,6 +96,7 @@ PCAP_PID=""
 COMPARE_SNI="${COMPARE_SNI:-}"
 COMPARE_PORT="${COMPARE_PORT:-}"
 PORT_SURVEY=0
+XRAY_CONFIG="${XRAY_CONFIG:-}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -116,6 +117,8 @@ while [ $# -gt 0 ]; do
     --compare-port)   COMPARE_PORT="${2:-}"; shift 2 ;;
     --compare-port=*) COMPARE_PORT="${1#--compare-port=}"; shift ;;
     --port-survey)    PORT_SURVEY=1; shift ;;
+    --xray-config)    XRAY_CONFIG="${2:-}"; shift 2 ;;
+    --xray-config=*)  XRAY_CONFIG="${1#--xray-config=}"; shift ;;
     --quiet|-q)    LOG_QUIET=1; shift ;;
     --json)        JSON_MODE=1; LOG_QUIET=1; shift ;;
     --version|-V)
@@ -125,7 +128,7 @@ while [ $# -gt 0 ]; do
     --help|-h)
       sed -n '2,27p' "$0"
       printf '\nversion: %s\n' "$DETECT_BLOCKING_VERSION"
-      printf '\nProbe names (for --only / --skip): env, dns, tcp, tls, ua, rst, udp, openvpn, control, ipv6, compare\n'
+      printf '\nProbe names (for --only / --skip): env, dns, tcp, tls, ua, rst, udp, openvpn, control, ipv6, compare, xray\n'
       printf '\nFlags:\n'
       printf '  --json (needs jq)   machine-readable JSON output (compact in batch/watch loops)\n'
       printf '  --quiet, -q         suppress stdout (logging still works)\n'
@@ -138,6 +141,8 @@ while [ $# -gt 0 ]; do
       printf '  --compare-sni LIST  comma-separated SNI values to test (vs proper / FAKE_SNI)\n'
       printf '  --compare-port LIST comma-separated TCP ports to test (vs VPN_PORT_TCP)\n'
       printf '  --port-survey       scan common alternative VPN/proxy ports (8443, 2083, 2087, ...)\n'
+      printf '  --xray-config URL   delegate end-to-end protocol test to xray-knife (optional dep)\n'
+      printf '                      accepts vless://, vmess://, trojan://, ss://, hysteria2:// URLs\n'
       exit 0
       ;;
     -*) die "unknown option: $1" ;;
@@ -319,6 +324,12 @@ CONTROL_BLOCKED=""
 IPV6_AAAA=""
 IPV6_TARGET_OK=0
 IPV6_HTTPS_CODE=""
+XRAY_TESTER_BIN=""       # discovered binary (xray-knife / xray / sing-box)
+XRAY_STATUS=""           # one of "", ok, failed, unavailable, no-config
+XRAY_RTT_MS=""           # parsed end-to-end RTT in milliseconds
+XRAY_TARGET_IP=""        # echoed Real IP from delegation output
+XRAY_TARGET_LOC=""       # echoed location (country) from delegation output
+XRAY_URL_DISPLAY=""      # creds-masked URL for human-readable / JSON output
 
 # ---------- colors (TTY-aware, suppressed when --quiet) ----------
 
@@ -580,6 +591,38 @@ _doh_multi_check() {
     DOH_MULTI_RESULTS="${DOH_MULTI_RESULTS}${p}|${state}|${ips}
 "
   done
+}
+
+# Locate a delegation binary for end-to-end Xray-protocol testing.
+# Preference order: xray-knife (most ergonomic CLI) > xray (raw core) > sing-box.
+_find_xray_tester() {
+  local c
+  for c in xray-knife xray sing-box; do
+    if command -v "$c" >/dev/null 2>&1; then printf '%s' "$c"; return 0; fi
+  done
+  return 1
+}
+
+# Mask credentials in an Xray protocol URL for safe display in logs / JSON.
+# vless://uuid@host:port?type=tcp&pbk=KEY&sid=SID#name  →  vless://<creds>@host:port#name
+# vmess://BASE64  →  vmess://<base64-config>
+# ss://b64@host:port  →  ss://<creds>@host:port
+_summarize_xray_url() {
+  local url="$1" scheme
+  scheme=$(printf '%s' "$url" | sed -nE 's|^([a-z0-9]+)://.*|\1|p')
+  case "$scheme" in
+    vless|trojan|ss|hysteria|hysteria2|tuic)
+      # scheme://creds@host:port?...#fragment
+      printf '%s' "$url" \
+        | sed -E 's|^([a-z0-9]+)://[^@]+@([^?#/]+)([?#].*)?$|\1://<creds>@\2|'
+      ;;
+    vmess)
+      printf 'vmess://<base64-config>'
+      ;;
+    *)
+      printf '%s' "<unknown-scheme>"
+      ;;
+  esac
 }
 
 _target_https_url() {
@@ -1157,6 +1200,97 @@ EOF
   fi
 }
 
+# Probe 11 — end-to-end Xray-protocol test via delegation to xray-knife
+# (or fallback to xray/sing-box if available). Only runs when --xray-config
+# is provided. Reads success/RTT/echoed-IP from the tester's stdout.
+#
+# WHY NOT NATIVE BASH PROBES: Reality is by-design indistinguishable from
+# the fallback target's TLS; Shadowsocks-2022 requires PSK-derived AEAD to
+# trigger any protocol-specific behaviour; VLESS-with-fallback proxies bad
+# UUIDs to a decoy site. Blind active probing produces false-positives;
+# the only honest end-to-end test is an *authenticated* client connection,
+# which is exactly what xray-knife does.
+probe_xray_protocol() {
+  if [ -z "$XRAY_CONFIG" ]; then
+    XRAY_STATUS="no-config"
+    return 0
+  fi
+
+  hdr "11. Xray-protocol end-to-end test"
+
+  if ! XRAY_TESTER_BIN=$(_find_xray_tester); then
+    XRAY_STATUS="unavailable"
+    warn "skipping — no xray-knife / xray / sing-box in PATH"
+    info "install: go install github.com/lilendian0x00/xray-knife@latest"
+    return 0
+  fi
+
+  XRAY_URL_DISPLAY=$(_summarize_xray_url "$XRAY_CONFIG")
+  info "config: $XRAY_URL_DISPLAY"
+  info "delegating to: $XRAY_TESTER_BIN"
+
+  # Only xray-knife has the "net http" sub-command we depend on; for raw xray
+  # or sing-box we currently can't run the test in one CLI call. Skip clean.
+  if [ "$XRAY_TESTER_BIN" != "xray-knife" ]; then
+    info "only xray-knife is currently supported for one-shot end-to-end probing"
+    info "see https://github.com/lilendian0x00/xray-knife"
+    XRAY_STATUS="unavailable"
+    return 0
+  fi
+
+  local out
+  # `net http` does the full handshake + HTTP request through the tunnel.
+  # -m 1 (one attempt), -d $TIMEOUT (max delay, seconds → ms internally).
+  out=$("$XRAY_TESTER_BIN" net http -c "$XRAY_CONFIG" \
+        -m 1 -d $(( TIMEOUT * 1000 )) 2>&1 || true)
+
+  # Defensive parsing — xray-knife output evolves between versions.
+  # 1) RTT: any "HTTP delay: NNN" / "Delay: NNN" / "delay: NNN" pattern.
+  XRAY_RTT_MS=$(printf '%s' "$out" \
+                | grep -ioE 'http delay:[[:space:]]*[0-9]+' | head -1 \
+                | grep -oE '[0-9]+')
+  [ -z "$XRAY_RTT_MS" ] && XRAY_RTT_MS=$(printf '%s' "$out" \
+                | grep -ioE '(^|[^a-z])delay:[[:space:]]*[0-9]+' | head -1 \
+                | grep -oE '[0-9]+')
+
+  # 2) Echoed Real IP / location, if the tester resolves them.
+  XRAY_TARGET_IP=$(printf '%s' "$out" \
+                   | grep -ioE 'real ip:[[:space:]]*[0-9.]+' | head -1 \
+                   | grep -oE '[0-9.]+')
+  XRAY_TARGET_LOC=$(printf '%s' "$out" \
+                    | grep -ioE 'location:[[:space:]]*[A-Z]{2,}' | head -1 \
+                    | awk '{print $NF}')
+
+  # 3) Verdict: explicit error words win; otherwise RTT presence implies ok.
+  if printf '%s' "$out" | grep -qiE 'timeout|connection refused|i/o timeout|invalid|error 50'; then
+    XRAY_STATUS="failed"
+  elif [ -n "$XRAY_RTT_MS" ]; then
+    XRAY_STATUS="ok"
+  else
+    XRAY_STATUS="failed"
+  fi
+
+  if [ "$XRAY_STATUS" = "ok" ]; then
+    ok "tunnel established, RTT ${XRAY_RTT_MS} ms${XRAY_TARGET_LOC:+ (egress: $XRAY_TARGET_LOC)}"
+    # Cross-reference: tunnel works despite our other probes seeing DPI.
+    if [ "${TLS_PROPER_SNI_OK:-1}" = "0" ] || [ "${DOH_INTEGRITY_STATE:-ok}" = "compromised" ]; then
+      add_verdict "Xray protocol bypasses local DPI/DNS-MITM despite environment signals"
+    fi
+  else
+    fail "Xray-protocol end-to-end test failed"
+    if [ "${TCP_OK:-1}" = "1" ]; then
+      if [ "${TLS_PROPER_SNI_OK:-0}" = "1" ]; then
+        # TCP + TLS to the server work but the protocol doesn't — strong signal.
+        add_verdict "Xray-protocol handshake fails while plain TLS to the same host succeeds — protocol-fingerprint DPI or config error"
+      else
+        add_verdict "Xray-protocol handshake fails — see probes 2-3 for root cause"
+      fi
+    else
+      info "TCP to target was already blocked; protocol failure is consistent"
+    fi
+  fi
+}
+
 probe_ipv6() {
   hdr "9. IPv6 reachability"
 
@@ -1263,6 +1397,12 @@ _emit_json() {
     --arg ipv6_aaaa         "$IPV6_AAAA" \
     --argjson ipv6_target   "${IPV6_TARGET_OK:-0}" \
     --arg ipv6_https        "$IPV6_HTTPS_CODE" \
+    --arg xray_status       "$XRAY_STATUS" \
+    --arg xray_bin          "$XRAY_TESTER_BIN" \
+    --arg xray_rtt          "$XRAY_RTT_MS" \
+    --arg xray_target_ip    "$XRAY_TARGET_IP" \
+    --arg xray_target_loc   "$XRAY_TARGET_LOC" \
+    --arg xray_url_display  "$XRAY_URL_DISPLAY" \
     --argjson verdicts      "$verdicts_json" '
     def words: split(" ") | map(select(length > 0));
     def opt(s): if s == "" then null else s end;
@@ -1339,6 +1479,14 @@ _emit_json() {
           aaaa: ($ipv6_aaaa | words),
           target_reachable: bool_int($ipv6_target),
           https_code: opt($ipv6_https)
+        },
+        xray_protocol: {
+          status: opt($xray_status),
+          tester_binary: opt($xray_bin),
+          rtt_ms: (if $xray_rtt == "" then null else ($xray_rtt | tonumber? // null) end),
+          egress_ip: opt($xray_target_ip),
+          egress_location: opt($xray_target_loc),
+          url_display: opt($xray_url_display)
         }
       },
       verdicts: $verdicts
@@ -1417,6 +1565,7 @@ _should_run openvpn && probe_openvpn
 _should_run control && probe_known_blocked
 _should_run ipv6    && probe_ipv6
 _should_run compare && probe_compare_matrix
+_should_run xray    && probe_xray_protocol
 
 # ---------- summary ----------
 
@@ -1464,6 +1613,9 @@ else
       *"IPv6 transport also unreachable"*) rec="both v4 and v6 down — verify network connectivity end-to-end before blaming DPI" ;;
       *"IPv6 HTTPS layer blocked"*) rec="v6 TCP works but TLS/HTTPS doesn't — likely SNI-DPI applied to v6 too, same mitigation as v4" ;;
       *"Bypass candidate found in compare matrix"*) rec="reconfigure client to use the working (SNI, port) combo from the matrix above" ;;
+      *"Xray protocol bypasses local DPI"*) rec="your protocol stack is working as designed — local DPI sees the cover, not the payload" ;;
+      *"Xray-protocol handshake fails while plain TLS"*) rec="protocol-fingerprint DPI or config drift — verify UUID/keys, try Reality with a fresh target SNI, or switch to a different protocol family" ;;
+      *"Xray-protocol handshake fails"*) rec="end-to-end test failed; address the underlying transport probe verdicts first, then re-run with the same --xray-config" ;;
       *) rec="" ;;
     esac
     if [ -n "$rec" ]; then

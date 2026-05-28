@@ -7,8 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-28
+
 ### Added
 
+- **`--xray-config URL` end-to-end Xray-protocol test** via delegation to
+  `xray-knife` (optional dep, auto-discovered in PATH). Honest authenticated
+  alternative to native blind probing — Reality / Shadowsocks-2022 /
+  Hysteria2 / VLESS-with-fallback are by-design unprobeable from outside
+  without credentials. Operator supplies their `vless://…`, `vmess://…`,
+  `trojan://…`, `ss://…`, `hysteria2://…` URL and the script runs a real
+  end-to-end test through xray-knife, reporting RTT, egress IP/location,
+  and cross-referencing with the other probe results.
+  Credentials in the URL are auto-masked (`<creds>` placeholder) for human
+  + JSON output. New verdicts:
+  `Xray protocol bypasses local DPI/DNS-MITM despite environment signals`
+  (positive case), and
+  `Xray-protocol handshake fails while plain TLS to the same host succeeds`
+  → protocol-fingerprint DPI or config drift.
+  JSON: `probes.xray_protocol` block with status / rtt_ms / egress info.
+  New probe name: `xray` (for `--only`/`--skip`).
 - **Multi-DoH cross-check** (probe_dns): canary query against every URL in
   `DOH_PROVIDERS` (default Cloudflare + Google + Quad9). Distinguishes
   "single-provider MITM" (split DoH hijack) from "all-DoH MITM" (universal

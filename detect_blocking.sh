@@ -80,11 +80,17 @@ fi
 
 LOG_FILE="${LOG_FILE:-}"
 LOG_QUIET="${LOG_QUIET:-0}"
+ONLY_PROBES="${ONLY_PROBES:-}"
+SKIP_PROBES="${SKIP_PROBES:-}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --log-file)   LOG_FILE="${2:-}"; shift 2 ;;
     --log-file=*) LOG_FILE="${1#--log-file=}"; shift ;;
+    --only)       ONLY_PROBES="${2:-}"; shift 2 ;;
+    --only=*)     ONLY_PROBES="${1#--only=}"; shift ;;
+    --skip)       SKIP_PROBES="${2:-}"; shift 2 ;;
+    --skip=*)     SKIP_PROBES="${1#--skip=}"; shift ;;
     --quiet|-q)   LOG_QUIET=1; shift ;;
     --version|-V)
       printf 'detect_blocking %s\n' "$DETECT_BLOCKING_VERSION"
@@ -93,12 +99,25 @@ while [ $# -gt 0 ]; do
     --help|-h)
       sed -n '2,27p' "$0"
       printf '\nversion: %s\n' "$DETECT_BLOCKING_VERSION"
+      printf '\nProbe names (for --only / --skip): env, dns, tcp, tls, ua, rst, udp, openvpn, control\n'
       exit 0
       ;;
     -*) die "unknown option: $1" ;;
     *)  VPN_HOST="${1}"; shift ;;
   esac
 done
+
+# Probe gate: --only takes precedence over --skip; comma-separated lists.
+_should_run() {
+  local name="$1"
+  if [ -n "$ONLY_PROBES" ]; then
+    case ",$ONLY_PROBES," in *,"$name",*) return 0 ;; *) return 1 ;; esac
+  fi
+  if [ -n "$SKIP_PROBES" ]; then
+    case ",$SKIP_PROBES," in *,"$name",*) return 1 ;; esac
+  fi
+  return 0
+}
 
 # ---------- config defaults ----------
 
@@ -137,6 +156,8 @@ OPENVPN_UDP_OK=0
 OPENVPN_TCP_OK=0
 DOH_INTEGRITY_STATE=""   # one of: "", ok, unreachable, compromised
 DOH_INTEGRITY_IPS=""     # what DoH returned for the canary query
+DOT_INTEGRITY_STATE=""   # one of: "", ok, unreachable, compromised, skipped
+DOT_INTEGRITY_IPS=""     # what DoT returned for the canary query
 RST_TMP_OUT=""           # probe-5 temp files; cleaned by EXIT trap on interrupt
 RST_TMP_TIME=""
 
@@ -292,6 +313,48 @@ _doh_integrity_check() {
   DOH_INTEGRITY_STATE="compromised"
 }
 
+# DoT integrity canary (parallels DoH). Queries one.one.one.one over TCP 853
+# via `dig +tls` (BIND 9.18+) or `kdig` (knot-utils) when available. Lets us
+# distinguish "DoH MITM" from "all encrypted DNS MITM" — operators may then
+# fall back to DoT inside their VPN client.
+_dot_integrity_check() {
+  DOT_INTEGRITY_STATE=""
+  DOT_INTEGRITY_IPS=""
+
+  local response ip
+  if check_cmd dig && dig -h 2>&1 | grep -qE '[\+\-]tls'; then
+    response=$(dig +tls +short +time="$TIMEOUT" +tries=1 \
+                 @1.1.1.1 one.one.one.one A 2>/dev/null)
+  elif check_cmd kdig; then
+    response=$(kdig +tls +short @1.1.1.1 one.one.one.one A 2>/dev/null)
+  else
+    DOT_INTEGRITY_STATE="skipped"
+    return
+  fi
+
+  DOT_INTEGRITY_IPS=$(printf '%s' "$response" | _ipv4_lines | _join_words)
+  if [ -z "$DOT_INTEGRITY_IPS" ]; then
+    DOT_INTEGRITY_STATE="unreachable"
+    return
+  fi
+  for ip in $DOT_INTEGRITY_IPS; do
+    case "$ip" in 1.1.1.1|1.0.0.1) DOT_INTEGRITY_STATE="ok"; return ;; esac
+  done
+  DOT_INTEGRITY_STATE="compromised"
+}
+
+# Locate a curl-impersonate binary. Common names across distros:
+#   curl-impersonate-chrome  (Debian/Ubuntu)
+#   curl_chrome116, curl_chrome120, ...  (Homebrew, upstream releases)
+#   curl_chrome  (generic alias users sometimes set up)
+_find_curl_impersonate() {
+  local c
+  for c in curl-impersonate-chrome curl_chrome120 curl_chrome116 curl_chrome curl-impersonate; do
+    if command -v "$c" >/dev/null 2>&1; then printf '%s' "$c"; return 0; fi
+  done
+  return 1
+}
+
 _target_https_url() {
   if [ "$VPN_PORT_TCP" = "443" ]; then
     printf 'https://%s/' "$VPN_HOST"
@@ -375,6 +438,23 @@ probe_dns() {
     compromised)
       fail "DoH integrity:    canary returned $DOH_INTEGRITY_IPS for one.one.one.one (expected 1.1.1.1/1.0.0.1)"
       add_verdict "DoH path is compromised – network intercepts/poisons DoH responses"
+      ;;
+  esac
+
+  _dot_integrity_check
+  case "$DOT_INTEGRITY_STATE" in
+    ok)
+      info "DoT integrity:    ok ($DOT_INTEGRITY_IPS via TLS:853)"
+      ;;
+    unreachable)
+      info "DoT integrity:    1.1.1.1:853 silent – DoT may also be blocked"
+      ;;
+    compromised)
+      fail "DoT integrity:    canary returned $DOT_INTEGRITY_IPS for one.one.one.one (TLS:853 also MITM'd)"
+      add_verdict "DoT path is compromised – TLS:853 cannot be trusted as DNS fallback"
+      ;;
+    skipped)
+      info "DoT integrity:    no \`dig +tls\` or \`kdig\` available – skipped"
       ;;
   esac
 
@@ -469,7 +549,7 @@ probe_tls_handshake() {
   hdr "3. TLS handshake behaviour"
   [ "$TCP_OK" -ne 1 ] && { warn "skipping – TCP unreachable"; return; }
 
-  local with_sni no_sni fake_sni
+  local with_sni no_sni fake_sni frag_sni=0
   with_sni=$(echo Q | openssl s_client -connect "$RESOLVED_IP:$VPN_PORT_TCP" \
     -servername "$VPN_HOST" -brief 2>&1 \
     | grep -cE 'Protocol version|Verification' || true)
@@ -486,7 +566,21 @@ probe_tls_handshake() {
   info "TLS without SNI:                   $([ "$no_sni" -gt 0 ] && echo OK || echo FAIL)"
   info "TLS with innocent SNI ($FAKE_SNI): $([ "$fake_sni" -gt 0 ] && echo OK || echo FAIL)"
 
-  if [ "$with_sni" -eq 0 ] && [ "$no_sni" -gt 0 ]; then
+  # If proper-SNI handshake failed, probe TLS-record fragmentation as a
+  # bypass test. `-max_send_frag 64` splits the ClientHello across many
+  # tiny TLS records — DPIs that don't reassemble records can be evaded.
+  # Skipped on the happy path to avoid unnecessary network noise.
+  if [ "$with_sni" -eq 0 ]; then
+    frag_sni=$(echo Q | openssl s_client -connect "$RESOLVED_IP:$VPN_PORT_TCP" \
+      -servername "$VPN_HOST" -brief -max_send_frag 64 2>&1 \
+      | grep -cE 'Protocol version|Verification' || true)
+    info "TLS with 64-byte record fragments: $([ "$frag_sni" -gt 0 ] && echo OK || echo FAIL)"
+  fi
+
+  if [ "$with_sni" -eq 0 ] && [ "$frag_sni" -gt 0 ]; then
+    fail "fragmented TLS bypasses block → DPI does not reassemble TLS records"
+    add_verdict "DPI bypassable via TLS-record fragmentation (use small-record / split-SNI client)"
+  elif [ "$with_sni" -eq 0 ] && [ "$no_sni" -gt 0 ]; then
     fail "DPI dies only when our SNI is sent → SNI-BASED BLOCKING"
     add_verdict "SNI-based DPI block – server name is in censor blacklist"
   elif [ "$with_sni" -eq 0 ] && [ "$fake_sni" -gt 0 ]; then
@@ -500,15 +594,17 @@ probe_tls_handshake() {
   fi
 }
 
-# V1: this probe varies only the User-Agent. Both curl calls share the same
-# TLS stack — the ClientHello (ciphers / extensions / curves order) is
-# identical, so this does NOT test JA3/JA4. A divergence means UA-based
-# filtering. Real JA3 testing needs curl-impersonate-chrome or similar.
+# Probe 4: distinguishes three filtering classes that all manifest as HTTP
+# failures from a vanilla curl but pass through a real browser:
+#   1) UA filtering only       — header alone is enough to be allowed
+#   2) JA3/TLS-fp filtering    — needs full browser-grade ClientHello (curl-impersonate)
+#   3) Block-page UA filtering — 403/451 with custom block page for default UA
+# Real JA3 testing requires curl-impersonate-chrome (auto-detected, optional).
 probe_request_filter() {
-  hdr "4. Request-header (UA) filtering — not full JA3"
+  hdr "4. Request-header / TLS-fingerprint filtering"
   [ "$TCP_OK" -ne 1 ] && { warn "skipping – TCP unreachable"; return; }
 
-  local curl_default curl_chrome http2_opt="" target_url
+  local curl_default curl_chrome curl_impersonate="" http2_opt="" target_url impersonate_cmd
   target_url=$(_target_https_url)
   curl --version 2>/dev/null | grep -qiE 'HTTP2|HTTP/2' && http2_opt="--http2"
 
@@ -524,20 +620,45 @@ probe_request_filter() {
     -o /dev/null -w '%{http_code}' "$target_url" 2>/dev/null)
   [ -n "$curl_chrome" ] || curl_chrome="000"
 
-  info "curl default UA:  HTTP $curl_default"
-  info "Chrome-like UA:   HTTP $curl_chrome"
+  info "curl default UA:    HTTP $curl_default"
+  info "Chrome-like UA:     HTTP $curl_chrome"
 
-  if [ "$curl_default" = "000" ] && [ "$curl_chrome" != "000" ]; then
+  # Optional 3rd probe: real JA3 via curl-impersonate. Mimics full Chrome
+  # ClientHello (ciphers, extensions, curve order, signature algorithms).
+  if impersonate_cmd=$(_find_curl_impersonate); then
+    curl_impersonate=$("$impersonate_cmd" -sk --max-time "$TIMEOUT" \
+      --resolve "$VPN_HOST:$VPN_PORT_TCP:$RESOLVED_IP" \
+      -o /dev/null -w '%{http_code}' "$target_url" 2>/dev/null)
+    [ -n "$curl_impersonate" ] || curl_impersonate="000"
+    info "Impersonate Chrome: HTTP $curl_impersonate  ($impersonate_cmd)"
+  else
+    info "Impersonate Chrome: skipped (no curl-impersonate-chrome installed)"
+  fi
+
+  # Order matters: check JA3-only first (most specific), then UA, then 000-fail.
+  if [ -n "$impersonate_cmd" ] \
+     && [ "$curl_impersonate" != "000" ] \
+     && [ "$curl_default" = "000" ] && [ "$curl_chrome" = "000" ]; then
+    fail "only real-JA3 client reaches the server → TLS-fingerprint (JA3) DPI"
+    add_verdict "TLS fingerprint (JA3/JA4) filtering — only browser-grade ClientHello accepted"
+  elif [ -n "$impersonate_cmd" ] \
+       && [ "$curl_impersonate" != "000" ] \
+       && [ "$curl_default" = "000" ] && [ "$curl_chrome" != "000" ]; then
+    info "all three pass at the fingerprint level — UA-only filter (see below)"
     warn "Chrome-UA works, default-UA fails (connection) → User-Agent filtering (not TLS-fp)"
     add_verdict "User-Agent based filtering (not JA3 — same TLS stack)"
-  elif [ "$curl_default" = "000" ] && [ "$curl_chrome" = "000" ]; then
-    warn "both requests fail – HTTPS layer entirely cut"
+  elif [ "$curl_default" = "000" ] && [ "$curl_chrome" != "000" ]; then
+    warn "Chrome-UA works, default-UA fails (connection) → User-Agent filtering (not TLS-fp)"
+    add_verdict "User-Agent based filtering (not JA3 — same TLS stack)"
+  elif [ "$curl_default" = "000" ] && [ "$curl_chrome" = "000" ] \
+       && [ -z "$impersonate_cmd" -o "$curl_impersonate" = "000" ]; then
+    warn "all requests fail – HTTPS layer entirely cut"
   elif printf '%s' "$curl_default" | grep -qE '^(403|451)$' \
        && ! printf '%s' "$curl_chrome" | grep -qE '^(403|451)$'; then
     warn "default-UA gets HTTP $curl_default block page, Chrome-UA gets $curl_chrome → UA filtering via block page"
     add_verdict "User-Agent based filtering (not JA3 — same TLS stack)"
   else
-    ok "HTTPS responds (HTTP $curl_default) – no UA filtering detected"
+    ok "HTTPS responds (HTTP $curl_default) – no UA / fingerprint filtering detected"
   fi
 }
 
@@ -717,15 +838,15 @@ if [ -n "$_missing_optional" ]; then
 fi
 unset _missing_optional
 
-probe_environment
-probe_dns || true
-probe_tcp_reachability
-probe_tls_handshake
-probe_request_filter
-probe_rst_injection
-probe_udp_protocols
-probe_openvpn
-probe_known_blocked
+_should_run env     && probe_environment
+_should_run dns     && { probe_dns || true; }
+_should_run tcp     && probe_tcp_reachability
+_should_run tls     && probe_tls_handshake
+_should_run ua      && probe_request_filter
+_should_run rst     && probe_rst_injection
+_should_run udp     && probe_udp_protocols
+_should_run openvpn && probe_openvpn
+_should_run control && probe_known_blocked
 
 # ---------- summary ----------
 
@@ -744,16 +865,19 @@ else
       *"System DNS failure"*)     rec="use DoH inside the VPN client and check router/provider DNS" ;;
       *"DNS sinkhole"*)           rec="use DoH inside the VPN client, not system resolver" ;;
       *"DoH path is compromised"*) rec="self-host DoH or use a trusted resolver via VPN tunnel – upstream DoH is intercepted on this network" ;;
+      *"DoT path is compromised"*) rec="DoH AND DoT both intercepted – use an out-of-band resolver inside the VPN tunnel, not local network DNS" ;;
       *"Domain unresolvable"*)    rec="verify the hostname and test from another resolver/network" ;;
       *"Network connectivity"*)   rec="check local internet/VPN state before interpreting target probes" ;;
       *"Target TCP reachability"*) rec="fix DNS first, then rerun transport probes" ;;
       *"IP route"*)               rec="rotate to a fresh IP / different /24" ;;
       *"Port 443"*)               rec="try TCP 8443, 2083, 2053 (Cloudflare-allowed ports)" ;;
       *"TLS DPI"*)                rec="switch to a non-TLS transport (Hysteria2, IKEv2, WG)" ;;
+      *"TLS-record fragmentation"*) rec="exploit naive DPI reassembly: enable record splitting in your client (e.g. byedpi, GreenTunnel, custom uTLS profile)" ;;
       *"RST injection"*)          rec="use uTLS-mimicked client, fragmentation, or non-TCP" ;;
       *"Silent packet"*)          rec="likely full IP block, rotate endpoint" ;;
       *"QUIC"*)                   rec="fall back to TCP-based transport for now" ;;
       *"User-Agent"*)             rec="adjust UA header in client; not a TLS-fp problem" ;;
+      *"JA3/JA4"*)                rec="use uTLS / curl-impersonate-grade client to mimic real browser ClientHello; vanilla Go/OpenSSL fingerprints get filtered" ;;
       *"OpenVPN handshake"*)      rec="use obfs-wrapped OpenVPN (Obfsproxy/Stunnel) or IKEv2/WG" ;;
       *"OpenVPN TCP port open"*)  rec="confirms targeted port-block; try OpenVPN as fallback" ;;
       *"Broad censorship"*)       rec="expect aggressive DPI; minimum stack: Reality + uTLS" ;;

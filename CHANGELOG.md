@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--only` / `--skip` probe-selection flags** for fast re-runs of a single
+  layer or skipping known-irrelevant probes. Probe names: `env`, `dns`, `tcp`,
+  `tls`, `ua`, `rst`, `udp`, `openvpn`, `control`.
+- **DoT integrity canary** (TCP 853): cross-checks `one.one.one.one`
+  via `dig +tls` (BIND 9.18+) or `kdig` when available. Distinguishes
+  "DoH MITM" from "all encrypted DNS MITM" and surfaces a hardened
+  `DoT path is compromised` verdict when both fail.
+- **TLS-record fragmentation bypass probe** in `probe_tls_handshake`:
+  when proper-SNI handshake fails, retries with `openssl -max_send_frag 64`.
+  If the fragmented variant succeeds, emits `DPI bypassable via TLS-record
+  fragmentation` verdict pointing at split-SNI / record-splitting clients.
+- **Real JA3/JA4 detection** in `probe_request_filter`: when
+  `curl-impersonate-chrome` (or `curl_chrome116`, `curl_chrome`, etc.) is
+  installed, runs a 3rd request with a full browser-grade ClientHello.
+  Distinguishes UA filtering from true TLS-fingerprint DPI; emits
+  `TLS fingerprint (JA3/JA4) filtering` verdict when only the impersonate
+  client passes.
+
 ### Fixed
 
 - `--help` no longer bleeds code into the help text — the `sed` range now

@@ -18,7 +18,7 @@
 #
 # Usage:
 #   ./detect_blocking.sh                       # uses defaults / config file
-#   ./detect_blocking.sh my-vpn.example.com    # CLI override of VPN_HOST
+#   ./detect_blocking.sh www.example.com    # CLI override of VPN_HOST
 #   VPN_HOST=h.example.com ./detect_blocking.sh
 #   ./detect_blocking.sh --log-file /tmp/d.log --quiet
 #   CONFIG_FILE=/path/to/file ./detect_blocking.sh
@@ -91,6 +91,11 @@ SKIP_PROBES="${SKIP_PROBES:-}"
 JSON_MODE="${JSON_MODE:-0}"
 WATCH_INTERVAL="${WATCH_INTERVAL:-}"
 BATCH_FILE="${BATCH_FILE:-}"
+PCAP_FILE="${PCAP_FILE:-}"
+PCAP_PID=""
+COMPARE_SNI="${COMPARE_SNI:-}"
+COMPARE_PORT="${COMPARE_PORT:-}"
+PORT_SURVEY=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -104,6 +109,13 @@ while [ $# -gt 0 ]; do
     --watch=*)     WATCH_INTERVAL="${1#--watch=}"; shift ;;
     --from-file)   BATCH_FILE="${2:-}"; shift 2 ;;
     --from-file=*) BATCH_FILE="${1#--from-file=}"; shift ;;
+    --pcap)        PCAP_FILE="${2:-}"; shift 2 ;;
+    --pcap=*)      PCAP_FILE="${1#--pcap=}"; shift ;;
+    --compare-sni)    COMPARE_SNI="${2:-}"; shift 2 ;;
+    --compare-sni=*)  COMPARE_SNI="${1#--compare-sni=}"; shift ;;
+    --compare-port)   COMPARE_PORT="${2:-}"; shift 2 ;;
+    --compare-port=*) COMPARE_PORT="${1#--compare-port=}"; shift ;;
+    --port-survey)    PORT_SURVEY=1; shift ;;
     --quiet|-q)    LOG_QUIET=1; shift ;;
     --json)        JSON_MODE=1; LOG_QUIET=1; shift ;;
     --version|-V)
@@ -113,7 +125,7 @@ while [ $# -gt 0 ]; do
     --help|-h)
       sed -n '2,27p' "$0"
       printf '\nversion: %s\n' "$DETECT_BLOCKING_VERSION"
-      printf '\nProbe names (for --only / --skip): env, dns, tcp, tls, ua, rst, udp, openvpn, control, ipv6\n'
+      printf '\nProbe names (for --only / --skip): env, dns, tcp, tls, ua, rst, udp, openvpn, control, ipv6, compare\n'
       printf '\nFlags:\n'
       printf '  --json (needs jq)   machine-readable JSON output (compact in batch/watch loops)\n'
       printf '  --quiet, -q         suppress stdout (logging still works)\n'
@@ -122,6 +134,10 @@ while [ $# -gt 0 ]; do
       printf '  --skip LIST         skip listed probes\n'
       printf '  --watch SECONDS     repeat probe every SECONDS, until interrupted\n'
       printf '  --from-file PATH    iterate over hosts in file (one per line, # comments)\n'
+      printf '  --pcap PATH         tcpdump probe traffic to PATH (needs root / cap_net_raw)\n'
+      printf '  --compare-sni LIST  comma-separated SNI values to test (vs proper / FAKE_SNI)\n'
+      printf '  --compare-port LIST comma-separated TCP ports to test (vs VPN_PORT_TCP)\n'
+      printf '  --port-survey       scan common alternative VPN/proxy ports (8443, 2083, 2087, ...)\n'
       exit 0
       ;;
     -*) die "unknown option: $1" ;;
@@ -131,6 +147,19 @@ done
 
 if [ "$JSON_MODE" = "1" ]; then
   check_cmd jq || die "--json requires jq (install: brew install jq / apt-get install jq)"
+fi
+
+# --port-survey: curated list of common alt-VPN/proxy ports, merged into
+# COMPARE_PORT so the compare matrix picks them up. Doesn't override an
+# explicit --compare-port, just extends it.
+if [ "$PORT_SURVEY" = "1" ]; then
+  _common_alt_ports="8443 2083 2087 2053 8388 4443 9443 51820 1194 500"
+  if [ -z "$COMPARE_PORT" ]; then
+    COMPARE_PORT=$(printf '%s' "$_common_alt_ports" | tr ' ' ',')
+  else
+    COMPARE_PORT="${COMPARE_PORT},$(printf '%s' "$_common_alt_ports" | tr ' ' ',')"
+  fi
+  unset _common_alt_ports
 fi
 
 # Filter --watch / --from-file out of $_ORIGINAL_ARGS for child invocations.
@@ -232,6 +261,7 @@ BASELINE_IPS="${BASELINE_IPS:-${BASELINE_IP:-1.1.1.1} 8.8.8.8 9.9.9.9}"
 FAKE_SNI="${FAKE_SNI:-www.microsoft.com}"
 CONTROL_SITES="${CONTROL_SITES:-www.protonvpn.com www.torproject.org www.discord.com}"
 DOH_URL="${DOH_URL:-https://1.1.1.1/dns-query}"
+DOH_PROVIDERS="${DOH_PROVIDERS:-https://1.1.1.1/dns-query https://dns.google/dns-query https://dns.quad9.net/dns-query}"
 TIMEOUT="${TIMEOUT:-5}"
 
 # When 0 (default): OpenVPN handshake silence is reported as INCONCLUSIVE
@@ -251,6 +281,10 @@ DOH_INTEGRITY_STATE=""   # one of: "", ok, unreachable, compromised
 DOH_INTEGRITY_IPS=""     # what DoH returned for the canary query
 DOT_INTEGRITY_STATE=""   # one of: "", ok, unreachable, compromised, skipped
 DOT_INTEGRITY_IPS=""     # what DoT returned for the canary query
+DOH_MULTI_RESULTS=""     # one " url|state|ips" entry per checked provider
+DOH_MULTI_OK=0           # how many providers returned the canonical answer
+DOH_MULTI_COMPROMISED=0  # how many returned wrong IPs
+DOH_MULTI_UNREACHABLE=0  # how many failed to respond
 RST_TMP_OUT=""           # probe-5 temp files; cleaned by EXIT trap on interrupt
 RST_TMP_TIME=""
 
@@ -512,6 +546,42 @@ _find_curl_impersonate() {
   return 1
 }
 
+# Multi-provider DoH cross-check. Queries one.one.one.one against every URL
+# in $DOH_PROVIDERS and records per-provider state. Catches "all-DoH MITM"
+# (every provider redirected to the same sinkhole) and "split MITM" (only
+# one provider hijacked) cases that single-provider canary cannot see.
+_doh_multi_check() {
+  DOH_MULTI_RESULTS=""
+  DOH_MULTI_OK=0
+  DOH_MULTI_COMPROMISED=0
+  DOH_MULTI_UNREACHABLE=0
+
+  local p ips ip state
+  for p in $DOH_PROVIDERS; do
+    ips=$(curl -sf --max-time "$TIMEOUT" \
+      -H 'accept: application/dns-json' \
+      "$p?name=one.one.one.one&type=A" 2>/dev/null \
+      | _parse_doh_ips | _join_words)
+
+    if [ -z "$ips" ]; then
+      state="unreachable"
+      DOH_MULTI_UNREACHABLE=$((DOH_MULTI_UNREACHABLE + 1))
+    else
+      state="compromised"
+      for ip in $ips; do
+        case "$ip" in 1.1.1.1|1.0.0.1) state="ok"; break ;; esac
+      done
+      case "$state" in
+        ok)          DOH_MULTI_OK=$((DOH_MULTI_OK + 1)) ;;
+        compromised) DOH_MULTI_COMPROMISED=$((DOH_MULTI_COMPROMISED + 1)) ;;
+      esac
+    fi
+
+    DOH_MULTI_RESULTS="${DOH_MULTI_RESULTS}${p}|${state}|${ips}
+"
+  done
+}
+
 _target_https_url() {
   if [ "$VPN_PORT_TCP" = "443" ]; then
     printf 'https://%s/' "$VPN_HOST"
@@ -601,6 +671,20 @@ probe_dns() {
       add_verdict "DoH path is compromised – network intercepts/poisons DoH responses"
       ;;
   esac
+
+  # Multi-DoH cross-check — broader picture than the single-provider canary.
+  _doh_multi_check
+  local total_providers=$((DOH_MULTI_OK + DOH_MULTI_COMPROMISED + DOH_MULTI_UNREACHABLE))
+  if [ "$total_providers" -gt 1 ]; then
+    info "DoH cross-check:  ${DOH_MULTI_OK}/${total_providers} providers honest, ${DOH_MULTI_COMPROMISED} compromised, ${DOH_MULTI_UNREACHABLE} unreachable"
+    if [ "$DOH_MULTI_OK" -eq 0 ] && [ "$DOH_MULTI_COMPROMISED" -gt 0 ]; then
+      fail "all reachable DoH providers return wrong IPs — encrypted DNS is uniformly MITM'd"
+      add_verdict "All DoH providers compromised – network does universal DoH interception"
+    elif [ "$DOH_MULTI_COMPROMISED" -gt 0 ]; then
+      warn "${DOH_MULTI_COMPROMISED} provider(s) return wrong IPs — split MITM"
+      add_verdict "Split DoH MITM – ${DOH_MULTI_COMPROMISED} of ${total_providers} providers compromised"
+    fi
+  fi
 
   _dot_integrity_check
   case "$DOT_INTEGRITY_STATE" in
@@ -999,6 +1083,78 @@ probe_known_blocked() {
   fi
 }
 
+COMPARE_MATRIX=""        # rows of "sni|port|tls_state|tcp_state"
+
+# Compare matrix: SNI × port. Useful when single-SNI probe fails — operator
+# wants to know "does ANY (SNI, port) combo bypass the DPI?".
+# Skipped unless --compare-sni or --compare-port is given.
+probe_compare_matrix() {
+  [ -z "$COMPARE_SNI" ] && [ -z "$COMPARE_PORT" ] && return 0
+
+  hdr "9b. Compare matrix (SNI × port)"
+  [ -z "$RESOLVED_IP" ] && { warn "skipping – no resolved IP"; return; }
+
+  local sni_list port_list sni port tls_ok tcp_ok
+  # Always include the canonical pair so the matrix is self-comparable.
+  sni_list="$VPN_HOST $(printf '%s' "$COMPARE_SNI" | tr ',' ' ')"
+  port_list="$VPN_PORT_TCP $(printf '%s' "$COMPARE_PORT" | tr ',' ' ')"
+
+  printf '  %-30s' "SNI \\ Port"
+  for port in $port_list; do printf '%-12s' "$port"; done
+  printf '\n'
+
+  COMPARE_MATRIX=""
+  for sni in $sni_list; do
+    [ -z "$sni" ] && continue
+    printf '  %-30s' "$sni"
+    for port in $port_list; do
+      [ -z "$port" ] && continue
+      # TCP gate first — skip TLS if port is dead.
+      if _nc_tcp_probe "$RESOLVED_IP" "$port"; then
+        tcp_ok=1
+        if echo Q | openssl s_client -connect "$RESOLVED_IP:$port" \
+             -servername "$sni" -brief 2>&1 \
+             | grep -qE 'Protocol version|Verification'; then
+          tls_ok=1
+          printf "%-12s" "TLS✓"
+        else
+          tls_ok=0
+          printf "%-12s" "TCP✓"
+        fi
+      else
+        tcp_ok=0; tls_ok=0
+        printf "%-12s" "—"
+      fi
+      COMPARE_MATRIX="${COMPARE_MATRIX}${sni}|${port}|${tls_ok}|${tcp_ok}
+"
+    done
+    printf '\n'
+  done
+
+  # Heuristic verdict: if a non-canonical combo works but the canonical fails,
+  # surface as bypass candidate.
+  local canonical_failed=0 alt_works=0
+  while IFS='|' read -r m_sni m_port m_tls m_tcp; do
+    [ -z "$m_sni" ] && continue
+    if [ "$m_sni" = "$VPN_HOST" ] && [ "$m_port" = "$VPN_PORT_TCP" ]; then
+      [ "$m_tls" = "0" ] && canonical_failed=1
+    else
+      [ "$m_tls" = "1" ] && alt_works=1
+    fi
+  done <<EOF
+$COMPARE_MATRIX
+EOF
+
+  if [ "$canonical_failed" = "1" ] && [ "$alt_works" = "1" ]; then
+    fail "canonical (host:port) blocked but at least one alt combo works"
+    add_verdict "Bypass candidate found in compare matrix — switch client SNI/port"
+  elif [ "$canonical_failed" = "1" ]; then
+    info "no working alt-combo — blocked uniformly across the tested set"
+  else
+    ok "canonical pair works; alt combos for reference only"
+  fi
+}
+
 probe_ipv6() {
   hdr "9. IPv6 reachability"
 
@@ -1075,6 +1231,10 @@ _emit_json() {
     --arg doh_ips           "$DOH_INTEGRITY_IPS" \
     --arg dot_state         "$DOT_INTEGRITY_STATE" \
     --arg dot_ips           "$DOT_INTEGRITY_IPS" \
+    --arg doh_multi         "$DOH_MULTI_RESULTS" \
+    --argjson doh_multi_ok  "${DOH_MULTI_OK:-0}" \
+    --argjson doh_multi_bad "${DOH_MULTI_COMPROMISED:-0}" \
+    --argjson doh_multi_off "${DOH_MULTI_UNREACHABLE:-0}" \
     --argjson tcp_baseline  "${TCP_BASELINE_OK:-0}" \
     --arg tcp_baseline_ip   "$TCP_BASELINE_IP" \
     --argjson tcp_target    "${TCP_OK:-0}" \
@@ -1128,7 +1288,13 @@ _emit_json() {
           system_a: ($dns_sys_ips | words),
           doh_a: ($dns_doh_ips | words),
           doh_integrity: {state: opt($doh_state), returned: ($doh_ips | words)},
-          dot_integrity: {state: opt($dot_state), returned: ($dot_ips | words)}
+          dot_integrity: {state: opt($dot_state), returned: ($dot_ips | words)},
+          doh_multi: {
+            ok: $doh_multi_ok,
+            compromised: $doh_multi_bad,
+            unreachable: $doh_multi_off,
+            providers: ($doh_multi | split("\n") | map(select(length > 0) | split("|") | {url: .[0], state: .[1], returned: (.[2] | split(" ") | map(select(length > 0)))}))
+          }
         },
         tcp: {
           baseline_reachable: bool_int($tcp_baseline),
@@ -1181,8 +1347,40 @@ _emit_json() {
 
 _init_log
 
-# Clean up probe-5 temp files even if the run is interrupted (Ctrl-C) mid-probe.
-trap 'rm -f "$RST_TMP_OUT" "$RST_TMP_TIME" 2>/dev/null' EXIT
+# Cleanup trap: probe-5 temp files + optional tcpdump capture (--pcap).
+_cleanup() {
+  rm -f "$RST_TMP_OUT" "$RST_TMP_TIME" 2>/dev/null
+  [ -n "$PCAP_PID" ] && kill "$PCAP_PID" 2>/dev/null
+}
+trap _cleanup EXIT
+
+# --pcap: spawn tcpdump in the background to capture probe-related traffic.
+# Scope-narrowed via 'host VPN_HOST' BPF filter — only captures packets to/from
+# our target plus baseline. Needs root or cap_net_raw; warns + continues on
+# permission denial.
+if [ -n "$PCAP_FILE" ]; then
+  if ! check_cmd tcpdump; then
+    warn "--pcap: tcpdump not installed; capture disabled"
+    PCAP_FILE=""
+  else
+    # Ensure parent dir exists.
+    _pcap_dir=$(dirname -- "$PCAP_FILE")
+    [ -d "$_pcap_dir" ] || mkdir -p -- "$_pcap_dir" 2>/dev/null || true
+    # Capture host VPN_HOST (+ resolved IP added later won't be retroactive,
+    # but BPF filter on hostname matches both IPv4 and IPv6 well in practice).
+    tcpdump -i any -nn -U -w "$PCAP_FILE" "host $VPN_HOST" \
+            >/dev/null 2>&1 &
+    PCAP_PID=$!
+    sleep 0.3
+    if kill -0 "$PCAP_PID" 2>/dev/null; then
+      [ "$LOG_QUIET" = "1" ] || printf '%s\n' "${YEL}pcap:${RST} writing to $PCAP_FILE (pid $PCAP_PID)"
+    else
+      warn "--pcap: tcpdump exited (likely needs sudo / cap_net_raw); continuing without capture"
+      PCAP_PID=""
+      PCAP_FILE=""
+    fi
+  fi
+fi
 
 if [ "$LOG_QUIET" != "1" ]; then
   printf '%s\n' "${BLU}VPN-blocking diagnostic for ${VPN_HOST}${RST}"
@@ -1216,6 +1414,7 @@ _should_run udp     && probe_udp_protocols
 _should_run openvpn && probe_openvpn
 _should_run control && probe_known_blocked
 _should_run ipv6    && probe_ipv6
+_should_run compare && probe_compare_matrix
 
 # ---------- summary ----------
 
@@ -1241,6 +1440,8 @@ else
       *"DNS sinkhole"*)           rec="use DoH inside the VPN client, not system resolver" ;;
       *"DoH path is compromised"*) rec="self-host DoH or use a trusted resolver via VPN tunnel – upstream DoH is intercepted on this network" ;;
       *"DoT path is compromised"*) rec="DoH AND DoT both intercepted – use an out-of-band resolver inside the VPN tunnel, not local network DNS" ;;
+      *"All DoH providers compromised"*) rec="network does universal DoH MITM (likely national-CA TLS interception) — encrypted DNS is unusable on this network, tunnel DNS over VPN" ;;
+      *"Split DoH MITM"*) rec="at least one DoH provider is hijacked — switch DOH_URL to one of the honest providers in DOH_PROVIDERS for this session" ;;
       *"Domain unresolvable"*)    rec="verify the hostname and test from another resolver/network" ;;
       *"Network connectivity"*)   rec="check local internet/VPN state before interpreting target probes" ;;
       *"Target TCP reachability"*) rec="fix DNS first, then rerun transport probes" ;;
@@ -1260,6 +1461,7 @@ else
       *"IPv4 blocked but IPv6 reachable"*) rec="enable IPv6-preferred mode in client; IPv4 path is being filtered while v6 is clean" ;;
       *"IPv6 transport also unreachable"*) rec="both v4 and v6 down — verify network connectivity end-to-end before blaming DPI" ;;
       *"IPv6 HTTPS layer blocked"*) rec="v6 TCP works but TLS/HTTPS doesn't — likely SNI-DPI applied to v6 too, same mitigation as v4" ;;
+      *"Bypass candidate found in compare matrix"*) rec="reconfigure client to use the working (SNI, port) combo from the matrix above" ;;
       *) rec="" ;;
     esac
     if [ -n "$rec" ]; then

@@ -99,7 +99,7 @@ chmod +x detect_blocking.sh
 ./detect_blocking.sh
 
 # Real run against your endpoint
-./detect_blocking.sh my-vpn.example.org
+./detect_blocking.sh www.example.com
 ```
 
 ---
@@ -137,9 +137,13 @@ Options:
       --skip LIST         Skip the listed probes (comma-separated).
       --watch SECONDS     Repeat probe every SECONDS until interrupted.
       --from-file PATH    Iterate over hosts in file (one per line, # comments).
+      --pcap PATH         tcpdump probe traffic to PATH (needs root / cap_net_raw).
+      --compare-sni LIST  Comma-separated SNI values for the SNI × port matrix.
+      --compare-port LIST Comma-separated TCP ports for the SNI × port matrix.
+      --port-survey       Scan curated list of common VPN/proxy alt ports.
       --json              Emit machine-readable JSON; implies --quiet. Requires jq.
 
-Probe names: env, dns, tcp, tls, ua, rst, udp, openvpn, control, ipv6
+Probe names: env, dns, tcp, tls, ua, rst, udp, openvpn, control, ipv6, compare
 
 Override precedence:
   CLI arg > environment variable > detect_blocking.conf > built-in default
@@ -151,11 +155,11 @@ Override precedence:
 forward compatibility. Convenient for monitoring stacks:
 
 ```sh
-./detect_blocking.sh --json vpn.example.org | jq '.verdicts'
-./detect_blocking.sh --json vpn.example.org | jq '.probes.dns.doh_integrity'
+./detect_blocking.sh --json www.example.com | jq '.verdicts'
+./detect_blocking.sh --json www.example.com | jq '.probes.dns.doh_integrity'
 
 # Emit a Prometheus-style counter
-./detect_blocking.sh --json vpn.example.org \
+./detect_blocking.sh --json www.example.com \
   | jq -r '"vpn_blocking_verdicts \(.verdicts | length)"'
 ```
 
@@ -201,13 +205,13 @@ The file is sourced before defaults are applied. It is gitignored. See
 ### Diagnose your VPN endpoint
 
 ```sh
-./detect_blocking.sh my-vpn.example.org
+./detect_blocking.sh www.example.com
 ```
 
 ### Increased timeout for slow or high-latency networks
 
 ```sh
-TIMEOUT=15 ./detect_blocking.sh --log-file /tmp/diag.log my-vpn.example.org
+TIMEOUT=15 ./detect_blocking.sh --log-file /tmp/diag.log www.example.com
 ```
 
 ### Cron: periodic monitoring with log rotation
@@ -252,7 +256,7 @@ jq -s 'map({host: .target.host, verdicts: .verdicts})' fleet-*.ndjson
 
 ```sh
 # Probe every 60s, alert on transition
-./detect_blocking.sh --watch 60 --json vpn.example.org \
+./detect_blocking.sh --watch 60 --json www.example.com \
   | while read -r line; do
       verdict_count=$(printf '%s' "$line" | jq '.verdicts | length')
       [ "$verdict_count" -gt 0 ] \

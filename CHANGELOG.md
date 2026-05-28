@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Multi-DoH cross-check** (probe_dns): canary query against every URL in
+  `DOH_PROVIDERS` (default Cloudflare + Google + Quad9). Distinguishes
+  "single-provider MITM" (split DoH hijack) from "all-DoH MITM" (universal
+  national-CA TLS interception). New verdicts:
+  `All DoH providers compromised`, `Split DoH MITM`. JSON: `probes.dns.doh_multi`.
+- **`--pcap PATH`** spawns tcpdump in background to capture probe traffic,
+  scoped by `host VPN_HOST` BPF filter. Auto-cleanup via EXIT trap.
+  Graceful fallback if tcpdump unavailable or sans cap_net_raw.
+- **`--compare-sni LIST` / `--compare-port LIST`** matrix probe:
+  iterates SNI × port grid via TLS handshake, emits a matrix table and
+  `Bypass candidate found in compare matrix` verdict when an alt-combo works
+  while the canonical (host:port) fails. New probe name: `compare`.
+- **`--port-survey`** convenience flag: extends `--compare-port` with a
+  curated list of common alt-VPN/proxy ports
+  (8443, 2083, 2087, 2053, 8388, 4443, 9443, 51820, 1194, 500).
+- **All `vpn.example.org` placeholders replaced with `www.example.com`**
+  (IANA-managed, always-resolvable demo target — matches script default,
+  copy-paste-runnable). Issue from README/CLI inconsistency.
 - **`--from-file PATH` batch mode**: iterates over hosts in a file (one per
   line, `#` comments skipped), invoking the script per host. In `--json`
   mode emits ndjson (one compact JSON object per line) for stream-processing.

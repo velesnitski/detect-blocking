@@ -61,6 +61,18 @@ jobs:
           bash tests/test_json.sh
         timeout-minutes: 2
 
+      - name: --watch loop emits ndjson
+        run: bash tests/test_watch.sh
+        timeout-minutes: 2
+
+      - name: --from-file batch emits ndjson-per-host
+        run: bash tests/test_from_file.sh
+        timeout-minutes: 2
+
+      - name: --pcap creates capture or gracefully degrades
+        run: bash tests/test_pcap.sh
+        timeout-minutes: 2
+
       - name: --only / --skip flag wiring
         run: |
           # Sanity: --only dns,tcp must print only those two probe headers.

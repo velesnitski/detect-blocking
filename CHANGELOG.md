@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-05-29
+
+### Fixed
+
+- **CI shellcheck job (green again).** Probes 15-17 introduced two unused
+  variables — `XRAY_EGRESS_DNS_LEAK` and a stray `elapsed_s` local in probe
+  17 — which `shellcheck` flags as `SC2034`. The lint job runs with `-e`, so
+  those warnings failed CI on v0.2.8/v0.2.9 even though the script ran
+  correctly and the local test suite was green. Removed both (the DNS-leak
+  boolean was dropped deliberately: a resolver/egress country-divergence
+  heuristic false-positives on legitimate setups like an FR egress using
+  8.8.8.8, which clashes with the tool's no-false-positives ethos; the
+  resolver region is still reported as informational). `shellcheck
+  detect_blocking.sh` is clean.
+
 ## [0.2.9] - 2026-05-29
 
 ### Fixed

@@ -28,7 +28,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.2.9"
+readonly DETECT_BLOCKING_VERSION="0.2.10"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -506,8 +506,7 @@ XRAY_EGRESS_COUNTRY=""      # ISO country code seen at the egress
 XRAY_EGRESS_HOSTING=""      # 1 / 0 — datacenter / hosting IP
 XRAY_EGRESS_PROXY=""        # 1 / 0 — on a proxy blocklist
 XRAY_EGRESS_MOBILE=""       # 1 / 0 — mobile carrier IP
-XRAY_EGRESS_DNS_COUNTRY=""  # country of the DNS resolver seen through the tunnel
-XRAY_EGRESS_DNS_LEAK=""     # 1 / 0 — resolver country diverges from egress (possible leak)
+XRAY_EGRESS_DNS_COUNTRY=""  # country of the DNS resolver seen through the tunnel (informational)
 
 # ---- probe 17: held-session stability (delayed-RST / kill-shaping) ----
 # Short bursts (13/14) miss the censor tactic of letting the handshake through
@@ -2349,7 +2348,7 @@ probe_xray_stability() {
   local port="$XRAY_JSON_SOCKS_PORT"
   local dur="$XRAY_STABILITY_SECONDS" iv="$XRAY_STABILITY_INTERVAL"
   local total=0 okc=0 first_fail="" rtt rmin="" rmax="" t0 t1
-  local start now elapsed_ms elapsed_s
+  local start now elapsed_ms
   # Per-pulse budget must clear the handshake on each fresh connection.
   local pulse_to
   pulse_to=$(( ( ${XRAY_JSON_RTT_MS:-3000} + 999 ) / 1000 + 3 ))

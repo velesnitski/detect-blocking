@@ -28,7 +28,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.2.8"
+readonly DETECT_BLOCKING_VERSION="0.2.9"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -2262,8 +2262,12 @@ probe_xray_egress() {
     return 0
   fi
 
-  local port="$XRAY_JSON_SOCKS_PORT" info_json dns_json
-  info_json=$(curl -sS --max-time "$TIMEOUT" \
+  # Each lookup opens a FRESH tunnel connection, so the budget must clear the
+  # Reality handshake (≈ probe-12 RTT) first — a flat $TIMEOUT (default 5s) is
+  # shorter than a high-RTT handshake and times the lookup out mid-handshake.
+  local port="$XRAY_JSON_SOCKS_PORT" info_json dns_json maxt
+  maxt=$(( ( ${XRAY_JSON_RTT_MS:-3000} + 999 ) / 1000 + TIMEOUT ))
+  info_json=$(curl -sS --max-time "$maxt" \
               --socks5-hostname "127.0.0.1:$port" \
               "$XRAY_EGRESS_INFO_URL" 2>/dev/null)
 
@@ -2289,7 +2293,7 @@ probe_xray_egress() {
   info "egress: country=${XRAY_EGRESS_COUNTRY:-?}, hosting=${XRAY_EGRESS_HOSTING}, proxy=${XRAY_EGRESS_PROXY}, mobile=${XRAY_EGRESS_MOBILE}"
 
   # DNS resolver as seen through the tunnel (edns.ip-api echoes the resolver).
-  dns_json=$(curl -sS --max-time "$TIMEOUT" \
+  dns_json=$(curl -sS --max-time "$maxt" \
              --socks5-hostname "127.0.0.1:$port" \
              "$XRAY_EGRESS_DNS_URL" 2>/dev/null)
   if printf '%s' "$dns_json" | grep -q '"dns"'; then

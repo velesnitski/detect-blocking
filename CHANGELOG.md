@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-05-29
+
+### Fixed
+
+- **Probe 16 timed out on high-RTT tunnels at the default `TIMEOUT`.** The
+  egress IP-info and DNS lookups used a flat `--max-time "$TIMEOUT"` (5s by
+  default), but each opens a fresh tunnel connection that must first clear
+  the Reality handshake (~5-6s on a multi-hop path) — so the lookups died
+  mid-handshake and reported "egress IP-info lookup returned no data through
+  the tunnel" even though the tunnel was healthy. Both lookups now use the
+  same handshake-aware budget (`ceil(probe-12 RTT) + TIMEOUT`) that probes
+  13/14/17 already derive. Probe 16 was the only tunnel-using probe still on
+  the flat timeout.
+
 ## [0.2.8] - 2026-05-29
 
 ### Added

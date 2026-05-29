@@ -242,6 +242,36 @@ in PATH` and the other 10 probes run as usual. The script never hard-fails on
 a missing optional dependency — see the gracefully-degrading model in the
 [Requirements](#requirements) section.
 
+### Going full-fidelity with `--xray-config-json` (probe 12)
+
+The share-link form is **lossy** — chained outbounds (`dialerProxy:
+fragment`), `noises`, custom routing rules, and several Reality knobs don't
+fit into the URL spec. If your production setup relies on those (e.g. an
+xray-core `freedom` fragment outbound chained behind the VLESS outbound),
+the URL test only covers half of what the client actually does.
+
+Probe 12 covers the other half: it accepts your **full `config.json`**,
+patches the SOCKS inbound to a random free port (so it doesn't collide
+with any running v2rayN / NekoBox), spawns `xray run` against the patched
+config, and then HTTP-GETs `https://cloudflare.com/cdn-cgi/trace` through
+the SOCKS5 inbound:
+
+```sh
+./detect_blocking.sh \
+  --xray-config-json /path/to/your/client/config.json \
+  --json | jq '.probes.xray_full_config'
+```
+
+Needs `xray` (the xray-core binary, not xray-knife) and `jq` in PATH. The
+EXIT trap kills the background xray process and removes the patched-config
+tempfile, even on Ctrl-C mid-probe.
+
+You can pass **both** `--xray-config URL` and `--xray-config-json FILE` in
+the same invocation. The killer cross-reference verdict —
+`Fragment / chained-outbound layer is the bypass — share-link form alone is
+not enough` — fires when the URL probe fails but the JSON probe succeeds,
+i.e. the chain layer is doing the heavy lifting.
+
 ---
 
 ## Requirements
@@ -281,11 +311,13 @@ Options:
       --compare-sni LIST  Comma-separated SNI values for the SNI × port matrix.
       --compare-port LIST Comma-separated TCP ports for the SNI × port matrix.
       --port-survey       Scan curated list of common VPN/proxy alt ports.
-      --xray-config URL   End-to-end Xray-protocol test (optional dep: xray-knife).
-                          Accepts vless://, vmess://, trojan://, ss://, hysteria2:// URLs.
+      --xray-config URL       End-to-end Xray-protocol test (xray-knife).
+                              vless://, vmess://, trojan://, ss://, hysteria2:// URLs.
+      --xray-config-json FILE Full-config end-to-end (xray-core + SOCKS5; covers
+                              fragment, dialerProxy, noises, chained outbounds).
       --json              Emit machine-readable JSON; implies --quiet. Requires jq.
 
-Probe names: env, dns, tcp, tls, ua, rst, udp, openvpn, control, ipv6, compare, xray
+Probe names: env, dns, tcp, tls, ua, rst, udp, openvpn, control, ipv6, compare, xray, xrayjson
 
 Override precedence:
   CLI arg > environment variable > detect_blocking.conf > built-in default

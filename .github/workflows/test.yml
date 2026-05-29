@@ -73,6 +73,10 @@ jobs:
         run: bash tests/test_pcap.sh
         timeout-minutes: 2
 
+      - name: --xray-config-json schema + graceful degradation
+        run: bash tests/test_xrayjson.sh
+        timeout-minutes: 2
+
       - name: --only / --skip flag wiring
         run: |
           # Sanity: --only dns,tcp must print only those two probe headers.

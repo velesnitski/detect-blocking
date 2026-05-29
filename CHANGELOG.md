@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-05-29
+
+### Added
+
+- **`--xray-config-json FILE` full-config probe (probe 12).** Where probe
+  11 delegates to `xray-knife` with a share-link (URL form is **lossy** —
+  chained outbounds, `dialerProxy: fragment`, `noises`, custom routing don't
+  fit), probe 12 spawns a sandboxed `xray run` against the user's actual
+  `config.json`, polls the SOCKS inbound, and tests through it via
+  `curl --socks5h … https://cloudflare.com/cdn-cgi/trace`.
+  - Patches inbound port to a random free port in the dynamic range
+    (49152–65534) via `jq`, so the test doesn't collide with a running
+    client on 10808/10809.
+  - Cross-references with probe 11: when URL form fails but JSON form
+    succeeds, emits `Fragment / chained-outbound layer is the bypass` —
+    pinpoints what's lost in the share-link round-trip.
+  - Cross-references with probes 3 / 5 / 1: emits `Xray full-config
+    bypasses local DPI/DNS-MITM despite environment signals` when the
+    tunnel works despite TLS-level DPI signals.
+  - Graceful degradation on missing `xray` binary, missing `jq`, missing
+    config file, or unbindable port — each emits a distinct status in the
+    JSON (`xray-missing` / `jq-missing` / `config-missing` /
+    `config-malformed` / `no-port` / `xray-bind-failed` / `ok` / `failed`).
+  - EXIT trap reliably kills the background `xray` process and removes the
+    patched-config tempfile, even on Ctrl-C mid-probe.
+  - New probe name `xrayjson` for `--only`/`--skip` plumbing.
+  - JSON output: `probes.xray_full_config` block with `status`,
+    `config_path`, `socks_port_used`, `egress_ip`, `egress_location`
+    (Cloudflare colo), `rtt_ms`.
+  - New `tests/test_xrayjson.sh` (CI on both platforms) asserts
+    graceful-degradation paths.
+
+## [0.2.1] - 2026-05-28
+
+### Fixed
+
+- **Bare IPv4 targets** — `_resolve_a_records` short-circuits on hostless
+  IPs like `203.0.113.10` instead of running `dig` and failing with
+  *Domain unresolvable*.
+- **xray-knife v10 API compatibility** — top-level `xray-knife http` is
+  detected first, legacy `xray-knife net http` falls back. Drops the
+  v10-incompatible `-m 1` flag.
+- **xray-knife failure diagnostic** — first error line from the delegated
+  tool (matching ❌ / closed pipe / EOF / reset by peer / refused / …) is
+  surfaced as `xray-knife says: <line>`.
+- **`--xray-config` whitespace strip + scheme validation** — terminal
+  paste-wrap (embedded newlines) is stripped before any processing; the
+  script `die`s early on unrecognised URI schemes.
+
+### Added
+
+- **Auto-derive `VPN_HOST` from `--xray-config`** — when no positional host
+  is given, the host is extracted from `vless://` / `trojan://` / `ss://`
+  / `hysteria://` / `hysteria2://` / `tuic://` URLs so all 11 probes align
+  with the protocol probe.
+- **3 new functional tests** (`tests/test_watch.sh`, `tests/test_from_file.sh`,
+  `tests/test_pcap.sh`) wired into CI on macOS + Ubuntu. `test_pcap.sh` is
+  graceful-dual-mode: passes whether or not the runner has `cap_net_raw`.
+
 ## [0.2.0] - 2026-05-28
 
 ### Added

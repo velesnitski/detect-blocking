@@ -7,22 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-05-29
+
+### Fixed
+
+- **Probe 12: `.json` extension on patched-config tempfile.**
+  `xray-core` determines config format from filename extension; without
+  `.json` it logs `Failed to get format` and exits before binding the
+  SOCKS inbound. The script now renames the `mktemp` output to append
+  `.json` before launching `xray run`.
+- **Probe 12: auto-derive `VPN_HOST` + `VPN_PORT_TCP` from `--xray-config-json`.**
+  Previously only `--xray-config URL` triggered the auto-derive; with
+  `--xray-config-json FILE` the diagnostic stayed on the `www.example.com`
+  demo default for the host AND `443` for the port. The script now walks
+  the JSON outbounds (vless / vmess / trojan / shadowsocks) for the first
+  matching entry and uses both its destination address AND port. Probes
+  0-10 align with the full-config probe (or with the first outbound in a
+  load-balanced fleet, which is still the intended diagnostic baseline).
+  Without the port half of this fix, probe 2 in a non-standard-port fleet
+  reported a false "IP route blocked entirely" verdict that drowned out
+  the real probe-12 finding.
+- **Probe 12: portable `curl --socks5-hostname` instead of `--socks5h`.**
+  The short form `--socks5h` needs curl ≥ 7.21.7 (2011) and is missing
+  from some bundled-with-macOS curl builds; the long form has been
+  supported since 7.18.0 (2008) and works everywhere.
+
 ## [0.2.3] - 2026-05-29
 
 ### Fixed
 
 - **Auto-derive now picks up port from `--xray-config` URL.** Previously only
   the host was extracted, leaving `VPN_PORT_TCP` on its 443 default. That
-  produced false "TCP unreachable" on probes 2–5 when the server listened
-  on a non-standard port (e.g. [REDACTED], [REDACTED], [REDACTED] — typical in load-
-  balanced fleets). The transport probes now align with the actual URL
-  destination, surfacing real protocol-layer findings instead of being
-  drowned by a phantom TCP failure.
+  produced false "TCP unreachable" on probes 2–5 when the URL pointed at
+  a non-standard port — a common pattern for Reality deployments that
+  randomise ports across a load-balanced fleet. The transport probes now
+  align with the actual URL destination, surfacing real protocol-layer
+  findings instead of being drowned by a phantom TCP failure.
 
-  Real-world payoff: this fix is what surfaced a fleet-wide Reality
-  `serverName` mismatch (client expected `[REDACTED]`, all 12
-  server endpoints presented `*.[REDACTED]` cert) — a misconfiguration
-  invisible without proper port alignment.
+  Real-world payoff: this fix is what made it possible to surface a
+  fleet-wide Reality `serverName` mismatch on the operator's first run,
+  by aligning the transport-layer probes with the actual destination
+  rather than the 443 default.
 
 ### Gitignore
 

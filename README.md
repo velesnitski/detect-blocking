@@ -245,32 +245,89 @@ a missing optional dependency — see the gracefully-degrading model in the
 ### Going full-fidelity with `--xray-config-json` (probe 12)
 
 The share-link form is **lossy** — chained outbounds (`dialerProxy:
-fragment`), `noises`, custom routing rules, and several Reality knobs don't
-fit into the URL spec. If your production setup relies on those (e.g. an
-xray-core `freedom` fragment outbound chained behind the VLESS outbound),
-the URL test only covers half of what the client actually does.
+fragment`), `noises`, custom routing rules, multiple-outbound balancers
+(`leastPing` / `random`), `observatory`, `sniffing`, and several Reality
+knobs don't fit into the URL spec. If your production setup relies on
+those, the URL test only covers what fits — one VLESS endpoint, no chain,
+no routing logic. Probe 12 spawns `xray run` against your **actual
+`config.json`** and tests end-to-end through its SOCKS inbound.
 
-Probe 12 covers the other half: it accepts your **full `config.json`**,
-patches the SOCKS inbound to a random free port (so it doesn't collide
-with any running v2rayN / NekoBox), spawns `xray run` against the patched
-config, and then HTTP-GETs `https://cloudflare.com/cdn-cgi/trace` through
-the SOCKS5 inbound:
+#### Quickstart — one paste from a fresh shell
 
 ```sh
-./detect_blocking.sh \
-  --xray-config-json /path/to/your/client/config.json \
-  --json | jq '.probes.xray_full_config'
+# 1. Install xray-core (one-time; jq is also required but ships with most distros)
+brew install xray            # macOS
+# OR — Linux/WSL:
+# sudo apt install -y jq && go install github.com/xtls/xray-core/main@latest \
+#   && sudo mv ~/go/bin/main /usr/local/bin/xray
+
+# 2. Save your client config.json somewhere safe (mode 600 — contains live creds)
+#    e.g. ~/.xray-test.json — the path is yours; nothing in the script is bound to it.
+
+# 3. Run the full diagnostic
+./detect_blocking.sh --xray-config-json ~/.xray-test.json --json | jq '.probes.xray_full_config'
+
+# 4. Cleanup when done (the file holds your UUID + Reality publicKey)
+shred -u ~/.xray-test.json 2>/dev/null || rm -P ~/.xray-test.json
 ```
 
-Needs `xray` (the xray-core binary, not xray-knife) and `jq` in PATH. The
-EXIT trap kills the background xray process and removes the patched-config
-tempfile, even on Ctrl-C mid-probe.
+The script patches your config in-memory before launching `xray run`: SOCKS
+inbound is rebound to a random free port in `49152-65534`, so the test
+doesn't collide with a running v2rayN / NekoBox / CLI client that may
+already squat on `10808` / `10809`. The patched copy is written to a temp
+file (`mktemp -t detect_blocking.xrayjson.XXXXXX`); the EXIT trap removes
+it and kills the background `xray` child even on `Ctrl-C` mid-probe.
+
+#### What the verdict gives you
+
+```sh
+./detect_blocking.sh --xray-config-json ~/.xray-test.json --json \
+  | jq '{verdicts, xray_full: .probes.xray_full_config}'
+```
+
+A passing run looks like:
+
+```json
+{
+  "verdicts": [],
+  "xray_full": {
+    "status": "ok",
+    "config_path": "/Users/you/.xray-test.json",
+    "socks_port_used": 52341,
+    "egress_ip": "<your VPN exit IP>",
+    "egress_location": "<CF colo, e.g. AMS>",
+    "rtt_ms": 640
+  }
+}
+```
+
+`egress_ip` is the IP the destination saw — for a config with a
+`leastPing` balancer this is **the actual server xray picked as fastest
+from your vantage**, i.e. the same one your real users would hit.
+
+#### Combine with probe 11 for the killer cross-reference
 
 You can pass **both** `--xray-config URL` and `--xray-config-json FILE` in
-the same invocation. The killer cross-reference verdict —
+the same invocation. The cross-reference verdict —
 `Fragment / chained-outbound layer is the bypass — share-link form alone is
 not enough` — fires when the URL probe fails but the JSON probe succeeds,
-i.e. the chain layer is doing the heavy lifting.
+i.e. the chain layer (fragment, dialerProxy, balancer) is doing the heavy
+lifting and a plain share-link client wouldn't reproduce the bypass.
+
+#### What if `xray-core` isn't installed?
+
+Probe 12 prints a one-line warning and the other probes run as usual:
+
+```
+== 12. Xray full-config (json) end-to-end test ==
+  [WARN]  skipping — 'xray' binary not in PATH
+          install: go install github.com/xtls/xray-core/main@latest (rename to 'xray')
+          or download: https://github.com/XTLS/Xray-core/releases
+```
+
+JSON output records `probes.xray_full_config.status == "xray-missing"`, so
+monitoring stacks can branch on "did we run the full-fidelity probe yet?"
+deterministically.
 
 ---
 

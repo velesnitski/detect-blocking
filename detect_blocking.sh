@@ -28,7 +28,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.2.3"
+readonly DETECT_BLOCKING_VERSION="0.2.4"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -207,6 +207,51 @@ if [ -n "$XRAY_CONFIG" ]; then
         ;;
     esac
   fi
+fi
+
+# Auto-derive VPN_HOST from --xray-config-json when no positional was given.
+# Walks the JSON outbounds for the first vless/vmess/trojan/shadowsocks entry
+# and uses its destination address. Keeps probes 0-10 aligned with the same
+# server the full-config probe will route through (or the first one in a
+# load-balanced fleet, which is still informative).
+if [ -n "${XRAY_JSON_CONFIG:-}" ] && [ -z "${VPN_HOST:-}" ] && [ -r "$XRAY_JSON_CONFIG" ] && command -v jq >/dev/null 2>&1; then
+  _derived_host=$(jq -r '
+    .outbounds // []
+    | map(select(.protocol == "vless" or .protocol == "vmess" or .protocol == "trojan"))
+    | first
+    | (.settings.vnext // [])[0].address // empty
+  ' "$XRAY_JSON_CONFIG" 2>/dev/null)
+  _derived_port=$(jq -r '
+    .outbounds // []
+    | map(select(.protocol == "vless" or .protocol == "vmess" or .protocol == "trojan"))
+    | first
+    | (.settings.vnext // [])[0].port // empty
+  ' "$XRAY_JSON_CONFIG" 2>/dev/null)
+  # Fallback: shadowsocks outbound shape is settings.servers[0].address/port
+  if [ -z "$_derived_host" ]; then
+    _derived_host=$(jq -r '
+      .outbounds // []
+      | map(select(.protocol == "shadowsocks"))
+      | first
+      | (.settings.servers // [])[0].address // empty
+    ' "$XRAY_JSON_CONFIG" 2>/dev/null)
+    _derived_port=$(jq -r '
+      .outbounds // []
+      | map(select(.protocol == "shadowsocks"))
+      | first
+      | (.settings.servers // [])[0].port // empty
+    ' "$XRAY_JSON_CONFIG" 2>/dev/null)
+  fi
+  if [ -n "$_derived_host" ]; then
+    VPN_HOST="$_derived_host"
+    if [ -n "$_derived_port" ] && [ -z "${VPN_PORT_TCP:-}" ]; then
+      VPN_PORT_TCP="$_derived_port"
+      printf '%s\n' "note: VPN_HOST + VPN_PORT_TCP auto-derived from --xray-config-json → ${_derived_host}:${_derived_port}" >&2
+    else
+      printf '%s\n' "note: VPN_HOST auto-derived from --xray-config-json → $_derived_host" >&2
+    fi
+  fi
+  unset _derived_host _derived_port
 fi
 
 # --port-survey: curated list of common alt-VPN/proxy ports, merged into
@@ -1463,7 +1508,14 @@ probe_xray_json() {
 
   # 2) Patch the json: keep only socks-protocol inbounds, force them to
   #    127.0.0.1:$socks_port. If none exist, synthesise a minimal one.
-  XRAY_JSON_PATCHED_PATH=$(mktemp -t detect_blocking.xrayjson.XXXXXX)
+  # NB: xray-core determines config format by file extension — without a
+  # .json suffix it logs "Failed to get format" and refuses to start.
+  # mktemp -t prefix appends random chars (no extension), so we rename.
+  local _tmpbase
+  _tmpbase=$(mktemp -t detect_blocking.xrayjson.XXXXXX)
+  XRAY_JSON_PATCHED_PATH="${_tmpbase}.json"
+  mv "$_tmpbase" "$XRAY_JSON_PATCHED_PATH"
+  unset _tmpbase
   if ! jq --argjson p "$socks_port" '
        (.inbounds // []) as $orig
        | .inbounds = (
@@ -1527,8 +1579,11 @@ probe_xray_json() {
   #    line-based key=value text; includes egress 'ip=' and colo).
   local t0 t1 trace
   t0=$(_now_ms)
+  # --socks5-hostname is the long form of --socks5h, supported since curl
+  # 7.18.0 (2008). The short form --socks5h needs 7.21.7+ (2011) and
+  # is missing from some bundled-with-macOS curl builds.
   trace=$(curl -sS --max-time "$TIMEOUT" \
-          --socks5h "127.0.0.1:$socks_port" \
+          --socks5-hostname "127.0.0.1:$socks_port" \
           https://cloudflare.com/cdn-cgi/trace 2>&1)
   t1=$(_now_ms)
   XRAY_JSON_RTT_MS=$(( t1 - t0 ))

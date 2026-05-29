@@ -3,9 +3,12 @@
 A single-file Bash diagnostic that classifies **what kind of network filtering**
 is preventing a VPN endpoint from working — DNS poisoning, IP blocks,
 SNI-based DPI, mid-handshake RST injection, silent drops, UDP/QUIC bans,
-OpenVPN signature blocks, and (via optional `xray-knife` delegation)
-authenticated end-to-end protocol tests for Reality / VLESS / VMess / Trojan
-/ Shadowsocks-2022 / Hysteria2.
+OpenVPN signature blocks, authenticated end-to-end protocol tests (via
+optional `xray-knife` delegation), full-fidelity tunnel boot through your
+real `xray-core` config, and **data-plane throughput probing** that
+catches cover-SNI traffic shaping the handshake-only tests miss.
+Supported protocols: Reality / VLESS / VMess / Trojan / Shadowsocks-2022
+/ Hysteria2.
 
 Built for operators who need to answer one question fast: *"is my server
 blocked, and if so, by what mechanism?"*
@@ -19,7 +22,7 @@ blocked, and if so, by what mechanism?"*
 
 ## What it does
 
-Runs a deterministic 11-stage probe chain from your local machine to a target
+Runs a deterministic 13-stage probe chain from your local machine to a target
 endpoint and emits a clearly labelled verdict for each detected blocking type.
 
 | # | Probe | Detects |
@@ -36,6 +39,8 @@ endpoint and emits a clearly labelled verdict for each detected blocking type.
 | 9 | IPv6 reachability | AAAA resolution + IPv6 TCP/HTTPS; detects "IPv4-only block" cases |
 | 9b | Compare matrix (opt-in) | `--compare-sni A,B,C` × `--compare-port 443,8443,…` grid for bypass discovery; `--port-survey` adds a curated alt-port list |
 | 11 | Xray protocol (opt-in) | Authenticated end-to-end test via `xray-knife` (v10 + legacy auto-detect); works for Reality / VLESS / VMess / Trojan / Shadowsocks-2022 / Hysteria2 |
+| 12 | Xray full-config (opt-in) | Spawns `xray-core` with your real config (`--xray-config-json FILE`), exercises chained outbounds / balancers / fragment dialers end-to-end through a local SOCKS inbound; reports egress IP + colo + RTT |
+| 13 | Tunnel throughput (auto with 12) | Pulls 10 MB from Cloudflare's speed-test backend through the same SOCKS tunnel; banded thresholds catch **cover-SNI traffic shaping** (RKN/TSPU/CN-style) that handshake-only probes miss |
 
 The verdict ends with a list of detected blocks plus an actionable
 recommendation for each (rotate IP, switch to Reality, use uTLS, etc).
@@ -481,6 +486,9 @@ Top-level keys: `schema_version`, `version`, `timestamp` (ISO-8601 UTC),
 | `DOH_URL` | `https://1.1.1.1/dns-query` | DoH endpoint |
 | `TIMEOUT` | `5` | Per-probe timeout (seconds) |
 | `STRICT_OPENVPN_VERDICT` | `0` | Set `1` to emit hard verdict on silent OpenVPN handshake |
+| `XRAY_THROUGHPUT_TARGET_BYTES` | `10485760` | Probe 13 download sample size (10 MB); raise for slow links to escape TCP slow-start |
+| `XRAY_THROUGHPUT_TIMEOUT` | `20` | Probe 13 download deadline (seconds); raise for high-RTT tunnels |
+| `XRAY_THROUGHPUT_URL` | `https://speed.cloudflare.com/__down` | Probe 13 throughput endpoint; must accept `?bytes=N` query |
 | `LOG_FILE` | *(empty)* | Optional log file path |
 | `LOG_QUIET` | `0` | Suppress stdout when `1` |
 

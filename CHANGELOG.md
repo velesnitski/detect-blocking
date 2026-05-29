@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-05-29
+
+### Added
+
+- **Probe 13 — data-plane throughput through the Reality tunnel.**
+  Probe 12 confirms the handshake succeeds but says nothing about whether
+  the tunnel can move bytes once it's up. Cover-SNI traffic shaping is
+  the failure mode this misses: handshake completes cleanly (censor
+  permits it — fingerprint is normal), TCP ping is fine, but the moment
+  payload starts flowing a shaper limits the stream to a few KB/s. The
+  user-visible symptom is "connects but nothing loads."
+
+  Probe 13 reuses the SOCKS inbound brought up by probe 12 and downloads
+  10 MB from Cloudflare's public speed-test backend
+  (`speed.cloudflare.com/__down?bytes=N`) through the tunnel. Measured
+  throughput is banded against thresholds tuned for known regional
+  shaping signatures:
+
+  - `≥ 250 KB/s` → healthy
+  - `< 250 KB/s` → degraded (partial shaping or cross-region congestion)
+  - `< 50 KB/s`  → severely throttled (classic cover-SNI shaping)
+  - `< 1 KB/s`   → tunnel collapsed post-handshake (mid-stream RST / MTU clamp)
+
+  The severe-throttle verdict spells out the mitigation: change the
+  Reality cover destination on **both** server (`dest` + `serverNames`)
+  and client (`serverName`) to a host that isn't shaped in the affected
+  region — and verify out-of-band before deploying.
+
+  Tunable via env vars: `XRAY_THROUGHPUT_TARGET_BYTES`,
+  `XRAY_THROUGHPUT_TIMEOUT`, `XRAY_THROUGHPUT_URL`. JSON schema adds
+  `probes.xray_throughput { status, bytes_per_second, bytes_received,
+  seconds, target_bytes }`. Status of `skipped` is emitted when probe 12
+  didn't bring up a tunnel — preserving the "did we test this layer?"
+  branch for monitoring stacks.
+
+  New tests: `tests/test_throughput.sh` exercises the skip path and JSON
+  schema invariants; full suite is now 8 tests, all passing on macOS +
+  Ubuntu CI.
+
 ## [0.2.4] - 2026-05-29
 
 ### Fixed

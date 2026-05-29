@@ -329,6 +329,73 @@ JSON output records `probes.xray_full_config.status == "xray-missing"`, so
 monitoring stacks can branch on "did we run the full-fidelity probe yet?"
 deterministically.
 
+### Probe 13 — data-plane throughput (catches cover-SNI shaping)
+
+Probe 12 confirms the Reality / VLESS handshake succeeds, but says nothing
+about whether the tunnel can actually move bytes once it's up. That
+distinction matters when a censor uses **cover-SNI traffic shaping**
+instead of an outright block:
+
+- TLS handshake completes cleanly (the censor lets it — fingerprint looks
+  normal).
+- TCP-level ping responds (also unaffected).
+- The instant payload starts flowing the shaper kicks in and limits the
+  flow to a few KB/s, making the tunnel feel "connected but broken".
+
+This pattern shows up against China-popular cover destinations (Bilibili,
+Baidu, WeChat properties) in the RU TSPU stack since 2024, and against
+YouTube-routed covers under CN GFW for years. Probe 12 alone reports
+`[OK]` — the handshake genuinely succeeds — and the diagnostic misses it.
+
+Probe 13 reuses the SOCKS inbound that probe 12 just stood up and pulls
+10 MB from Cloudflare's public speed-test backend
+(`speed.cloudflare.com/__down?bytes=N`) through the tunnel, then bands
+the measured throughput:
+
+| Band | Meaning |
+|---|---|
+| `≥ 250 KB/s` | healthy — usable for normal browsing |
+| `< 250 KB/s` | degraded — partial shaping, congestion, or low-bandwidth egress; re-test from a different vantage |
+| `< 50 KB/s` | severely throttled — classic cover-SNI shaping signature; change the Reality cover destination |
+| `< 1 KB/s` | tunnel collapsed post-handshake — mid-stream RST or kill-shaping |
+
+When the throttled-severe band fires, the verdict spells out the
+mitigation: change the Reality `dest` on the server **and** `serverName`
+on the client to a host that isn't shaped in the affected region. Verify
+out-of-band (plain `curl` from a tester in that region) before deploying.
+
+Tuning knobs (env vars):
+
+```sh
+# Larger sample for slow links (default 10 MB):
+XRAY_THROUGHPUT_TARGET_BYTES=$((50*1024*1024)) ./detect_blocking.sh --xray-config-json ~/.xray-test.json
+
+# Longer timeout for high-RTT tunnels (default 20s):
+XRAY_THROUGHPUT_TIMEOUT=60 ./detect_blocking.sh --xray-config-json ~/.xray-test.json
+
+# Different throughput target (must support `?bytes=N` query param):
+XRAY_THROUGHPUT_URL=https://your.speed-test/down ./detect_blocking.sh --xray-config-json ~/.xray-test.json
+```
+
+JSON output:
+
+```json
+{
+  "probes": {
+    "xray_throughput": {
+      "status": "ok",
+      "bytes_per_second": 1218000,
+      "bytes_received": 10485760,
+      "seconds": 8.6,
+      "target_bytes": 10485760
+    }
+  }
+}
+```
+
+Status values: `ok`, `throttled-mild`, `throttled-severe`, `broken`,
+`skipped` (when probe 12 didn't succeed), `curl-missing`.
+
 ---
 
 ## Requirements

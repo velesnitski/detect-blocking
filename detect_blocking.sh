@@ -28,7 +28,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.2.4"
+readonly DETECT_BLOCKING_VERSION="0.2.5"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -438,6 +438,15 @@ XRAY_JSON_SOCKS_PORT=""  # actual port the patched config binds (random high)
 XRAY_JSON_EGRESS_IP=""   # ip= line from cloudflare trace
 XRAY_JSON_EGRESS_LOC=""  # colo= line from cloudflare trace (e.g. AMS, FRA)
 XRAY_JSON_RTT_MS=""      # round-trip via the SOCKS tunnel
+
+# ---- probe 13: data-plane throughput through the same SOCKS inbound ----
+XRAY_THROUGHPUT_STATUS=""   # ok, throttled-severe, throttled-mild, broken, skipped, curl-missing
+XRAY_THROUGHPUT_BPS=""      # bytes/sec averaged over the download window
+XRAY_THROUGHPUT_BYTES=""    # bytes actually received before EOF / timeout
+XRAY_THROUGHPUT_TIME_S=""   # wall-clock seconds the download window spanned
+XRAY_THROUGHPUT_TARGET_BYTES="${XRAY_THROUGHPUT_TARGET_BYTES:-10485760}"  # 10 MB default
+XRAY_THROUGHPUT_TIMEOUT="${XRAY_THROUGHPUT_TIMEOUT:-20}"                  # seconds
+XRAY_THROUGHPUT_URL="${XRAY_THROUGHPUT_URL:-https://speed.cloudflare.com/__down}"
 
 # ---------- colors (TTY-aware, suppressed when --quiet) ----------
 
@@ -1617,6 +1626,102 @@ probe_xray_json() {
   fi
 }
 
+probe_xray_throughput() {
+  # Depends on probe 12 having successfully brought up the SOCKS inbound
+  # — the xray-core process is left running until _cleanup, so we can
+  # reuse its SOCKS port for a bulk download without spawning xray twice.
+  if [ "$XRAY_JSON_STATUS" != "ok" ]; then
+    XRAY_THROUGHPUT_STATUS="skipped"
+    return 0
+  fi
+
+  hdr "13. Xray tunnel throughput (data-plane shaping detection)"
+
+  if ! check_cmd curl; then
+    warn "skipping — curl not available"
+    XRAY_THROUGHPUT_STATUS="curl-missing"
+    return 0
+  fi
+
+  # Cloudflare's speed-test backend (speed.cloudflare.com/__down?bytes=N)
+  # streams arbitrary bytes from /dev/zero-equivalent — it's the public
+  # endpoint behind speed.cloudflare.com's browser tool, no auth, no rate
+  # limit at this size. We pick 10 MB by default: enough to escape TCP
+  # slow-start and any small-burst exemption (TSPU/RKN typically exempts
+  # the first 16-64 KB to keep HTTPS handshakes responsive), but small
+  # enough to keep the test under a few seconds on a healthy 10+ Mbps link.
+  local target_bytes="$XRAY_THROUGHPUT_TARGET_BYTES"
+  local target_url="${XRAY_THROUGHPUT_URL}?bytes=${target_bytes}"
+  local max_time="$XRAY_THROUGHPUT_TIMEOUT"
+
+  info "downloading ${target_bytes} bytes via tunnel (max ${max_time}s)"
+
+  # -w gives us size_download, time_total, speed_download in one line —
+  # curl's own measurement, more accurate than wrapping with time(1).
+  # We deliberately don't echo the SOCKS port (already shown in probe 12)
+  # and don't echo target IP (Cloudflare anycast, not endpoint-specific).
+  local stats rc
+  stats=$(curl -sS --max-time "$max_time" -o /dev/null \
+          --socks5-hostname "127.0.0.1:$XRAY_JSON_SOCKS_PORT" \
+          -w '%{size_download} %{time_total} %{speed_download}\n' \
+          "$target_url" 2>/dev/null)
+  rc=$?
+
+  local bytes time_s bps
+  bytes=$(printf '%s' "$stats" | awk '{print $1+0}')
+  time_s=$(printf '%s' "$stats" | awk '{print $2+0}')
+  bps=$(printf '%s' "$stats" | awk '{print int($3)}')
+
+  XRAY_THROUGHPUT_BYTES="$bytes"
+  XRAY_THROUGHPUT_TIME_S="$time_s"
+  XRAY_THROUGHPUT_BPS="$bps"
+
+  # Human-readable speed for the verdict line. Avoid floating point — we
+  # only need ballpark units (B/s, KB/s, MB/s) for diagnostic context.
+  local human
+  if [ "$bps" -ge 1048576 ]; then
+    human="$(( bps / 1048576 )).$(( (bps % 1048576) * 10 / 1048576 )) MB/s"
+  elif [ "$bps" -ge 1024 ]; then
+    human="$(( bps / 1024 )) KB/s"
+  else
+    human="${bps} B/s"
+  fi
+
+  # Verdict bands (bytes/sec). Tuned against real-world Reality + cover-SNI
+  # shaping: TSPU/RKN-style throttling typically drops to ~12-37 KB/s (the
+  # signature seen on throttled YouTube/Bilibili since 2024). Healthy
+  # tunneled traffic with high RTT (Reality + cross-region hop) sits in the
+  # 300 KB/s — several MB/s band depending on upstream bandwidth and
+  # TCP-window scaling.
+  #
+  #   < 1024      → tunnel pipe collapsed after handshake (RST mid-stream,
+  #                 kill-shaping post-detection, MTU clamp causing stalls)
+  #   < 51200     → severe throttling (≤ 50 KB/s ≈ 400 kbps) — cover-SNI
+  #                 shaping signature (RKN/TSPU/CN-style traffic-identifier hit)
+  #   < 256000    → degraded (< 250 KB/s ≈ 2 Mbps) — partial shaping,
+  #                 cross-region congestion, or upstream-bottlenecked egress
+  #   ≥ 256000    → healthy
+  #
+  # No sensitive details in the verdict text — keep mitigations generic
+  # so logs are safe to share publicly.
+  if [ "$bps" -lt 1024 ]; then
+    fail "tunnel throughput collapsed: ${human} (${bytes} bytes in ${time_s}s, curl rc=$rc)"
+    XRAY_THROUGHPUT_STATUS="broken"
+    add_verdict "Reality tunnel handshakes successfully but data plane is unusable — payload doesn't flow (mid-stream RST, MTU clamp, or post-detection kill-shaping). Inspect with --pcap and look for RST flags arriving shortly after the first MB"
+  elif [ "$bps" -lt 51200 ]; then
+    fail "tunnel throughput severely throttled: ${human}"
+    XRAY_THROUGHPUT_STATUS="throttled-severe"
+    add_verdict "Reality tunnel works at TLS layer but data plane throttled to dial-up speeds — classic cover-SNI traffic-shaping signature. Mitigation: change Reality cover destination (both 'dest' on server and 'serverName' on client) to a host that is NOT under throttling in the affected region. Pick a high-traffic CDN endpoint reachable from the test region — verify out-of-band with a plain curl from that region before deploying"
+  elif [ "$bps" -lt 256000 ]; then
+    warn "tunnel throughput degraded: ${human}"
+    XRAY_THROUGHPUT_STATUS="throttled-mild"
+    add_verdict "Reality tunnel throughput under 250 KB/s — partial shaping, cross-region congestion, or upstream-bottlenecked egress. Re-test against a different cover-SNI to disambiguate"
+  else
+    ok "tunnel throughput healthy: ${human} (${bytes} bytes in ${time_s}s)"
+    XRAY_THROUGHPUT_STATUS="ok"
+  fi
+}
+
 probe_ipv6() {
   hdr "9. IPv6 reachability"
 
@@ -1735,6 +1840,11 @@ _emit_json() {
     --arg xj_egress_loc     "$XRAY_JSON_EGRESS_LOC" \
     --arg xj_rtt            "$XRAY_JSON_RTT_MS" \
     --arg xj_config_path    "$XRAY_JSON_CONFIG" \
+    --arg xt_status         "$XRAY_THROUGHPUT_STATUS" \
+    --arg xt_bps            "$XRAY_THROUGHPUT_BPS" \
+    --arg xt_bytes          "$XRAY_THROUGHPUT_BYTES" \
+    --arg xt_time_s         "$XRAY_THROUGHPUT_TIME_S" \
+    --argjson xt_target     "$XRAY_THROUGHPUT_TARGET_BYTES" \
     --argjson verdicts      "$verdicts_json" '
     def words: split(" ") | map(select(length > 0));
     def opt(s): if s == "" then null else s end;
@@ -1827,6 +1937,13 @@ _emit_json() {
           egress_ip: opt($xj_egress_ip),
           egress_location: opt($xj_egress_loc),
           rtt_ms: (if $xj_rtt == "" then null else ($xj_rtt | tonumber? // null) end)
+        },
+        xray_throughput: {
+          status: opt($xt_status),
+          bytes_per_second: (if $xt_bps == "" then null else ($xt_bps | tonumber? // null) end),
+          bytes_received: (if $xt_bytes == "" then null else ($xt_bytes | tonumber? // null) end),
+          seconds: (if $xt_time_s == "" then null else ($xt_time_s | tonumber? // null) end),
+          target_bytes: $xt_target
         }
       },
       verdicts: $verdicts
@@ -1918,6 +2035,7 @@ _should_run ipv6    && probe_ipv6
 _should_run compare && probe_compare_matrix
 _should_run xray    && probe_xray_protocol
 _should_run xrayjson && probe_xray_json
+_should_run xrayjson && probe_xray_throughput
 
 # ---------- summary ----------
 

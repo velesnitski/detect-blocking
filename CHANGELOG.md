@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-05-29
+
+### Fixed
+
+- **Auto-derive now picks up port from `--xray-config` URL.** Previously only
+  the host was extracted, leaving `VPN_PORT_TCP` on its 443 default. That
+  produced false "TCP unreachable" on probes 2–5 when the server listened
+  on a non-standard port (e.g. [REDACTED], [REDACTED], [REDACTED] — typical in load-
+  balanced fleets). The transport probes now align with the actual URL
+  destination, surfacing real protocol-layer findings instead of being
+  drowned by a phantom TCP failure.
+
+  Real-world payoff: this fix is what surfaced a fleet-wide Reality
+  `serverName` mismatch (client expected `[REDACTED]`, all 12
+  server endpoints presented `*.[REDACTED]` cert) — a misconfiguration
+  invisible without proper port alignment.
+
+### Gitignore
+
+- Added `.xray-*.json`, `.xray-*-cfg.json`, `xray-test-*.json` patterns
+  so ad-hoc local test configs never accidentally end up in commits.
+
 ## [0.2.2] - 2026-05-29
 
 ### Added

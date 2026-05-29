@@ -28,7 +28,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.2.2"
+readonly DETECT_BLOCKING_VERSION="0.2.3"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -186,11 +186,21 @@ if [ -n "$XRAY_CONFIG" ]; then
       vless://*|trojan://*|ss://*|hysteria://*|hysteria2://*|tuic://*)
         _derived_host=$(printf '%s' "$XRAY_CONFIG" \
           | sed -nE 's|^[a-z0-9]+://[^@]+@([^:?#/]+).*|\1|p')
+        # Also derive the URL's port if present — aligns transport probes
+        # (2 / 3 / 5) with the same destination instead of leaving them
+        # on the 443 default. Critical for non-standard-port deployments.
+        _derived_port=$(printf '%s' "$XRAY_CONFIG" \
+          | sed -nE 's|^[a-z0-9]+://[^@]+@[^:?#/]+:([0-9]+).*|\1|p')
         if [ -n "$_derived_host" ]; then
           VPN_HOST="$_derived_host"
-          printf '%s\n' "note: VPN_HOST auto-derived from --xray-config → $_derived_host" >&2
+          if [ -n "$_derived_port" ] && [ -z "${VPN_PORT_TCP:-}" ]; then
+            VPN_PORT_TCP="$_derived_port"
+            printf '%s\n' "note: VPN_HOST + VPN_PORT_TCP auto-derived from --xray-config → ${_derived_host}:${_derived_port}" >&2
+          else
+            printf '%s\n' "note: VPN_HOST auto-derived from --xray-config → $_derived_host" >&2
+          fi
         fi
-        unset _derived_host
+        unset _derived_host _derived_port
         ;;
       vmess://*)
         printf '%s\n' "note: vmess:// URL provided without positional host — host is inside base64 JSON, pass it explicitly to align probes 0-10" >&2

@@ -1,6 +1,12 @@
 # Local configuration — may contain real endpoint details
 detect_blocking.conf
 
+# Local Xray configs used for ad-hoc testing — must NEVER be committed.
+.xray-*.json
+.xray-*-cfg.json
+xray-test-*.json
+
+
 # Log files
 *.log
 *.log.[0-9]*

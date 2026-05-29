@@ -42,6 +42,9 @@ endpoint and emits a clearly labelled verdict for each detected blocking type.
 | 12 | Xray full-config (opt-in) | Spawns `xray-core` with your real config (`--xray-config-json FILE`, or synthesized from a `--xray-config URL`), exercises chained outbounds / balancers / fragment dialers end-to-end through a local SOCKS inbound; reports egress IP + colo + RTT. Auto-retries once at 4× `TIMEOUT` on a slow (timeout) handshake |
 | 13 | Tunnel throughput (auto with 12) | Pulls 10 MB from Cloudflare's speed-test backend through the same SOCKS tunnel; banded thresholds catch **cover-SNI traffic shaping** (RKN/TSPU/CN-style) that handshake-only probes miss |
 | 14 | Tunnel capacity (auto with 12) | N parallel streams × several CDN backends (Cloudflare / Hetzner / OVH) through the tunnel; reports the **best aggregate Mbps** — a real-speedtest-style estimate that defeats the single-stream under-reporting of probe 13. Runs by default; `--no-speedtest` to skip, auto-skipped in `--watch`/`--from-file` loops |
+| 15 | Reality cover authenticity (auto) | Plain-TLS probe like a censor's active prober: is the presented cert a CA-valid cover, or **self-signed/mismatched** (fake cover, trivially fingerprinted)? Booleans only — never prints the cover domain |
+| 16 | Egress integrity (auto with 12) | Through the tunnel: egress geo + **datacenter/proxy/mobile flags** (is the exit IP already on "this is a VPN" lists?) + DNS-resolver region. Country + flags only, never the IP. `--no-egress-check` to skip the 3rd-party lookup |
+| 17 | Held-session stability (auto with 12) | Holds the tunnel ~20s with periodic pulses to catch **delayed mid-session RST / kill-shaping** that short bursts (13/14) miss. `--no-stability` to skip; auto-skipped in `--watch`/`--from-file` loops |
 
 The verdict ends with a list of detected blocks plus an actionable
 recommendation for each (rotate IP, switch to Reality, use uTLS, etc).
@@ -514,6 +517,61 @@ Status values: `ok`, `skipped` (probe 12 didn't bring up a tunnel),
 `skipped-loop` (inside `--watch`/`--from-file` without `--speedtest`),
 `disabled` (`--no-speedtest`), `no-result`, `curl-missing`.
 
+### Probes 15-17 — stealth, integrity, stability
+
+Probes 11-14 answer *"does the tunnel connect, and is it fast?"* — but Reality
+exists for **stealth** and a VPN exists for **no leaks**. Probes 15-17 cover
+the dimensions the others miss. All three are **safe to share**: their
+output and JSON carry verdicts, booleans and a country code only — never the
+cover domain, the raw egress IP, or the provider name.
+
+**Probe 15 — Reality cover authenticity.** Connects plain-TLS
+(unauthenticated, exactly what a GFW/TSPU active prober does) with the
+configured `serverName` and inspects the cert. A genuine Reality server
+relays such clients to the **real** cover site, so they see a CA-valid cert
+for that name. A self-signed or mismatched cert means the cover is fake and
+an active prober flags the server instantly:
+
+```
+== 15. Reality cover authenticity ==
+          unauthenticated TLS probe (what an active prober sees)
+          cover cert: self-signed=1, chain-valid=0, CN-matches-serverName=1
+  [FAIL]  cover certificate is self-signed → fake cover, trivially fingerprinted
+```
+
+**Probe 16 — egress integrity.** Through the tunnel, looks up the egress
+geo + datacenter/proxy/mobile flags (is the exit already on the lists that
+Netflix / banks block?) and the DNS-resolver region:
+
+```
+== 16. Egress integrity (geo / reputation / DNS) ==
+          egress: country=NL, hosting=1, proxy=0, mobile=0
+  [WARN]  egress IP is flagged as datacenter/proxy — streaming & banking services likely to block it
+```
+
+It sends the egress IP to a 3rd-party IP-info service (`ip-api.com` by
+default). Disable with `--no-egress-check`, or point `XRAY_EGRESS_INFO_URL`
+at your own.
+
+**Probe 17 — held-session stability.** Holds the tunnel for a real-elapsed
+window (default 20s) and pulses small requests, catching the censor tactic
+of allowing the handshake then RST-ing the proven tunnel seconds later:
+
+```
+== 17. Held-session stability (delayed-RST detection) ==
+          holding tunnel ~20s (real elapsed), pulsing every 4s
+  [OK]    tunnel stable: 4/4 pulses over ~20s (RTT 110-180 ms)
+          note: only catches kills within ~20s — raise XRAY_STABILITY_SECONDS to probe for slower kill-shaping
+```
+
+If the tunnel works then dies mid-window, the verdict is
+`delayed RST / post-detection kill-shaping` with the time-to-kill. Runs by
+default; auto-skips in `--watch`/`--from-file` loops (`--stability` forces
+it there), `--no-stability` disables.
+
+JSON adds `probes.xray_cover` (booleans), `probes.xray_egress` (country +
+flags), and `probes.xray_stability` (pulse counts + RTT range + time-to-kill).
+
 ---
 
 ## Requirements
@@ -607,6 +665,11 @@ Top-level keys: `schema_version`, `version`, `timestamp` (ISO-8601 UTC),
 | `XRAY_SPEEDTEST_MAX_BYTES` | `52428800` | Probe 14 total download budget (~50 MB); raise for a fuller capacity reading |
 | `XRAY_SPEEDTEST_SECONDS` | `5` | Probe 14 download window per stream, after the handshake |
 | `XRAY_SPEEDTEST_URLS` | CF / Hetzner / OVH | Probe 14 endpoints — space-separated `name\|url\|mode` triples (`mode`=`cf`\|`range`) |
+| `XRAY_EGRESS_CHECK` | `1` | Probe 16 on/off (set `0`, or `--no-egress-check`, to skip the 3rd-party IP-info call) |
+| `XRAY_EGRESS_INFO_URL` | `ip-api.com/json` | Probe 16 IP-info endpoint (point at your own to avoid the public service) |
+| `XRAY_STABILITY` | `1` | Probe 17 on/off (set `0`, or `--no-stability`, to disable) |
+| `XRAY_STABILITY_SECONDS` | `20` | Probe 17 hold window (real elapsed); raise to catch slower kill-shaping |
+| `XRAY_STABILITY_INTERVAL` | `4` | Probe 17 seconds between pulses |
 | `LOG_FILE` | *(empty)* | Optional log file path |
 | `LOG_QUIET` | `0` | Suppress stdout when `1` |
 

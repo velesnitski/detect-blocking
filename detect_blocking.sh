@@ -28,7 +28,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.2.7"
+readonly DETECT_BLOCKING_VERSION="0.2.8"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -126,6 +126,9 @@ while [ $# -gt 0 ]; do
     --xray-config-json=*)  XRAY_JSON_CONFIG="${1#--xray-config-json=}"; shift ;;
     --speedtest)    XRAY_SPEEDTEST=1; XRAY_SPEEDTEST_FORCE=1; shift ;;
     --no-speedtest) XRAY_SPEEDTEST=0; shift ;;
+    --no-egress-check) XRAY_EGRESS_CHECK=0; shift ;;
+    --stability)    XRAY_STABILITY=1; XRAY_STABILITY_FORCE=1; shift ;;
+    --no-stability) XRAY_STABILITY=0; shift ;;
     --quiet|-q)    LOG_QUIET=1; shift ;;
     --json)        JSON_MODE=1; LOG_QUIET=1; shift ;;
     --version|-V)
@@ -154,6 +157,9 @@ while [ $# -gt 0 ]; do
       printf '                      dialerProxy, chained outbounds; needs xray + jq)\n'
       printf '  --speedtest         force probe 14 (multi-stream capacity) even inside --watch/--from-file\n'
       printf '  --no-speedtest      disable probe 14 (it runs by default when probe 12 succeeds)\n'
+      printf '  --no-egress-check   disable probe 16 (egress geo/reputation; avoids a 3rd-party IP-info call)\n'
+      printf '  --no-stability      disable probe 17 (held-session RST detection; it runs by default)\n'
+      printf '  --stability         force probe 17 even inside --watch/--from-file loops\n'
       exit 0
       ;;
     -*) die "unknown option: $1" ;;
@@ -476,6 +482,49 @@ XRAY_SPEEDTEST_STATUS=""    # ok, skipped, disabled, curl-missing, no-result
 XRAY_SPEEDTEST_BEST_BPS=""  # best aggregate bytes/sec across endpoints
 XRAY_SPEEDTEST_BEST_NAME="" # endpoint name that produced the best aggregate
 XRAY_SPEEDTEST_RESULTS=""   # "name|bps name|bps ..." for JSON / reporting
+
+# ---- probe 15: Reality cover authenticity ----
+# A working Reality server relays UNAUTHENTICATED clients (plain TLS, like a
+# censor's active probe) to the genuine cover site, so they see a real
+# CA-valid cert. A self-signed / mismatched cert means the cover is fake and
+# trivially fingerprintable. Output is booleans only — never the cover domain.
+XRAY_COVER_STATUS=""        # ok, fake, mismatch, unreachable, skipped, no-sni, openssl-missing
+XRAY_COVER_SELFSIGNED=""    # 1 / 0 / "" (issuer == subject)
+XRAY_COVER_CHAIN_VALID=""   # 1 / 0 / "" (openssl verify return code 0)
+XRAY_COVER_CN_MATCH=""      # 1 / 0 / "" (cert CN/SAN covers the configured serverName)
+
+# ---- probe 16: egress integrity (geo / reputation / DNS) ----
+# Runs through the probe-12 tunnel. Reports geo + datacenter/proxy flags so
+# you know if the egress is already on the "this is a VPN" lists that streaming
+# / banking services block. Sends the egress IP to a 3rd-party IP-info service
+# — disable with --no-egress-check. Output: country code + flags, never the IP.
+XRAY_EGRESS_CHECK="${XRAY_EGRESS_CHECK:-1}"                 # 1 = run (--no-egress-check opts out)
+XRAY_EGRESS_INFO_URL="${XRAY_EGRESS_INFO_URL:-http://ip-api.com/json/?fields=status,countryCode,hosting,proxy,mobile}"
+XRAY_EGRESS_DNS_URL="${XRAY_EGRESS_DNS_URL:-http://edns.ip-api.com/json}"
+XRAY_EGRESS_STATUS=""       # ok, skipped, disabled, curl-missing, no-data
+XRAY_EGRESS_COUNTRY=""      # ISO country code seen at the egress
+XRAY_EGRESS_HOSTING=""      # 1 / 0 — datacenter / hosting IP
+XRAY_EGRESS_PROXY=""        # 1 / 0 — on a proxy blocklist
+XRAY_EGRESS_MOBILE=""       # 1 / 0 — mobile carrier IP
+XRAY_EGRESS_DNS_COUNTRY=""  # country of the DNS resolver seen through the tunnel
+XRAY_EGRESS_DNS_LEAK=""     # 1 / 0 — resolver country diverges from egress (possible leak)
+
+# ---- probe 17: held-session stability (delayed-RST / kill-shaping) ----
+# Short bursts (13/14) miss the censor tactic of letting the handshake through
+# then RST-ing the proven tunnel seconds later. Probe 17 holds the tunnel and
+# pulses small requests for a real-elapsed window, catching mid-session death.
+# Runs by default when probe 12 succeeds; --no-stability opts out; auto-skips
+# inside --watch/--from-file loops (slow), --stability forces it there.
+XRAY_STABILITY="${XRAY_STABILITY:-1}"                      # 1 = run by default (--no-stability opts out)
+XRAY_STABILITY_FORCE="${XRAY_STABILITY_FORCE:-0}"         # 1 = run even inside --watch/--from-file loops
+XRAY_STABILITY_SECONDS="${XRAY_STABILITY_SECONDS:-20}"    # real-elapsed hold duration
+XRAY_STABILITY_INTERVAL="${XRAY_STABILITY_INTERVAL:-4}"  # seconds between pulses
+XRAY_STABILITY_STATUS=""    # ok, killed, unstable, skipped, disabled, curl-missing
+XRAY_STABILITY_TOTAL=""     # pulses attempted
+XRAY_STABILITY_OK=""        # pulses that succeeded
+XRAY_STABILITY_FIRST_FAIL_S=""  # seconds into the hold when the first failure hit
+XRAY_STABILITY_RTT_MIN=""   # ms
+XRAY_STABILITY_RTT_MAX=""   # ms
 
 # ---------- colors (TTY-aware, suppressed when --quiet) ----------
 
@@ -2089,6 +2138,267 @@ probe_xray_speedtest() {
   fi
 }
 
+# Extract the Reality cover serverName from --xray-config URL or
+# --xray-config-json. Echoes the SNI (empty if not a reality config). Kept
+# out of probe output — only used internally to drive the cover check.
+_xray_cover_sni() {
+  if [ -n "$XRAY_CONFIG" ]; then
+    case "$XRAY_CONFIG" in
+      *security=reality*)
+        printf '%s' "$XRAY_CONFIG" \
+          | sed -nE 's|.*[?&]sni=([^&#]*).*|\1|p' | head -1
+        return 0 ;;
+    esac
+  fi
+  if [ -n "$XRAY_JSON_CONFIG" ] && [ -r "$XRAY_JSON_CONFIG" ] && command -v jq >/dev/null 2>&1; then
+    jq -r '
+      .outbounds // []
+      | map(select(.streamSettings.security == "reality"))
+      | first | .streamSettings.realitySettings.serverName // empty
+    ' "$XRAY_JSON_CONFIG" 2>/dev/null
+  fi
+}
+
+# Probe 15 — Reality cover authenticity. Connects plain-TLS (unauthenticated,
+# exactly what a GFW/TSPU active prober does) with the configured serverName
+# and inspects the presented certificate. A genuine Reality server relays such
+# clients to the real cover site → CA-valid cert chaining to that name. A
+# self-signed or mismatched cert means the cover is fake and trivially
+# fingerprinted. Output is booleans only — the cover domain is never printed.
+probe_xray_cover() {
+  local sni
+  sni=$(_xray_cover_sni)
+  if [ -z "$sni" ]; then
+    XRAY_COVER_STATUS="skipped"   # not a reality config (or no config)
+    return 0
+  fi
+
+  hdr "15. Reality cover authenticity"
+  info "unauthenticated TLS probe (what an active prober sees)"
+
+  if ! check_cmd openssl; then
+    warn "skipping — openssl not available"
+    XRAY_COVER_STATUS="openssl-missing"
+    return 0
+  fi
+
+  # `echo Q` makes openssl quit right after the handshake — no `timeout`
+  # wrapper needed (and `timeout`/`gtimeout` aren't present on stock macOS).
+  local out subject issuer verify
+  out=$(echo Q | openssl s_client -connect "$VPN_HOST:$VPN_PORT_TCP" \
+        -servername "$sni" 2>/dev/null)
+  subject=$(printf '%s' "$out" | sed -nE 's/^subject=(.*)/\1/p' | head -1)
+  issuer=$(printf '%s'  "$out" | sed -nE 's/^issuer=(.*)/\1/p'  | head -1)
+  verify=$(printf '%s'  "$out" | sed -nE 's/.*Verify return code: ([0-9]+).*/\1/p' | head -1)
+
+  if [ -z "$subject" ]; then
+    fail "no TLS certificate returned — cover unreachable (see probes 2-3)"
+    XRAY_COVER_STATUS="unreachable"
+    return 0
+  fi
+
+  # Self-signed: issuer == subject, or verify code 18/19.
+  if [ "$subject" = "$issuer" ] || [ "$verify" = "18" ] || [ "$verify" = "19" ]; then
+    XRAY_COVER_SELFSIGNED=1
+  else
+    XRAY_COVER_SELFSIGNED=0
+  fi
+  [ "$verify" = "0" ] && XRAY_COVER_CHAIN_VALID=1 || XRAY_COVER_CHAIN_VALID=0
+
+  # CN/SAN covers the configured serverName? Compare case-insensitively,
+  # accepting a wildcard parent (*.example.com vs host.example.com). Booleans
+  # only — neither the cert CN nor the SNI is emitted.
+  local cn lc_cn lc_sni parent
+  cn=$(printf '%s' "$subject" | sed -nE 's/.*CN ?= ?([^,/]+).*/\1/p' | head -1)
+  lc_cn=$(printf '%s' "$cn"  | tr '[:upper:]' '[:lower:]')
+  lc_sni=$(printf '%s' "$sni" | tr '[:upper:]' '[:lower:]')
+  parent="${lc_sni#*.}"
+  if [ -n "$lc_cn" ] && { [ "$lc_cn" = "$lc_sni" ] || [ "$lc_cn" = "*.$parent" ]; }; then
+    XRAY_COVER_CN_MATCH=1
+  else
+    XRAY_COVER_CN_MATCH=0
+  fi
+
+  info "cover cert: self-signed=${XRAY_COVER_SELFSIGNED}, chain-valid=${XRAY_COVER_CHAIN_VALID}, CN-matches-serverName=${XRAY_COVER_CN_MATCH}"
+
+  if [ "$XRAY_COVER_SELFSIGNED" = "1" ]; then
+    fail "cover certificate is self-signed → fake cover, trivially fingerprinted"
+    XRAY_COVER_STATUS="fake"
+    add_verdict "Reality cover is fake — the server presents a self-signed certificate to unauthenticated clients instead of relaying them to the genuine cover site. An active prober (GFW/TSPU) flags this as a censorship-circumvention server immediately. Fix on the server: point Reality 'dest' at the real cover host:443 and list it in 'serverNames'"
+  elif [ "$XRAY_COVER_CHAIN_VALID" = "1" ] && [ "$XRAY_COVER_CN_MATCH" = "1" ]; then
+    ok "cover certificate is CA-valid and matches the configured serverName → authentic cover"
+  elif [ "$XRAY_COVER_CHAIN_VALID" = "1" ]; then
+    warn "cover cert is CA-valid but for a different host than the configured serverName"
+    XRAY_COVER_STATUS="mismatch"
+    add_verdict "Reality cover/serverName mismatch — the cover host serves a valid cert, but not for the serverName your client sends. The handshake's SNI won't match what the server steals, so authentication fails fleet-wide. Align client serverName with the server's Reality 'dest'/'serverNames'"
+  else
+    warn "cover cert neither self-signed nor cleanly CA-valid (verify code ${verify:-?})"
+    XRAY_COVER_STATUS="mismatch"
+  fi
+  [ -z "$XRAY_COVER_STATUS" ] && XRAY_COVER_STATUS="ok"
+}
+
+# Probe 16 — egress integrity (geo / reputation / DNS leak). Runs through the
+# probe-12 tunnel. Tells you if the egress is already on the datacenter/proxy
+# lists that streaming & banking services block, and whether DNS resolves in a
+# different region than the egress (possible leak). Output: country code +
+# flags only — never the raw egress IP. Sends the egress IP to a 3rd-party
+# IP-info service; disable with --no-egress-check.
+probe_xray_egress() {
+  if [ "$XRAY_EGRESS_CHECK" != "1" ]; then
+    XRAY_EGRESS_STATUS="disabled"
+    return 0
+  fi
+  if [ "$XRAY_JSON_STATUS" != "ok" ]; then
+    XRAY_EGRESS_STATUS="skipped"
+    return 0
+  fi
+
+  hdr "16. Egress integrity (geo / reputation / DNS)"
+
+  if ! check_cmd curl; then
+    warn "skipping — curl not available"
+    XRAY_EGRESS_STATUS="curl-missing"
+    return 0
+  fi
+
+  local port="$XRAY_JSON_SOCKS_PORT" info_json dns_json
+  info_json=$(curl -sS --max-time "$TIMEOUT" \
+              --socks5-hostname "127.0.0.1:$port" \
+              "$XRAY_EGRESS_INFO_URL" 2>/dev/null)
+
+  if [ -z "$info_json" ] || ! printf '%s' "$info_json" | grep -q '"countryCode"'; then
+    fail "egress IP-info lookup returned no data through the tunnel"
+    XRAY_EGRESS_STATUS="no-data"
+    return 0
+  fi
+
+  # Parse with jq if available, else minimal grep/sed (fields are flat).
+  if command -v jq >/dev/null 2>&1; then
+    XRAY_EGRESS_COUNTRY=$(printf '%s' "$info_json" | jq -r '.countryCode // empty' 2>/dev/null)
+    XRAY_EGRESS_HOSTING=$(printf '%s' "$info_json" | jq -r 'if .hosting then 1 else 0 end' 2>/dev/null)
+    XRAY_EGRESS_PROXY=$(printf '%s'   "$info_json" | jq -r 'if .proxy   then 1 else 0 end' 2>/dev/null)
+    XRAY_EGRESS_MOBILE=$(printf '%s'  "$info_json" | jq -r 'if .mobile  then 1 else 0 end' 2>/dev/null)
+  else
+    XRAY_EGRESS_COUNTRY=$(printf '%s' "$info_json" | sed -nE 's/.*"countryCode":"([^"]*)".*/\1/p')
+    printf '%s' "$info_json" | grep -q '"hosting":true' && XRAY_EGRESS_HOSTING=1 || XRAY_EGRESS_HOSTING=0
+    printf '%s' "$info_json" | grep -q '"proxy":true'   && XRAY_EGRESS_PROXY=1   || XRAY_EGRESS_PROXY=0
+    printf '%s' "$info_json" | grep -q '"mobile":true'  && XRAY_EGRESS_MOBILE=1  || XRAY_EGRESS_MOBILE=0
+  fi
+
+  info "egress: country=${XRAY_EGRESS_COUNTRY:-?}, hosting=${XRAY_EGRESS_HOSTING}, proxy=${XRAY_EGRESS_PROXY}, mobile=${XRAY_EGRESS_MOBILE}"
+
+  # DNS resolver as seen through the tunnel (edns.ip-api echoes the resolver).
+  dns_json=$(curl -sS --max-time "$TIMEOUT" \
+             --socks5-hostname "127.0.0.1:$port" \
+             "$XRAY_EGRESS_DNS_URL" 2>/dev/null)
+  if printf '%s' "$dns_json" | grep -q '"dns"'; then
+    if command -v jq >/dev/null 2>&1; then
+      XRAY_EGRESS_DNS_COUNTRY=$(printf '%s' "$dns_json" | jq -r '.dns.geo // empty' 2>/dev/null | sed -nE 's/^([A-Za-z ]+) -.*/\1/p')
+      [ -z "$XRAY_EGRESS_DNS_COUNTRY" ] && XRAY_EGRESS_DNS_COUNTRY=$(printf '%s' "$dns_json" | jq -r '.dns.geo // empty' 2>/dev/null)
+    fi
+    if [ -n "$XRAY_EGRESS_DNS_COUNTRY" ]; then
+      info "DNS resolver (via tunnel): ${XRAY_EGRESS_DNS_COUNTRY}"
+    fi
+  fi
+
+  XRAY_EGRESS_STATUS="ok"
+  if [ "$XRAY_EGRESS_PROXY" = "1" ] || [ "$XRAY_EGRESS_HOSTING" = "1" ]; then
+    warn "egress IP is flagged as datacenter/proxy — streaming & banking services likely to block it"
+    add_verdict "Egress IP is on datacenter/proxy reputation lists — fine for censorship circumvention, but streaming / payment / banking sites will challenge or block it. For those use cases a residential or clean egress is needed"
+  else
+    ok "egress reputation clean (not flagged datacenter/proxy)"
+  fi
+}
+
+# Probe 17 — held-session stability (delayed-RST / kill-shaping). Opt-in.
+# Holds the probe-12 tunnel and pulses small requests for a while, catching the
+# censor tactic of allowing the handshake then RST-ing the proven tunnel
+# seconds later — invisible to the short bursts in probes 13/14.
+probe_xray_stability() {
+  if [ "$XRAY_STABILITY" != "1" ]; then
+    XRAY_STABILITY_STATUS="disabled"
+    return 0
+  fi
+  if [ "$XRAY_JSON_STATUS" != "ok" ]; then
+    XRAY_STABILITY_STATUS="skipped"
+    return 0
+  fi
+
+  hdr "17. Held-session stability (delayed-RST detection)"
+
+  if ! check_cmd curl; then
+    warn "skipping — curl not available"
+    XRAY_STABILITY_STATUS="curl-missing"
+    return 0
+  fi
+
+  # Auto-skip inside --watch / --from-file loops: a ~20s hold every iteration
+  # would dominate a monitoring cadence. Force with --stability.
+  if [ "${XRAY_STABILITY_FORCE:-0}" != "1" ] \
+     && { [ "${_WATCH_CHILD:-0}" = "1" ] || [ "${_BATCH_CHILD:-0}" = "1" ]; }; then
+    info "skipped in watch/batch loop (~${XRAY_STABILITY_SECONDS}s hold) — pass --stability to force"
+    XRAY_STABILITY_STATUS="skipped-loop"
+    return 0
+  fi
+
+  local port="$XRAY_JSON_SOCKS_PORT"
+  local dur="$XRAY_STABILITY_SECONDS" iv="$XRAY_STABILITY_INTERVAL"
+  local total=0 okc=0 first_fail="" rtt rmin="" rmax="" t0 t1
+  local start now elapsed_ms elapsed_s
+  # Per-pulse budget must clear the handshake on each fresh connection.
+  local pulse_to
+  pulse_to=$(( ( ${XRAY_JSON_RTT_MS:-3000} + 999 ) / 1000 + 3 ))
+
+  info "holding tunnel ~${dur}s (real elapsed), pulsing every ${iv}s"
+
+  start=$(_now_ms)
+  while : ; do
+    now=$(_now_ms); elapsed_ms=$(( now - start ))
+    [ "$elapsed_ms" -ge "$(( dur * 1000 ))" ] && break
+    total=$(( total + 1 ))
+    t0=$(_now_ms)
+    if curl -sS --max-time "$pulse_to" \
+         --socks5-hostname "127.0.0.1:$port" \
+         -o /dev/null https://cloudflare.com/cdn-cgi/trace 2>/dev/null; then
+      t1=$(_now_ms); rtt=$(( t1 - t0 ))
+      okc=$(( okc + 1 ))
+      [ -z "$rmin" ] && rmin="$rtt"; [ "$rtt" -lt "$rmin" ] && rmin="$rtt"
+      [ -z "$rmax" ] && rmax="$rtt"; [ "$rtt" -gt "$rmax" ] && rmax="$rtt"
+    else
+      now=$(_now_ms)
+      [ -z "$first_fail" ] && first_fail=$(( ( now - start ) / 1000 ))
+    fi
+    # Sleep only if time remains in the window.
+    now=$(_now_ms)
+    [ "$(( now - start ))" -lt "$(( dur * 1000 ))" ] && sleep "$iv"
+  done
+
+  XRAY_STABILITY_TOTAL="$total"
+  XRAY_STABILITY_OK="$okc"
+  XRAY_STABILITY_FIRST_FAIL_S="$first_fail"
+  XRAY_STABILITY_RTT_MIN="$rmin"
+  XRAY_STABILITY_RTT_MAX="$rmax"
+
+  if [ "$total" = "0" ]; then
+    warn "no pulses fit in the window (handshake slower than hold duration)"
+    XRAY_STABILITY_STATUS="unstable"
+  elif [ "$okc" = "$total" ]; then
+    ok "tunnel stable: ${okc}/${total} pulses over ~${dur}s (RTT ${rmin:-?}-${rmax:-?} ms)"
+    info "note: only catches kills within ~${dur}s — raise XRAY_STABILITY_SECONDS to probe for slower kill-shaping"
+    XRAY_STABILITY_STATUS="ok"
+  elif [ "$okc" -gt 0 ] && [ -n "$first_fail" ]; then
+    # Worked, then started failing → classic delayed kill.
+    fail "tunnel died mid-session: ${okc}/${total} pulses ok, first failure ~${first_fail}s in"
+    XRAY_STABILITY_STATUS="killed"
+    add_verdict "Tunnel passed the handshake then failed mid-session (~${first_fail}s in) — delayed RST / post-detection kill-shaping. The censor lets the handshake through, classifies the flow as a tunnel, then drops it. Short connection tests miss this; rotate endpoint/cover or shorten session reuse"
+  else
+    warn "tunnel unstable: only ${okc}/${total} pulses succeeded"
+    XRAY_STABILITY_STATUS="unstable"
+    add_verdict "Tunnel intermittently fails (${okc}/${total} pulses) — flaky path, congested egress, or partial interference; not a clean block"
+  fi
+}
+
 probe_ipv6() {
   hdr "9. IPv6 reachability"
 
@@ -2222,6 +2532,22 @@ _emit_json() {
     --arg xs_best_name      "$XRAY_SPEEDTEST_BEST_NAME" \
     --arg xs_results        "$XRAY_SPEEDTEST_RESULTS" \
     --argjson xs_streams    "${XRAY_SPEEDTEST_STREAMS:-0}" \
+    --arg xc_status         "$XRAY_COVER_STATUS" \
+    --arg xc_selfsigned     "$XRAY_COVER_SELFSIGNED" \
+    --arg xc_chain          "$XRAY_COVER_CHAIN_VALID" \
+    --arg xc_cnmatch        "$XRAY_COVER_CN_MATCH" \
+    --arg xe_status         "$XRAY_EGRESS_STATUS" \
+    --arg xe_country        "$XRAY_EGRESS_COUNTRY" \
+    --arg xe_hosting        "$XRAY_EGRESS_HOSTING" \
+    --arg xe_proxy          "$XRAY_EGRESS_PROXY" \
+    --arg xe_mobile         "$XRAY_EGRESS_MOBILE" \
+    --arg xe_dns_country    "$XRAY_EGRESS_DNS_COUNTRY" \
+    --arg xst_status        "$XRAY_STABILITY_STATUS" \
+    --arg xst_total         "$XRAY_STABILITY_TOTAL" \
+    --arg xst_ok            "$XRAY_STABILITY_OK" \
+    --arg xst_firstfail     "$XRAY_STABILITY_FIRST_FAIL_S" \
+    --arg xst_rttmin        "$XRAY_STABILITY_RTT_MIN" \
+    --arg xst_rttmax        "$XRAY_STABILITY_RTT_MAX" \
     --argjson verdicts      "$verdicts_json" '
     def words: split(" ") | map(select(length > 0));
     def opt(s): if s == "" then null else s end;
@@ -2340,6 +2666,28 @@ _emit_json() {
                       mbps: ((.[1] | tonumber? // 0) * 8 / 1000000) }))
             end
           )
+        },
+        xray_cover: {
+          status: opt($xc_status),
+          self_signed: tri_bool(($xc_selfsigned | tonumber? // -1)),
+          chain_valid: tri_bool(($xc_chain | tonumber? // -1)),
+          cn_matches_servername: tri_bool(($xc_cnmatch | tonumber? // -1))
+        },
+        xray_egress: {
+          status: opt($xe_status),
+          country: opt($xe_country),
+          hosting: tri_bool(($xe_hosting | tonumber? // -1)),
+          proxy: tri_bool(($xe_proxy | tonumber? // -1)),
+          mobile: tri_bool(($xe_mobile | tonumber? // -1)),
+          dns_resolver_geo: opt($xe_dns_country)
+        },
+        xray_stability: {
+          status: opt($xst_status),
+          pulses_total: (if $xst_total == "" then null else ($xst_total | tonumber? // null) end),
+          pulses_ok: (if $xst_ok == "" then null else ($xst_ok | tonumber? // null) end),
+          first_failure_seconds: (if $xst_firstfail == "" then null else ($xst_firstfail | tonumber? // null) end),
+          rtt_min_ms: (if $xst_rttmin == "" then null else ($xst_rttmin | tonumber? // null) end),
+          rtt_max_ms: (if $xst_rttmax == "" then null else ($xst_rttmax | tonumber? // null) end)
         }
       },
       verdicts: $verdicts
@@ -2435,6 +2783,9 @@ _should_run xray    && probe_xray_protocol
 _should_run xrayjson && probe_xray_json
 _should_run xrayjson && probe_xray_throughput
 _should_run xrayjson && probe_xray_speedtest
+{ _should_run xray || _should_run xrayjson; } && probe_xray_cover
+_should_run xrayjson && probe_xray_egress
+_should_run xrayjson && probe_xray_stability
 
 # ---------- summary ----------
 
@@ -2452,7 +2803,7 @@ else
     [ "$LOG_QUIET" = "1" ] || printf "  ${RED}•${RST} %s\n" "$v"
   done
 
-  [ "$LOG_QUIET" = "1" ] || printf '\n%s\n' "${YEL}Recommendation:${RST}"
+  _recs=()
   for v in "${VERDICTS[@]}"; do
     case "$v" in
       *"SNI"*)                    rec="try Reality / domain fronting / ECH-enabled client" ;;
@@ -2488,13 +2839,24 @@ else
       *"Xray full-config bypasses local DPI"*) rec="full config (with chained outbounds / fragment / noises) tunnels through — keep deploying this exact config to clients" ;;
       *"Fragment / chained-outbound layer is the bypass"*) rec="the lost-in-translation pieces of the share-link form (fragment, dialerProxy, noises) ARE the bypass; clients must consume the full json, not the URL" ;;
       *"Xray full-config tunnel fails while plain TLS"*) rec="protocol-fingerprint DPI on the tunnel — verify UUID/keys, try a different SNI front, or change flow= variant" ;;
+      *"timed out (even at"*)     rec="raise TIMEOUT (high-RTT / multi-hop tunnel) or check the server's upstream/egress health — this is latency, not a fingerprint block" ;;
+      *"rejected (reset / closed pipe)"*) rec="protocol-fingerprint DPI or config drift — verify UUID / keys / flow / target SNI" ;;
+      *"Reality cover is fake"*)  rec="server-side fix: point Reality 'dest' at the real cover host:443 and add it to 'serverNames' so unauthenticated probes get relayed to a genuine CA-valid cert" ;;
+      *"Reality cover/serverName mismatch"*) rec="align the client 'serverName' with the server's Reality dest / serverNames" ;;
+      *"Egress IP is on datacenter/proxy"*) rec="for streaming / payment / banking, route those flows through a residential or clean-IP egress; for censorship circumvention the current egress is fine" ;;
+      *"delayed RST"*|*"kill-shaping"*) rec="rotate endpoint / cover SNI, shorten session reuse, or add traffic padding — the handshake is fine, the proven flow is being dropped" ;;
+      *"intermittently fails"*)   rec="treat as a flaky path / congested egress, not a hard block; re-test from another vantage" ;;
       *) rec="" ;;
     esac
-    if [ -n "$rec" ]; then
+    [ -n "$rec" ] && _recs+=("$rec")
+  done
+  if [ "${#_recs[@]}" -gt 0 ]; then
+    [ "$LOG_QUIET" = "1" ] || printf '\n%s\n' "${YEL}Recommendation:${RST}"
+    for rec in "${_recs[@]}"; do
       [ "$LOG_QUIET" = "1" ] || printf "  → %s\n" "$rec"
       _log_line REC "$rec"
-    fi
-  done
+    done
+  fi
 fi
 
 [ "$LOG_QUIET" = "1" ] || printf '\n%s\n' "${DIM}Done.${RST}"

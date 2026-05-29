@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-05-29
+
+### Added
+
+Three new Xray probes covering the **stealth / integrity / stability**
+dimensions that the reachability (11/12) and performance (13/14) probes
+miss. All three are designed to be **safe to share**: output and JSON carry
+verdicts + booleans + country code only — never the cover domain, the raw
+egress IP, or the provider name.
+
+- **Probe 15 — Reality cover authenticity.** Connects plain-TLS
+  (unauthenticated, exactly what a GFW/TSPU active prober does) with the
+  configured `serverName` and inspects the presented certificate. A genuine
+  Reality server relays such clients to the real cover site → a CA-valid
+  cert for that name; a **self-signed or mismatched cert means the cover is
+  fake and trivially fingerprinted**. Emits `self-signed`,
+  `chain-valid`, `CN-matches-serverName` booleans (never the domain).
+  Automates the exact fleet-wide misconfiguration found by hand earlier this
+  cycle. Runs by default when a Reality config is present.
+
+- **Probe 16 — egress integrity (geo / reputation / DNS).** Through the
+  probe-12 tunnel, looks up the egress geo + datacenter/proxy/mobile flags
+  so you know if the exit IP is already on the "this is a VPN" lists that
+  streaming / payment / banking services block, plus the DNS-resolver region
+  seen through the tunnel. Reports country code + flags only — not the IP or
+  ASN org. Runs by default; sends the egress IP to a 3rd-party IP-info
+  service (`ip-api.com`, configurable via `XRAY_EGRESS_INFO_URL`) — disable
+  with `--no-egress-check`.
+
+- **Probe 17 — held-session stability (delayed-RST detection).** Holds the
+  tunnel for a real-elapsed window (default 20s) and pulses small requests,
+  catching the censor tactic of letting the handshake through then RST-ing
+  the proven tunnel seconds later — invisible to the short bursts in 13/14.
+  Runs by default; auto-skips inside `--watch` / `--from-file` loops
+  (`--stability` forces it there); `--no-stability` disables. Notes that it
+  only catches kills within the hold window — raise `XRAY_STABILITY_SECONDS`
+  to probe for slower kill-shaping.
+
+  Tunables: `XRAY_EGRESS_CHECK`, `XRAY_EGRESS_INFO_URL`, `XRAY_EGRESS_DNS_URL`,
+  `XRAY_STABILITY`, `XRAY_STABILITY_SECONDS`, `XRAY_STABILITY_INTERVAL`.
+  JSON schema adds `probes.xray_cover`, `probes.xray_egress`,
+  `probes.xray_stability`.
+
+  New test: `tests/test_cover_egress_stability.sh` (gating + schema +
+  an assertion that no domain/IP leaks into the 15/16 JSON). Suite is now 11.
+
+### Fixed
+
+- **Recommendation block no longer prints an empty header.** Recommendations
+  are now buffered and the `Recommendation:` heading is emitted only when at
+  least one verdict maps to advice. Added mappings for the new
+  cover/egress/stability verdicts and for the v0.2.6 timeout/reset wording.
+
 ## [0.2.7] - 2026-05-29
 
 ### Added

@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-05-29
+
+### Added
+
+- **Probe 14 — multi-stream / multi-endpoint capacity estimate.** Probe 13
+  is a single-stream shaping *floor* detector; on a high-RTT tunnel a single
+  TCP stream is window-limited and under-reports real bandwidth by an order
+  of magnitude (e.g. ~10 Mbps single-stream where the link actually carries
+  100+ Mbps). Probe 14 runs N parallel streams (default 4, like a real
+  speedtest) against several public CDN backends (Cloudflare, Hetzner, OVH
+  by default) through the probe-12 SOCKS tunnel and reports the **best
+  aggregate** as the usable-bandwidth estimate — defeating both single-stream
+  BDP limits and one slow path skewing the result.
+
+  Runs **by default** whenever probe 12 brings up a tunnel. Opt out with
+  `--no-speedtest` (or `XRAY_SPEEDTEST=0`). Auto-skips inside `--watch` /
+  `--from-file` loops (so monitoring doesn't pull tens of MB per iteration);
+  `--speedtest` forces it even there.
+
+  Per-stream curl budget is derived from probe 12's measured handshake RTT
+  plus a download window, so streams clear the Reality handshake before the
+  download window opens — a fixed short timeout would kill every stream
+  mid-handshake on a high-RTT tunnel. Total download is bounded
+  (`XRAY_SPEEDTEST_MAX_BYTES`, default ~50 MB); with a small budget on a fast
+  link the streams finish inside TCP slow-start, so the result is reported as
+  a **floor** with a hint to raise the budget for a fuller reading.
+
+  Tunables: `XRAY_SPEEDTEST_STREAMS` (4), `XRAY_SPEEDTEST_MAX_BYTES`
+  (52428800), `XRAY_SPEEDTEST_SECONDS` (5, the download window after
+  handshake), `XRAY_SPEEDTEST_URLS` (space-separated `name|url|mode` triples;
+  `mode=cf` appends `?bytes=N`, `mode=range` caps bytes via an HTTP Range
+  header). JSON schema adds `probes.xray_speedtest { status, streams,
+  best_endpoint, best_bytes_per_second, best_mbps, per_endpoint[] }`.
+
+  New test: `tests/test_speedtest.sh`. Full suite is now 11 tests.
+
+### Fixed
+
+- **URL-synthesized config no longer creates an orphan tempfile.** The
+  synthesizer wrote a `mktemp` base *plus* a `.json` sibling; the synth file
+  is only ever read by `jq` (probe 12 writes its own patched `.json` that
+  xray-core loads), so the extension was unnecessary. Now a single temp file
+  is created and removed — eliminating an intermittent "tempfile leaked"
+  flake in `tests/test_xray_url_synth.sh`. The test's leak check is now
+  delta-based (ignores unrelated pre-existing files).
+
 ## [0.2.6] - 2026-05-29
 
 ### Added

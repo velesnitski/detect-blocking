@@ -28,7 +28,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.2.6"
+readonly DETECT_BLOCKING_VERSION="0.2.7"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -124,6 +124,8 @@ while [ $# -gt 0 ]; do
     --xray-config=*)  XRAY_CONFIG="${1#--xray-config=}"; shift ;;
     --xray-config-json)    XRAY_JSON_CONFIG="${2:-}"; shift 2 ;;
     --xray-config-json=*)  XRAY_JSON_CONFIG="${1#--xray-config-json=}"; shift ;;
+    --speedtest)    XRAY_SPEEDTEST=1; XRAY_SPEEDTEST_FORCE=1; shift ;;
+    --no-speedtest) XRAY_SPEEDTEST=0; shift ;;
     --quiet|-q)    LOG_QUIET=1; shift ;;
     --json)        JSON_MODE=1; LOG_QUIET=1; shift ;;
     --version|-V)
@@ -150,6 +152,8 @@ while [ $# -gt 0 ]; do
       printf '                      accepts vless://, vmess://, trojan://, ss://, hysteria2:// URLs\n'
       printf '  --xray-config-json FILE  full-config probe via xray-core + SOCKS5 (covers fragment,\n'
       printf '                      dialerProxy, chained outbounds; needs xray + jq)\n'
+      printf '  --speedtest         force probe 14 (multi-stream capacity) even inside --watch/--from-file\n'
+      printf '  --no-speedtest      disable probe 14 (it runs by default when probe 12 succeeds)\n'
       exit 0
       ;;
     -*) die "unknown option: $1" ;;
@@ -453,6 +457,25 @@ XRAY_THROUGHPUT_TIME_S=""   # wall-clock seconds the download window spanned
 XRAY_THROUGHPUT_TARGET_BYTES="${XRAY_THROUGHPUT_TARGET_BYTES:-10485760}"  # 10 MB default
 XRAY_THROUGHPUT_TIMEOUT="${XRAY_THROUGHPUT_TIMEOUT:-20}"                  # seconds
 XRAY_THROUGHPUT_URL="${XRAY_THROUGHPUT_URL:-https://speed.cloudflare.com/__down}"
+
+# ---- probe 14: multi-stream / multi-endpoint capacity estimate (opt-in) ----
+# Probe 13 is a single-stream shaping FLOOR detector; on a high-RTT tunnel a
+# single TCP stream is window-limited and badly under-reports real capacity.
+# Probe 14 runs N parallel streams (like a real speedtest) against several
+# public CDN backends and reports the best aggregate — the closest honest
+# estimate of usable tunnel bandwidth. Opt-in (downloads tens of MB).
+XRAY_SPEEDTEST="${XRAY_SPEEDTEST:-1}"                       # 1 = run by default (--no-speedtest opts out)
+XRAY_SPEEDTEST_FORCE="${XRAY_SPEEDTEST_FORCE:-0}"           # 1 = run even inside --watch / --from-file loops
+XRAY_SPEEDTEST_STREAMS="${XRAY_SPEEDTEST_STREAMS:-4}"       # parallel streams per endpoint
+XRAY_SPEEDTEST_MAX_BYTES="${XRAY_SPEEDTEST_MAX_BYTES:-52428800}"  # ~50 MB total budget
+XRAY_SPEEDTEST_SECONDS="${XRAY_SPEEDTEST_SECONDS:-5}"       # download window AFTER handshake (per stream)
+# Endpoints as space-separated name|url|mode triples. mode=cf → append
+# ?bytes=N (Cloudflare); mode=range → cap bytes with an HTTP Range header.
+XRAY_SPEEDTEST_URLS="${XRAY_SPEEDTEST_URLS:-cloudflare|https://speed.cloudflare.com/__down|cf hetzner|https://speed.hetzner.de/100MB.bin|range ovh|https://proof.ovh.net/files/100Mb.dat|range}"
+XRAY_SPEEDTEST_STATUS=""    # ok, skipped, disabled, curl-missing, no-result
+XRAY_SPEEDTEST_BEST_BPS=""  # best aggregate bytes/sec across endpoints
+XRAY_SPEEDTEST_BEST_NAME="" # endpoint name that produced the best aggregate
+XRAY_SPEEDTEST_RESULTS=""   # "name|bps name|bps ..." for JSON / reporting
 
 # ---------- colors (TTY-aware, suppressed when --quiet) ----------
 
@@ -845,9 +868,11 @@ _synthesize_xray_json_from_url() {
   hdr=$(_qp "$query" headerType)
   enc=$(_qp "$query" encryption); [ -z "$enc" ] && enc=none
 
-  local _base out
-  _base=$(mktemp -t detect_blocking.synthcfg.XXXXXX) || return 1
-  out="${_base}.json"
+  # Single temp file — no .json extension needed: probe 12 reads this via jq
+  # and writes its own patched .json that xray-core actually loads, so this
+  # file is never handed to xray directly. One file → nothing to orphan.
+  local out
+  out=$(mktemp -t detect_blocking.synthcfg.XXXXXX) || return 1
 
   if ! jq -n \
       --arg proto "$scheme" --arg host "$host" --argjson port "$port" \
@@ -891,11 +916,10 @@ _synthesize_xray_json_from_url() {
                       settings:{ auth:"noauth", udp:true } } ],
         outbounds: [ outbound, { protocol:"freedom", tag:"direct" } ]
       }' > "$out" 2>/dev/null; then
-    rm -f "$_base" "$out" 2>/dev/null
+    rm -f "$out" 2>/dev/null
     return 1
   fi
   chmod 600 "$out" 2>/dev/null
-  rm -f "$_base" 2>/dev/null
   printf '%s' "$out"
 }
 
@@ -1938,6 +1962,133 @@ probe_xray_throughput() {
   fi
 }
 
+# Format bytes/sec as "X.Y MB/s (Z Mbps)" without floating point.
+_fmt_speed() {
+  local bps="$1" mbps_x10 mb_x10
+  mbps_x10=$(( bps * 8 * 10 / 1000000 ))   # megabits/sec ×10
+  mb_x10=$(( bps * 10 / 1048576 ))          # MB/sec ×10
+  printf '%d.%d MB/s (%d.%d Mbps)' \
+    "$(( mb_x10 / 10 ))" "$(( mb_x10 % 10 ))" \
+    "$(( mbps_x10 / 10 ))" "$(( mbps_x10 % 10 ))"
+}
+
+# Run $streams parallel downloads of one endpoint through the SOCKS tunnel and
+# echo the aggregate bytes/sec (sum of per-stream speed_download). $1=url
+# $2=mode(cf|range) $3=per-stream bytes $4=max secs $5=streams $6=socks port.
+_speedtest_one_endpoint() {
+  local url="$1" mode="$2" perstream="$3" secs="$4" streams="$5" port="$6"
+  local tmpd i agg=0 v
+  tmpd=$(mktemp -d -t detect_blocking.spd.XXXXXX) || return 1
+  for i in $(seq 1 "$streams"); do
+    (
+      if [ "$mode" = "cf" ]; then
+        curl -sS --max-time "$secs" \
+          --socks5-hostname "127.0.0.1:$port" \
+          -o /dev/null -w '%{speed_download}' \
+          "${url}?bytes=${perstream}" 2>/dev/null > "$tmpd/$i"
+      else
+        # Range-cap bytes on a static file; falls back to time cap if the
+        # server ignores Range (curl still measures whatever it pulled).
+        curl -sS --max-time "$secs" -r "0-$(( perstream - 1 ))" \
+          --socks5-hostname "127.0.0.1:$port" \
+          -o /dev/null -w '%{speed_download}' \
+          "$url" 2>/dev/null > "$tmpd/$i"
+      fi
+    ) &
+  done
+  wait
+  for i in $(seq 1 "$streams"); do
+    v=$(cat "$tmpd/$i" 2>/dev/null); v=${v%%.*}
+    case "$v" in ''|*[!0-9]*) v=0 ;; esac
+    agg=$(( agg + v ))
+  done
+  rm -rf "$tmpd" 2>/dev/null
+  printf '%d' "$agg"
+}
+
+# Probe 14 — multi-stream / multi-endpoint capacity estimate.
+# Runs by default whenever probe 12 brought up a tunnel; reuses its SOCKS
+# inbound. Reports the best aggregate across endpoints as the usable-bandwidth
+# estimate — single-endpoint or single-stream numbers under-report on high-RTT
+# tunnels, which is the whole point of 13→14. Opt out with --no-speedtest.
+probe_xray_speedtest() {
+  if [ "$XRAY_SPEEDTEST" != "1" ]; then
+    XRAY_SPEEDTEST_STATUS="disabled"
+    return 0
+  fi
+  if [ "$XRAY_JSON_STATUS" != "ok" ]; then
+    XRAY_SPEEDTEST_STATUS="skipped"
+    return 0
+  fi
+
+  hdr "14. Xray tunnel capacity (multi-stream / multi-endpoint)"
+
+  # Auto-skip inside --watch / --from-file loops: pulling tens of MB on every
+  # iteration would hammer the metered egress. Force with --speedtest.
+  if [ "${XRAY_SPEEDTEST_FORCE:-0}" != "1" ] \
+     && { [ "${_WATCH_CHILD:-0}" = "1" ] || [ "${_BATCH_CHILD:-0}" = "1" ]; }; then
+    info "skipped in watch/batch loop to avoid repeated ~$(( XRAY_SPEEDTEST_MAX_BYTES / 1048576 )) MB downloads — pass --speedtest to force"
+    XRAY_SPEEDTEST_STATUS="skipped-loop"
+    return 0
+  fi
+
+  if ! check_cmd curl; then
+    warn "skipping — curl not available"
+    XRAY_SPEEDTEST_STATUS="curl-missing"
+    return 0
+  fi
+
+  local streams="$XRAY_SPEEDTEST_STREAMS"
+  local n_ep perstream secs hs_s
+  n_ep=$(printf '%s' "$XRAY_SPEEDTEST_URLS" | wc -w | tr -d ' ')
+  [ "$n_ep" -ge 1 ] || { XRAY_SPEEDTEST_STATUS="no-result"; return 0; }
+  # Split the total byte budget across all (endpoint × stream) downloads.
+  perstream=$(( XRAY_SPEEDTEST_MAX_BYTES / (n_ep * streams) ))
+  [ "$perstream" -lt 1048576 ] && perstream=1048576   # floor 1 MB/stream
+
+  # Each stream opens a FRESH tunnel connection, so its curl budget must
+  # clear the Reality handshake (≈ probe-12 RTT) before bytes flow — a fixed
+  # short timeout would kill every stream mid-handshake on a high-RTT tunnel.
+  # Budget = ceil(handshake) + download window + margin.
+  hs_s=$(( ( ${XRAY_JSON_RTT_MS:-3000} + 999 ) / 1000 ))
+  [ "$hs_s" -lt 3 ] && hs_s=3
+  secs=$(( hs_s + XRAY_SPEEDTEST_SECONDS + 2 ))
+
+  info "${streams} parallel streams × ${n_ep} endpoint(s), ≤$(( XRAY_SPEEDTEST_MAX_BYTES / 1048576 )) MB total, ${secs}s/stream (~${hs_s}s handshake + ${XRAY_SPEEDTEST_SECONDS}s window)"
+
+  local triple name url mode agg best=0 best_name=""
+  for triple in $XRAY_SPEEDTEST_URLS; do
+    name=${triple%%|*}
+    url=${triple#*|}; mode=${url##*|}; url=${url%|*}
+    agg=$(_speedtest_one_endpoint "$url" "$mode" "$perstream" "$secs" "$streams" "$XRAY_JSON_SOCKS_PORT")
+    case "$agg" in ''|*[!0-9]*) agg=0 ;; esac
+    XRAY_SPEEDTEST_RESULTS="${XRAY_SPEEDTEST_RESULTS}${XRAY_SPEEDTEST_RESULTS:+ }${name}|${agg}"
+    if [ "$agg" -gt 0 ]; then
+      info "  ${name}: $(_fmt_speed "$agg")"
+    else
+      info "  ${name}: no data (endpoint unreachable through tunnel)"
+    fi
+    if [ "$agg" -gt "$best" ]; then best="$agg"; best_name="$name"; fi
+  done
+
+  XRAY_SPEEDTEST_BEST_BPS="$best"
+  XRAY_SPEEDTEST_BEST_NAME="$best_name"
+
+  if [ "$best" -le 0 ]; then
+    fail "no endpoint returned data through the tunnel"
+    XRAY_SPEEDTEST_STATUS="no-result"
+    return 0
+  fi
+
+  XRAY_SPEEDTEST_STATUS="ok"
+  ok "best capacity: $(_fmt_speed "$best") via ${best_name} (${streams} streams)"
+  # Honesty note: with a small byte budget on a fast link the streams finish
+  # inside TCP slow-start, so this reads as a FLOOR, not a ceiling.
+  if [ "$perstream" -le 5242880 ]; then
+    info "note: $(( perstream / 1048576 )) MB/stream is small for a fast link — raise XRAY_SPEEDTEST_MAX_BYTES for a fuller reading (this is a floor)"
+  fi
+}
+
 probe_ipv6() {
   hdr "9. IPv6 reachability"
 
@@ -2066,6 +2217,11 @@ _emit_json() {
     --arg xt_bytes          "$XRAY_THROUGHPUT_BYTES" \
     --arg xt_time_s         "$XRAY_THROUGHPUT_TIME_S" \
     --argjson xt_target     "$XRAY_THROUGHPUT_TARGET_BYTES" \
+    --arg xs_status         "$XRAY_SPEEDTEST_STATUS" \
+    --arg xs_best_bps       "$XRAY_SPEEDTEST_BEST_BPS" \
+    --arg xs_best_name      "$XRAY_SPEEDTEST_BEST_NAME" \
+    --arg xs_results        "$XRAY_SPEEDTEST_RESULTS" \
+    --argjson xs_streams    "${XRAY_SPEEDTEST_STREAMS:-0}" \
     --argjson verdicts      "$verdicts_json" '
     def words: split(" ") | map(select(length > 0));
     def opt(s): if s == "" then null else s end;
@@ -2170,6 +2326,20 @@ _emit_json() {
           bytes_received: (if $xt_bytes == "" then null else ($xt_bytes | tonumber? // null) end),
           seconds: (if $xt_time_s == "" then null else ($xt_time_s | tonumber? // null) end),
           target_bytes: $xt_target
+        },
+        xray_speedtest: {
+          status: opt($xs_status),
+          streams: $xs_streams,
+          best_endpoint: opt($xs_best_name),
+          best_bytes_per_second: (if $xs_best_bps == "" then null else ($xs_best_bps | tonumber? // null) end),
+          best_mbps: (if $xs_best_bps == "" then null else (($xs_best_bps | tonumber? // 0) * 8 / 1000000) end),
+          per_endpoint: (
+            if $xs_results == "" then []
+            else ($xs_results | split(" ") | map(select(length > 0) | split("|")
+                  | { name: .[0], bytes_per_second: (.[1] | tonumber? // null),
+                      mbps: ((.[1] | tonumber? // 0) * 8 / 1000000) }))
+            end
+          )
         }
       },
       verdicts: $verdicts
@@ -2264,6 +2434,7 @@ _should_run compare && probe_compare_matrix
 _should_run xray    && probe_xray_protocol
 _should_run xrayjson && probe_xray_json
 _should_run xrayjson && probe_xray_throughput
+_should_run xrayjson && probe_xray_speedtest
 
 # ---------- summary ----------
 

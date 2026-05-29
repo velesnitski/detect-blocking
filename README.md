@@ -41,6 +41,7 @@ endpoint and emits a clearly labelled verdict for each detected blocking type.
 | 11 | Xray protocol (opt-in) | Authenticated end-to-end test via `xray-knife` (v10 + legacy auto-detect); works for Reality / VLESS / VMess / Trojan / Shadowsocks-2022 / Hysteria2 |
 | 12 | Xray full-config (opt-in) | Spawns `xray-core` with your real config (`--xray-config-json FILE`, or synthesized from a `--xray-config URL`), exercises chained outbounds / balancers / fragment dialers end-to-end through a local SOCKS inbound; reports egress IP + colo + RTT. Auto-retries once at 4× `TIMEOUT` on a slow (timeout) handshake |
 | 13 | Tunnel throughput (auto with 12) | Pulls 10 MB from Cloudflare's speed-test backend through the same SOCKS tunnel; banded thresholds catch **cover-SNI traffic shaping** (RKN/TSPU/CN-style) that handshake-only probes miss |
+| 14 | Tunnel capacity (auto with 12) | N parallel streams × several CDN backends (Cloudflare / Hetzner / OVH) through the tunnel; reports the **best aggregate Mbps** — a real-speedtest-style estimate that defeats the single-stream under-reporting of probe 13. Runs by default; `--no-speedtest` to skip, auto-skipped in `--watch`/`--from-file` loops |
 
 The verdict ends with a list of detected blocks plus an actionable
 recommendation for each (rotate IP, switch to Reality, use uTLS, etc).
@@ -434,6 +435,85 @@ JSON output:
 Status values: `ok`, `throttled-mild`, `throttled-severe`, `broken`,
 `skipped` (when probe 12 didn't succeed), `curl-missing`.
 
+### Probe 14 — real capacity (multi-stream, multi-endpoint)
+
+Probe 13 deliberately uses **one** stream — that's what makes it a clean
+shaping detector, but it's a terrible *capacity* meter. A single TCP stream
+over a high-RTT tunnel is limited by `window ÷ RTT` (the bandwidth-delay
+product), so it can read ~10 Mbps on a link that actually carries 100+
+Mbps. That's not a bug — it's why every real speedtest (Ookla, fast.com)
+opens many parallel connections.
+
+Probe 14 does the same: **N parallel streams (default 4) against several
+public CDN backends** (Cloudflare, Hetzner, OVH), through the probe-12
+tunnel, and reports the **best aggregate** as the usable-bandwidth
+estimate. Multiple endpoints mean one slow/blocked path can't skew the
+result; the per-stream timeout is derived from probe 12's measured
+handshake RTT so streams clear the Reality handshake before the download
+window opens.
+
+```
+== 14. Xray tunnel capacity (multi-stream / multi-endpoint) ==
+          4 parallel streams × 3 endpoint(s), ≤50 MB total, 12s/stream (~5s handshake + 5s window)
+            cloudflare: 2.0 MB/s (17.3 Mbps)
+            hetzner: no data (endpoint unreachable through tunnel)
+            ovh: 2.0 MB/s (16.6 Mbps)
+  [OK]    best capacity: 2.0 MB/s (17.3 Mbps) via cloudflare (4 streams)
+          note: 4 MB/stream is small for a fast link — raise XRAY_SPEEDTEST_MAX_BYTES for a fuller reading (this is a floor)
+```
+
+It **runs by default** whenever probe 12 succeeds. Because each run pulls
+tens of MB through your (possibly metered) egress, it auto-skips inside
+`--watch` / `--from-file` loops, and you can disable it entirely:
+
+```sh
+./detect_blocking.sh --xray-config-json ~/.xray-test.json --no-speedtest   # skip probe 14
+./detect_blocking.sh --xray-config-json ~/.xray-test.json --speedtest      # force it even in --watch/--from-file
+```
+
+> **Reading the number.** With the default ~50 MB budget split across
+> 3 endpoints × 4 streams (~4 MB/stream), a fast link finishes inside TCP
+> slow-start, so the figure is a **floor**, not a ceiling. For a reading
+> that approaches your real cap, raise the budget:
+>
+> ```sh
+> XRAY_SPEEDTEST_MAX_BYTES=$((300*1024*1024)) ./detect_blocking.sh --xray-config-json ~/.xray-test.json
+> ```
+
+Tuning knobs (env vars):
+
+```sh
+XRAY_SPEEDTEST_STREAMS=8        # parallel streams per endpoint (default 4)
+XRAY_SPEEDTEST_MAX_BYTES=...    # total download budget in bytes (default ~50 MB)
+XRAY_SPEEDTEST_SECONDS=10       # download window per stream, after handshake (default 5)
+# Endpoints: space-separated name|url|mode triples. mode=cf → ?bytes=N, mode=range → HTTP Range.
+XRAY_SPEEDTEST_URLS='cloudflare|https://speed.cloudflare.com/__down|cf hetzner|https://speed.hetzner.de/100MB.bin|range'
+```
+
+JSON output:
+
+```json
+{
+  "probes": {
+    "xray_speedtest": {
+      "status": "ok",
+      "streams": 4,
+      "best_endpoint": "cloudflare",
+      "best_bytes_per_second": 2271145,
+      "best_mbps": 18.17,
+      "per_endpoint": [
+        { "name": "cloudflare", "bytes_per_second": 2271145, "mbps": 18.17 },
+        { "name": "ovh",        "bytes_per_second": 2073865, "mbps": 16.59 }
+      ]
+    }
+  }
+}
+```
+
+Status values: `ok`, `skipped` (probe 12 didn't bring up a tunnel),
+`skipped-loop` (inside `--watch`/`--from-file` without `--speedtest`),
+`disabled` (`--no-speedtest`), `no-result`, `curl-missing`.
+
 ---
 
 ## Requirements
@@ -522,6 +602,11 @@ Top-level keys: `schema_version`, `version`, `timestamp` (ISO-8601 UTC),
 | `XRAY_THROUGHPUT_TARGET_BYTES` | `10485760` | Probe 13 download sample size (10 MB); raise for slow links to escape TCP slow-start |
 | `XRAY_THROUGHPUT_TIMEOUT` | `20` | Probe 13 download deadline (seconds); raise for high-RTT tunnels |
 | `XRAY_THROUGHPUT_URL` | `https://speed.cloudflare.com/__down` | Probe 13 throughput endpoint; must accept `?bytes=N` query |
+| `XRAY_SPEEDTEST` | `1` | Probe 14 on/off (set `0`, or `--no-speedtest`, to disable) |
+| `XRAY_SPEEDTEST_STREAMS` | `4` | Probe 14 parallel streams per endpoint |
+| `XRAY_SPEEDTEST_MAX_BYTES` | `52428800` | Probe 14 total download budget (~50 MB); raise for a fuller capacity reading |
+| `XRAY_SPEEDTEST_SECONDS` | `5` | Probe 14 download window per stream, after the handshake |
+| `XRAY_SPEEDTEST_URLS` | CF / Hetzner / OVH | Probe 14 endpoints — space-separated `name\|url\|mode` triples (`mode`=`cf`\|`range`) |
 | `LOG_FILE` | *(empty)* | Optional log file path |
 | `LOG_QUIET` | `0` | Suppress stdout when `1` |
 

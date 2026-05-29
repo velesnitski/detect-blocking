@@ -23,6 +23,11 @@ fail() { printf 'FAIL: %s\n' "$1" >&2; printf '%s\n' "$out" >&2; exit 1; }
 
 URL='vless://00000000-0000-0000-0000-000000000000@127.0.0.1:1?type=tcp&security=reality&pbk=TESTPUBKEYxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx&sid=0123abcd&fp=chrome&sni=www.example.com&flow=xtls-rprx-vision#synth-test'
 
+# Snapshot synthcfg tempfile count BEFORE the run so the leak check measures
+# the delta this invocation causes, not pre-existing files from other sources.
+tmpdir=$(dirname "$(mktemp -u 2>/dev/null || echo /tmp/x)")
+before=$(ls "$tmpdir"/detect_blocking.synthcfg* 2>/dev/null | wc -l | tr -d ' ')
+
 out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config "$URL" --only xrayjson --json 2>/dev/null)
 
 # 1) Synthesis must have happened regardless of xray-core presence.
@@ -56,10 +61,10 @@ case "$status" in
   *) fail "unexpected xray_full_config.status: '$status'" ;;
 esac
 
-# 6) No synthesized temp config may survive the run.
-tmpdir=$(dirname "$(mktemp -u 2>/dev/null || echo /tmp/x)")
-leaked=$(ls "$tmpdir"/detect_blocking.synthcfg* 2>/dev/null | wc -l | tr -d ' ')
-[ "$leaked" = "0" ] \
-  || fail "synthesized config tempfile leaked in $tmpdir ($leaked file(s))"
+# 6) No synthesized temp config may survive the run (delta vs the snapshot
+#    taken before the run — ignores unrelated pre-existing files).
+after=$(ls "$tmpdir"/detect_blocking.synthcfg* 2>/dev/null | wc -l | tr -d ' ')
+[ "$after" -le "$before" ] \
+  || fail "synthesized config tempfile leaked in $tmpdir (before=$before after=$after)"
 
 echo "PASS: --xray-config URL synthesizes a probe-12 config + schema/cleanup intact"

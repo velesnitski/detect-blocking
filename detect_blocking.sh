@@ -28,7 +28,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.2.5"
+readonly DETECT_BLOCKING_VERSION="0.2.6"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -430,6 +430,8 @@ XRAY_RTT_MS=""           # parsed end-to-end RTT in milliseconds
 XRAY_TARGET_IP=""        # echoed Real IP from delegation output
 XRAY_TARGET_LOC=""       # echoed location (country) from delegation output
 XRAY_URL_DISPLAY=""      # creds-masked URL for human-readable / JSON output
+XRAY_FAIL_KIND=""        # on failure: timeout | reset | other (drives verdict)
+XRAY_RETRY_USED=0        # 1 if the slow-handshake auto-retry ran
 
 # --xray-config-json (probe 12) state vars
 XRAY_JSON_STATUS=""      # ok, failed, xray-missing, jq-missing, config-missing,
@@ -438,6 +440,10 @@ XRAY_JSON_SOCKS_PORT=""  # actual port the patched config binds (random high)
 XRAY_JSON_EGRESS_IP=""   # ip= line from cloudflare trace
 XRAY_JSON_EGRESS_LOC=""  # colo= line from cloudflare trace (e.g. AMS, FRA)
 XRAY_JSON_RTT_MS=""      # round-trip via the SOCKS tunnel
+XRAY_JSON_FAIL_KIND=""   # on failure: timeout | reset | other (drives verdict)
+XRAY_JSON_RETRY_USED=0   # 1 if the slow-handshake auto-retry ran
+XRAY_JSON_SYNTH_PATH=""  # temp config synthesized from --xray-config URL (cleaned on exit)
+XRAY_JSON_FROM_URL=0     # 1 when probe 12 ran off a synthesized share-link config
 
 # ---- probe 13: data-plane throughput through the same SOCKS inbound ----
 XRAY_THROUGHPUT_STATUS=""   # ok, throttled-severe, throttled-mild, broken, skipped, curl-missing
@@ -781,6 +787,116 @@ _target_https_url() {
   else
     printf 'https://%s:%s/' "$VPN_HOST" "$VPN_PORT_TCP"
   fi
+}
+
+# Extract the first value of query-string key $2 from query string $1.
+# Keys in share links are plain alnum, so no regex escaping is needed.
+_qp() {
+  printf '%s' "$1" | tr '&' '\n' | sed -nE "s/^$2=(.*)$/\1/p" | head -1
+}
+
+# Minimal percent-decode for share-link path / host-header values
+# (e.g. %2F → /). Safe for the small, well-formed values found in URLs.
+_urldecode() {
+  local s="${1//+/ }"
+  printf '%b' "${s//%/\\x}"
+}
+
+# Synthesize a minimal xray-core JSON config from a vless:// or trojan://
+# share link, so probes 12/13 (which need a full config + xray-core) can run
+# from --xray-config URL alone — no hand-written JSON required. Echoes the
+# path to a 0600 temp .json file on success; returns 1 for unsupported
+# schemes (vmess base64, ss, hysteria, tuic) so the caller skips cleanly.
+#
+# The config is intentionally minimal: one proxy outbound + a freedom direct,
+# a single socks inbound (probe 12 relocates it to a free port). No routing /
+# balancer / fragment layers — those only exist in a real --xray-config-json.
+_synthesize_xray_json_from_url() {
+  local url="$1" scheme rest uuid after hostport host port query
+  scheme=${url%%://*}
+  case "$scheme" in
+    vless|trojan) ;;
+    *) return 1 ;;
+  esac
+
+  rest=${url#*://}; rest=${rest%%#*}      # drop scheme + fragment
+  uuid=${rest%%@*}
+  after=${rest#*@}
+  hostport=${after%%\?*}
+  query=""; case "$after" in *\?*) query=${after#*\?} ;; esac
+  host=${hostport%%:*}
+  port=${hostport##*:}
+  case "$port" in ''|*[!0-9]*) port=443 ;; esac
+  [ -n "$uuid" ] && [ -n "$host" ] || return 1
+
+  local net sec sni fp pbk sid spx flow alpn path hosthdr svc hdr enc
+  net=$(_qp "$query" type);        [ -z "$net" ] && net=tcp
+  sec=$(_qp "$query" security);    [ -z "$sec" ] && sec=none
+  sni=$(_qp "$query" sni)
+  fp=$(_qp "$query" fp)
+  pbk=$(_qp "$query" pbk)
+  sid=$(_qp "$query" sid)
+  spx=$(_qp "$query" spx)
+  flow=$(_qp "$query" flow)
+  alpn=$(_urldecode "$(_qp "$query" alpn)")
+  path=$(_urldecode "$(_qp "$query" path)")
+  hosthdr=$(_urldecode "$(_qp "$query" host)")
+  svc=$(_urldecode "$(_qp "$query" serviceName)")
+  hdr=$(_qp "$query" headerType)
+  enc=$(_qp "$query" encryption); [ -z "$enc" ] && enc=none
+
+  local _base out
+  _base=$(mktemp -t detect_blocking.synthcfg.XXXXXX) || return 1
+  out="${_base}.json"
+
+  if ! jq -n \
+      --arg proto "$scheme" --arg host "$host" --argjson port "$port" \
+      --arg uuid "$uuid" --arg enc "$enc" --arg flow "$flow" \
+      --arg net "$net" --arg sec "$sec" --arg sni "$sni" --arg fp "$fp" \
+      --arg pbk "$pbk" --arg sid "$sid" --arg spx "$spx" --arg alpn "$alpn" \
+      --arg path "$path" --arg hosthdr "$hosthdr" --arg svc "$svc" --arg hdr "$hdr" '
+      def nz(s): if s == "" then null else s end;
+      def prune: with_entries(select(.value != null));
+      def secSettings:
+        if $sec == "reality" then
+          { realitySettings: ({ show:false, serverName:nz($sni), fingerprint:nz($fp),
+                                publicKey:nz($pbk), shortId:nz($sid), spiderX:nz($spx) } | prune) }
+        elif $sec == "tls" then
+          { tlsSettings: ({ serverName:nz($sni), fingerprint:nz($fp),
+                            alpn:(if $alpn=="" then null else ($alpn|split(",")) end) } | prune) }
+        else {} end;
+      def transportSettings:
+        if $net == "ws" then
+          { wsSettings: ({ path:(if $path=="" then "/" else $path end),
+                           headers:(if $hosthdr=="" then null else {Host:$hosthdr} end) } | prune) }
+        elif $net == "grpc" then
+          { grpcSettings: { serviceName:(if $svc=="" then "" else $svc end) } }
+        elif $net == "tcp" then
+          (if $hdr == "http" then { tcpSettings:{ header:{ type:"http" } } } else { tcpSettings:{} } end)
+        else {} end;
+      def outbound:
+        (if $proto == "trojan" then
+           { protocol:"trojan",
+             settings:{ servers:[ { address:$host, port:$port, password:$uuid } ] }, tag:"proxy" }
+         else
+           { protocol:"vless",
+             settings:{ vnext:[ { address:$host, port:$port,
+                                  users:[ ({ id:$uuid, encryption:$enc, flow:nz($flow) } | prune) ] } ] },
+             tag:"proxy" }
+         end)
+        + { streamSettings: ({ network:$net, security:$sec } + secSettings + transportSettings) };
+      {
+        log: { loglevel:"warning" },
+        inbounds: [ { tag:"socks", listen:"127.0.0.1", port:10808, protocol:"socks",
+                      settings:{ auth:"noauth", udp:true } } ],
+        outbounds: [ outbound, { protocol:"freedom", tag:"direct" } ]
+      }' > "$out" 2>/dev/null; then
+    rm -f "$_base" "$out" 2>/dev/null
+    return 1
+  fi
+  chmod 600 "$out" 2>/dev/null
+  rm -f "$_base" 2>/dev/null
+  printf '%s' "$out"
 }
 
 # Send a minimal-but-valid IKE_SA_INIT initiator header (RFC 7296 §3.1)
@@ -1350,6 +1466,28 @@ EOF
   fi
 }
 
+# Classify a failed tunnel attempt from the tester/curl output. The
+# distinction matters for the verdict: a *timeout* on an otherwise-clean
+# transport usually means a slow / high-RTT / multi-hop tunnel (raise the
+# budget), NOT active interference — whereas a *reset* (RST, closed pipe,
+# refused, SSL error) is the real protocol-fingerprint-DPI / config-drift
+# signature. Echoes one of: timeout | reset | other.
+#
+# Covers both xray-knife phrasing (Go net/http: "context deadline
+# exceeded", "Client.Timeout", "i/o timeout", "reset by peer", "closed
+# pipe", "EOF") and curl phrasing (exit 28 "timed out"; 35/52/56 "reset",
+# "Empty reply", "Recv failure", "SSL_ERROR").
+_classify_tunnel_failure() {
+  local o="$1"
+  if printf '%s' "$o" | grep -qiE 'deadline exceeded|i/o timeout|client\.timeout|timeout exceeded|timed out|operation timed out|\(28\)'; then
+    printf 'timeout'
+  elif printf '%s' "$o" | grep -qiE 'reset by peer|closed pipe|broken pipe|connection refused|empty reply|recv failure|ssl_error|no route to host|unexpected eof|\bEOF\b|\(3[56]\)|\(52\)'; then
+    printf 'reset'
+  else
+    printf 'other'
+  fi
+}
+
 # Probe 11 — end-to-end Xray-protocol test via delegation to xray-knife
 # (or fallback to xray/sing-box if available). Only runs when --xray-config
 # is provided. Reads success/RTT/echoed-IP from the tester's stdout.
@@ -1402,50 +1540,79 @@ probe_xray_protocol() {
     return 0
   fi
 
-  if [ "$xk_layout" = "v10" ]; then
-    out=$("$XRAY_TESTER_BIN" http -c "$XRAY_CONFIG" \
-          -d $(( TIMEOUT * 1000 )) 2>&1 || true)
-  else
-    out=$("$XRAY_TESTER_BIN" net http -c "$XRAY_CONFIG" \
-          -m 1 -d $(( TIMEOUT * 1000 )) 2>&1 || true)
-  fi
+  # Run the probe, then — if it times out on an otherwise-clean transport —
+  # retry ONCE with a 4× budget. High-RTT / multi-hop tunnels (e.g. a
+  # RU-ingress → EU-egress chain) routinely need 5-8s to complete the
+  # Reality handshake; the default 5s budget produces a false "handshake
+  # fails" verdict that reads like DPI but is really just latency.
+  local _attempt_ms=$(( TIMEOUT * 1000 ))
+  local _retry_ms=$(( TIMEOUT * 4 * 1000 ))
+  while : ; do
+    if [ "$xk_layout" = "v10" ]; then
+      out=$("$XRAY_TESTER_BIN" http -c "$XRAY_CONFIG" \
+            -d "$_attempt_ms" 2>&1 || true)
+    else
+      out=$("$XRAY_TESTER_BIN" net http -c "$XRAY_CONFIG" \
+            -m 1 -d "$_attempt_ms" 2>&1 || true)
+    fi
 
-  # Defensive parsing — xray-knife output evolves between versions.
-  # 1) RTT: any "HTTP delay: NNN" / "Delay: NNN" / "delay: NNN" pattern.
-  XRAY_RTT_MS=$(printf '%s' "$out" \
-                | grep -ioE 'http delay:[[:space:]]*[0-9]+' | head -1 \
-                | grep -oE '[0-9]+')
-  [ -z "$XRAY_RTT_MS" ] && XRAY_RTT_MS=$(printf '%s' "$out" \
-                | grep -ioE '(^|[^a-z])delay:[[:space:]]*[0-9]+' | head -1 \
-                | grep -oE '[0-9]+')
+    # Defensive parsing — xray-knife output evolves between versions.
+    # 1) RTT: any "HTTP delay: NNN" / "Delay: NNN" / "delay: NNN" pattern.
+    XRAY_RTT_MS=$(printf '%s' "$out" \
+                  | grep -ioE 'http delay:[[:space:]]*[0-9]+' | head -1 \
+                  | grep -oE '[0-9]+')
+    [ -z "$XRAY_RTT_MS" ] && XRAY_RTT_MS=$(printf '%s' "$out" \
+                  | grep -ioE '(^|[^a-z])delay:[[:space:]]*[0-9]+' | head -1 \
+                  | grep -oE '[0-9]+')
 
-  # 2) Echoed Real IP / location, if the tester resolves them.
-  XRAY_TARGET_IP=$(printf '%s' "$out" \
-                   | grep -ioE 'real ip:[[:space:]]*[0-9.]+' | head -1 \
-                   | grep -oE '[0-9.]+')
-  XRAY_TARGET_LOC=$(printf '%s' "$out" \
-                    | grep -ioE 'location:[[:space:]]*[A-Z]{2,}' | head -1 \
-                    | awk '{print $NF}')
+    # 2) Echoed Real IP / location, if the tester resolves them.
+    XRAY_TARGET_IP=$(printf '%s' "$out" \
+                     | grep -ioE 'real ip:[[:space:]]*[0-9.]+' | head -1 \
+                     | grep -oE '[0-9.]+')
+    XRAY_TARGET_LOC=$(printf '%s' "$out" \
+                      | grep -ioE 'location:[[:space:]]*[A-Z]{2,}' | head -1 \
+                      | awk '{print $NF}')
 
-  # 3) Verdict: explicit error words win; otherwise RTT presence implies ok.
-  # v10 uses ❌ prefix + "closed pipe" / "EOF" / "reset by peer". Legacy uses
-  # "Error:" / "FAILED" / "TIMEOUT".
-  if printf '%s' "$out" \
-       | grep -qE '❌|closed pipe|EOF|reset by peer|timeout|connection refused|i/o timeout|invalid|error 50|unable to connect|no route to host'; then
-    XRAY_STATUS="failed"
-  elif [ -n "$XRAY_RTT_MS" ]; then
-    XRAY_STATUS="ok"
-  else
-    XRAY_STATUS="failed"
-  fi
+    # 3) Verdict: explicit error words win; otherwise RTT presence implies ok.
+    # v10 uses ❌ prefix + "closed pipe" / "EOF" / "reset by peer". Legacy uses
+    # "Error:" / "FAILED" / "TIMEOUT".
+    if printf '%s' "$out" \
+         | grep -qE '❌|closed pipe|EOF|reset by peer|timeout|connection refused|i/o timeout|invalid|error 50|unable to connect|no route to host'; then
+      XRAY_STATUS="failed"
+    elif [ -n "$XRAY_RTT_MS" ]; then
+      XRAY_STATUS="ok"
+    else
+      XRAY_STATUS="failed"
+    fi
+
+    # Auto-retry exactly once on a timeout-class failure. A timeout while
+    # "awaiting headers" proves the connection was established (you'd get
+    # 'refused' / 'no route' otherwise), so the timeout classification alone
+    # is sufficient evidence the tunnel is reachable-but-slow — no need to
+    # gate on probe 2 (which --only xray skips anyway).
+    if [ "$XRAY_STATUS" = "failed" ] && [ "$XRAY_RETRY_USED" = "0" ] \
+       && [ "$(_classify_tunnel_failure "$out")" = "timeout" ]; then
+      XRAY_RETRY_USED=1
+      _attempt_ms="$_retry_ms"
+      warn "handshake exceeded ${TIMEOUT}s — retrying once at $(( TIMEOUT * 4 ))s (high-RTT / multi-hop tunnel?)"
+      continue
+    fi
+    break
+  done
 
   if [ "$XRAY_STATUS" = "ok" ]; then
-    ok "tunnel established, RTT ${XRAY_RTT_MS} ms${XRAY_TARGET_LOC:+ (egress: $XRAY_TARGET_LOC)}"
+    if [ "$XRAY_RETRY_USED" = "1" ]; then
+      ok "tunnel established on retry, RTT ${XRAY_RTT_MS} ms${XRAY_TARGET_LOC:+ (egress: $XRAY_TARGET_LOC)} — slow handshake, not blocked"
+      info "tip: this path needs TIMEOUT≥$(( TIMEOUT * 4 )); set 'TIMEOUT=$(( TIMEOUT * 4 ))' to avoid the first-attempt timeout"
+    else
+      ok "tunnel established, RTT ${XRAY_RTT_MS} ms${XRAY_TARGET_LOC:+ (egress: $XRAY_TARGET_LOC)}"
+    fi
     # Cross-reference: tunnel works despite our other probes seeing DPI.
     if [ "${TLS_PROPER_SNI_OK:-1}" = "0" ] || [ "${DOH_INTEGRITY_STATE:-ok}" = "compromised" ]; then
       add_verdict "Xray protocol bypasses local DPI/DNS-MITM despite environment signals"
     fi
   else
+    XRAY_FAIL_KIND=$(_classify_tunnel_failure "$out")
     fail "Xray-protocol end-to-end test failed"
     # Surface a 1-line excerpt of the delegation output to help triage
     # parse/config errors vs network errors. Trim leading whitespace,
@@ -1455,15 +1622,18 @@ probe_xray_protocol() {
             | grep -iE 'error|failed|timeout|invalid|refused|unable' \
             | head -1 | sed 's|^[[:space:]│|]*||' | head -c 200)
     [ -n "$_diag" ] && info "$XRAY_TESTER_BIN says: $_diag"
-    if [ "${TCP_OK:-1}" = "1" ]; then
-      if [ "${TLS_PROPER_SNI_OK:-0}" = "1" ]; then
-        # TCP + TLS to the server work but the protocol doesn't — strong signal.
-        add_verdict "Xray-protocol handshake fails while plain TLS to the same host succeeds — protocol-fingerprint DPI or config error"
-      else
-        add_verdict "Xray-protocol handshake fails — see probes 2-3 for root cause"
-      fi
+    if [ "$XRAY_FAIL_KIND" = "timeout" ]; then
+      # Timed out even after the 4× retry — latency/egress, not DPI.
+      # (Timeout class implies the connection was established, so this
+      #  verdict stands regardless of whether probe 2 ran.)
+      add_verdict "Xray-protocol handshake timed out (even at $(( TIMEOUT * 4 ))s) — slow or throttled tunnel egress, not a fingerprint block. Raise TIMEOUT, or check the server's own upstream/egress health"
+    elif [ "${TCP_OK:-1}" = "1" ] && [ "${TLS_PROPER_SNI_OK:-0}" = "1" ]; then
+      # TCP + TLS to the server work but the protocol is actively refused.
+      add_verdict "Xray-protocol handshake rejected (reset / closed pipe) while plain TLS to the same host succeeds — protocol-fingerprint DPI or config error (verify UUID / keys / flow / target SNI)"
+    elif [ "${TCP_OK:-1}" = "1" ]; then
+      add_verdict "Xray-protocol handshake fails — see probes 2-3 for root cause"
     else
-      info "TCP to target was already blocked; protocol failure is consistent"
+      info "transport probes were skipped or already blocked; protocol failure is consistent"
     fi
   fi
 }
@@ -1477,12 +1647,29 @@ probe_xray_protocol() {
 #   probe 12: your config.json → run xray → SOCKS test (slow, full-fidelity)
 # Both can run in the same invocation for comparison.
 probe_xray_json() {
+  # If only a share-link URL was given (no --xray-config-json FILE),
+  # synthesize a minimal config from it so probes 12/13 still run. Needs jq;
+  # if synthesis isn't possible the probe skips quietly (probe 11 already
+  # exercised the same URL via xray-knife).
+  if [ -z "$XRAY_JSON_CONFIG" ] && [ -n "$XRAY_CONFIG" ] && command -v jq >/dev/null 2>&1; then
+    local _synth
+    if _synth=$(_synthesize_xray_json_from_url "$XRAY_CONFIG"); then
+      XRAY_JSON_CONFIG="$_synth"
+      XRAY_JSON_SYNTH_PATH="$_synth"
+      XRAY_JSON_FROM_URL=1
+    fi
+  fi
+
   if [ -z "$XRAY_JSON_CONFIG" ]; then
     XRAY_JSON_STATUS="no-config"
     return 0
   fi
 
   hdr "12. Xray full-config (json) end-to-end test"
+
+  if [ "$XRAY_JSON_FROM_URL" = "1" ]; then
+    info "config synthesized from --xray-config share link (minimal: 1 outbound, no routing/balancer)"
+  fi
 
   if [ ! -r "$XRAY_JSON_CONFIG" ]; then
     fail "config file not readable: $XRAY_JSON_CONFIG"
@@ -1586,24 +1773,50 @@ probe_xray_json() {
 
   # 5) HTTP GET through SOCKS5 to cloudflare.com/cdn-cgi/trace (returns
   #    line-based key=value text; includes egress 'ip=' and colo).
-  local t0 t1 trace
-  t0=$(_now_ms)
-  # --socks5-hostname is the long form of --socks5h, supported since curl
-  # 7.18.0 (2008). The short form --socks5h needs 7.21.7+ (2011) and
-  # is missing from some bundled-with-macOS curl builds.
-  trace=$(curl -sS --max-time "$TIMEOUT" \
-          --socks5-hostname "127.0.0.1:$socks_port" \
-          https://cloudflare.com/cdn-cgi/trace 2>&1)
-  t1=$(_now_ms)
-  XRAY_JSON_RTT_MS=$(( t1 - t0 ))
+  #    --socks5-hostname is the long form of --socks5h, supported since curl
+  #    7.18.0 (2008). The short form --socks5h needs 7.21.7+ (2011) and
+  #    is missing from some bundled-with-macOS curl builds.
+  #
+  #    As in probe 11, retry ONCE at a 4× budget when the first attempt
+  #    times out — the xray-core process is still running, so we just
+  #    re-issue curl through the same SOCKS port. High-RTT / multi-hop
+  #    tunnels need the extra budget; a timeout here is latency, not DPI.
+  local t0 t1 trace _max="$TIMEOUT"
+  while : ; do
+    t0=$(_now_ms)
+    trace=$(curl -sS --max-time "$_max" \
+            --socks5-hostname "127.0.0.1:$socks_port" \
+            https://cloudflare.com/cdn-cgi/trace 2>&1)
+    t1=$(_now_ms)
+    XRAY_JSON_RTT_MS=$(( t1 - t0 ))
 
-  XRAY_JSON_EGRESS_IP=$(printf '%s' "$trace" | awk -F= '/^ip=/{print $2; exit}')
-  XRAY_JSON_EGRESS_LOC=$(printf '%s' "$trace" | awk -F= '/^colo=/{print $2; exit}')
+    XRAY_JSON_EGRESS_IP=$(printf '%s' "$trace" | awk -F= '/^ip=/{print $2; exit}')
+    XRAY_JSON_EGRESS_LOC=$(printf '%s' "$trace" | awk -F= '/^colo=/{print $2; exit}')
 
-  # 6) Verdict — trace must contain a Cloudflare host marker AND an egress IP.
-  if [ -n "$XRAY_JSON_EGRESS_IP" ] && printf '%s' "$trace" | grep -q '^h=cloudflare\.com'; then
-    XRAY_JSON_STATUS="ok"
-    ok "full-config tunnel works, egress $XRAY_JSON_EGRESS_IP${XRAY_JSON_EGRESS_LOC:+ ($XRAY_JSON_EGRESS_LOC)}, RTT ${XRAY_JSON_RTT_MS} ms"
+    # Success = Cloudflare host marker AND an egress IP.
+    if [ -n "$XRAY_JSON_EGRESS_IP" ] && printf '%s' "$trace" | grep -q '^h=cloudflare\.com'; then
+      XRAY_JSON_STATUS="ok"
+      break
+    fi
+    if [ "$XRAY_JSON_RETRY_USED" = "0" ] \
+       && [ "$(_classify_tunnel_failure "$trace")" = "timeout" ]; then
+      XRAY_JSON_RETRY_USED=1
+      _max=$(( TIMEOUT * 4 ))
+      warn "tunnel timed out at ${TIMEOUT}s — retrying once at ${_max}s (high-RTT / multi-hop tunnel?)"
+      continue
+    fi
+    XRAY_JSON_STATUS="failed"
+    break
+  done
+
+  # 6) Verdict.
+  if [ "$XRAY_JSON_STATUS" = "ok" ]; then
+    if [ "$XRAY_JSON_RETRY_USED" = "1" ]; then
+      ok "full-config tunnel works on retry, egress $XRAY_JSON_EGRESS_IP${XRAY_JSON_EGRESS_LOC:+ ($XRAY_JSON_EGRESS_LOC)}, RTT ${XRAY_JSON_RTT_MS} ms — slow handshake, not blocked"
+      info "tip: this path needs TIMEOUT≥$(( TIMEOUT * 4 )); set 'TIMEOUT=$(( TIMEOUT * 4 ))' to avoid the first-attempt timeout"
+    else
+      ok "full-config tunnel works, egress $XRAY_JSON_EGRESS_IP${XRAY_JSON_EGRESS_LOC:+ ($XRAY_JSON_EGRESS_LOC)}, RTT ${XRAY_JSON_RTT_MS} ms"
+    fi
     # Cross-reference: tunnel works despite transport-layer DPI signals.
     if [ "${TLS_PROPER_SNI_OK:-1}" = "0" ] || [ "${DOH_INTEGRITY_STATE:-ok}" = "compromised" ]; then
       add_verdict "Xray full-config bypasses local DPI/DNS-MITM despite environment signals"
@@ -1615,13 +1828,16 @@ probe_xray_json() {
       add_verdict "Fragment / chained-outbound layer is the bypass — share-link form alone is not enough"
     fi
   else
-    XRAY_JSON_STATUS="failed"
+    XRAY_JSON_FAIL_KIND=$(_classify_tunnel_failure "$trace")
     fail "tunnel did not reach Cloudflare cdn-cgi/trace"
     local _curl_diag
     _curl_diag=$(printf '%s\n' "$trace" | grep -iE 'curl:|error|refused|timed out|unreachable' | head -1 | head -c 200)
     [ -n "$_curl_diag" ] && info "curl says: $_curl_diag"
-    if [ "${TCP_OK:-1}" = "1" ] && [ "${TLS_PROPER_SNI_OK:-0}" = "1" ]; then
-      add_verdict "Xray full-config tunnel fails while plain TLS to server works — protocol-fingerprint DPI or config drift"
+    if [ "$XRAY_JSON_FAIL_KIND" = "timeout" ]; then
+      # Timeout class implies the SOCKS connect succeeded → reachable-but-slow.
+      add_verdict "Xray full-config tunnel timed out (even at $(( TIMEOUT * 4 ))s) — slow or throttled tunnel egress, not a fingerprint block. Raise TIMEOUT, or check the server's upstream/egress health"
+    elif [ "${TCP_OK:-1}" = "1" ] && [ "${TLS_PROPER_SNI_OK:-0}" = "1" ]; then
+      add_verdict "Xray full-config tunnel rejected (reset / closed pipe) while plain TLS to server works — protocol-fingerprint DPI or config drift (verify UUID / keys / flow / target SNI)"
     fi
   fi
 }
@@ -1834,12 +2050,17 @@ _emit_json() {
     --arg xray_target_ip    "$XRAY_TARGET_IP" \
     --arg xray_target_loc   "$XRAY_TARGET_LOC" \
     --arg xray_url_display  "$XRAY_URL_DISPLAY" \
+    --arg xray_fail_kind    "$XRAY_FAIL_KIND" \
+    --argjson xray_retry    "${XRAY_RETRY_USED:-0}" \
     --arg xj_status         "$XRAY_JSON_STATUS" \
     --arg xj_socks_port     "$XRAY_JSON_SOCKS_PORT" \
     --arg xj_egress_ip      "$XRAY_JSON_EGRESS_IP" \
     --arg xj_egress_loc     "$XRAY_JSON_EGRESS_LOC" \
     --arg xj_rtt            "$XRAY_JSON_RTT_MS" \
     --arg xj_config_path    "$XRAY_JSON_CONFIG" \
+    --arg xj_fail_kind      "$XRAY_JSON_FAIL_KIND" \
+    --argjson xj_retry      "${XRAY_JSON_RETRY_USED:-0}" \
+    --argjson xj_from_url   "${XRAY_JSON_FROM_URL:-0}" \
     --arg xt_status         "$XRAY_THROUGHPUT_STATUS" \
     --arg xt_bps            "$XRAY_THROUGHPUT_BPS" \
     --arg xt_bytes          "$XRAY_THROUGHPUT_BYTES" \
@@ -1928,15 +2149,20 @@ _emit_json() {
           rtt_ms: (if $xray_rtt == "" then null else ($xray_rtt | tonumber? // null) end),
           egress_ip: opt($xray_target_ip),
           egress_location: opt($xray_target_loc),
-          url_display: opt($xray_url_display)
+          url_display: opt($xray_url_display),
+          failure_kind: opt($xray_fail_kind),
+          slow_handshake_retry: bool_int($xray_retry)
         },
         xray_full_config: {
           status: opt($xj_status),
-          config_path: opt($xj_config_path),
+          config_path: (if $xj_from_url == 1 then null else opt($xj_config_path) end),
+          synthesized_from_url: bool_int($xj_from_url),
           socks_port_used: (if $xj_socks_port == "" then null else ($xj_socks_port | tonumber? // null) end),
           egress_ip: opt($xj_egress_ip),
           egress_location: opt($xj_egress_loc),
-          rtt_ms: (if $xj_rtt == "" then null else ($xj_rtt | tonumber? // null) end)
+          rtt_ms: (if $xj_rtt == "" then null else ($xj_rtt | tonumber? // null) end),
+          failure_kind: opt($xj_fail_kind),
+          slow_handshake_retry: bool_int($xj_retry)
         },
         xray_throughput: {
           status: opt($xt_status),
@@ -1969,6 +2195,8 @@ _cleanup() {
     kill -9 "$XRAY_JSON_XRAY_PID" 2>/dev/null
   fi
   [ -n "$XRAY_JSON_PATCHED_PATH" ] && rm -f "$XRAY_JSON_PATCHED_PATH" 2>/dev/null
+  # Synthesized-from-URL config holds live credentials — remove it too.
+  [ -n "$XRAY_JSON_SYNTH_PATH" ] && rm -f "$XRAY_JSON_SYNTH_PATH" 2>/dev/null
 }
 trap _cleanup EXIT
 

@@ -39,7 +39,7 @@ endpoint and emits a clearly labelled verdict for each detected blocking type.
 | 9 | IPv6 reachability | AAAA resolution + IPv6 TCP/HTTPS; detects "IPv4-only block" cases |
 | 9b | Compare matrix (opt-in) | `--compare-sni A,B,C` × `--compare-port 443,8443,…` grid for bypass discovery; `--port-survey` adds a curated alt-port list |
 | 11 | Xray protocol (opt-in) | Authenticated end-to-end test via `xray-knife` (v10 + legacy auto-detect); works for Reality / VLESS / VMess / Trojan / Shadowsocks-2022 / Hysteria2 |
-| 12 | Xray full-config (opt-in) | Spawns `xray-core` with your real config (`--xray-config-json FILE`), exercises chained outbounds / balancers / fragment dialers end-to-end through a local SOCKS inbound; reports egress IP + colo + RTT |
+| 12 | Xray full-config (opt-in) | Spawns `xray-core` with your real config (`--xray-config-json FILE`, or synthesized from a `--xray-config URL`), exercises chained outbounds / balancers / fragment dialers end-to-end through a local SOCKS inbound; reports egress IP + colo + RTT. Auto-retries once at 4× `TIMEOUT` on a slow (timeout) handshake |
 | 13 | Tunnel throughput (auto with 12) | Pulls 10 MB from Cloudflare's speed-test backend through the same SOCKS tunnel; banded thresholds catch **cover-SNI traffic shaping** (RKN/TSPU/CN-style) that handshake-only probes miss |
 
 The verdict ends with a list of detected blocks plus an actionable
@@ -256,6 +256,39 @@ knobs don't fit into the URL spec. If your production setup relies on
 those, the URL test only covers what fits — one VLESS endpoint, no chain,
 no routing logic. Probe 12 spawns `xray run` against your **actual
 `config.json`** and tests end-to-end through its SOCKS inbound.
+
+> **You can also drive probes 12 + 13 straight from a `--xray-config URL`.**
+> If you pass only a share link (no `--xray-config-json`), the script
+> synthesizes a minimal config from it — one proxy outbound + a freedom
+> direct, single socks inbound — so a single `--xray-config URL` runs
+> probes 11, 12 **and** 13 together. Supports `vless://` / `trojan://`
+> with reality / tls over tcp / ws / grpc. The synthesized file holds live
+> credentials, is written `0600`, and is removed by the EXIT trap. For
+> `vmess://` (base64), `ss://`, `hysteria*` or `tuic://`, or for any
+> chained / balancer / fragment setup, pass a real `--xray-config-json`.
+
+#### High-RTT tunnels: automatic slow-handshake retry
+
+Multi-hop paths (e.g. a RU-ingress → EU-egress chain) often need 5-8s to
+complete the Reality handshake — more than the 5s default `TIMEOUT`. Rather
+than mislabel a slow-but-working tunnel as blocked, probes 11 and 12 retry
+once at 4× the budget when the first attempt **times out** (as opposed to
+being actively reset). On success they report `slow handshake, not blocked`
+and suggest the `TIMEOUT=N` that avoids the first-attempt miss:
+
+```
+[WARN]  handshake exceeded 5s — retrying once at 20s (high-RTT / multi-hop tunnel?)
+[OK]    tunnel established on retry, RTT 5584 ms — slow handshake, not blocked
+        tip: this path needs TIMEOUT≥20; set 'TIMEOUT=20' to avoid the first-attempt timeout
+```
+
+The verdict text now distinguishes the two failure modes: a *timeout*
+(even after the retry) reads "slow or throttled tunnel egress, not a
+fingerprint block — raise TIMEOUT"; an active *reset / closed pipe* keeps
+the "protocol-fingerprint DPI or config drift" verdict. The JSON exposes
+this as `failure_kind` (`timeout` | `reset` | `other`) and
+`slow_handshake_retry` (bool) on both `xray_protocol` and
+`xray_full_config`.
 
 #### Quickstart — one paste from a fresh shell
 

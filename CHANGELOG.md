@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-05-29
+
+### Added
+
+- **Probes 12 + 13 now run from a `--xray-config URL` share link.**
+  Previously the full-config tunnel probe (12) and throughput probe (13)
+  required a hand-written `--xray-config-json FILE`. The script now
+  synthesizes a minimal xray-core config (one proxy outbound + freedom
+  direct, single socks inbound) directly from a `vless://` or `trojan://`
+  share link, so a single `--xray-config URL` exercises probes 11, 12 and
+  13 together. Supports reality / tls security and tcp / ws / grpc
+  transports; reads `type`, `security`, `sni`, `fp`, `pbk`, `sid`, `spx`,
+  `flow`, `alpn`, `path`, `host`, `serviceName`, `headerType`,
+  `encryption` from the query string. The synthesized config holds live
+  credentials and is written 0600, then removed by the EXIT trap.
+  `vmess://` (base64 blob), `ss://`, `hysteria*` and `tuic://` are not
+  synthesized — pass `--xray-config-json` for those.
+
+- **Slow-handshake auto-retry for probes 11 and 12.** High-RTT / multi-hop
+  tunnels (e.g. a RU-ingress → EU-egress chain) routinely need 5-8s to
+  complete the Reality handshake, which exceeded the 5s default budget and
+  produced a confident-but-wrong "handshake fails — protocol-fingerprint
+  DPI or config error" verdict. On a *timeout-class* failure the probe now
+  retries exactly once at 4× the budget; on success it reports "slow
+  handshake, not blocked" and hints the `TIMEOUT=N` needed to skip the
+  first-attempt timeout.
+
+### Changed
+
+- **Verdicts distinguish timeout from active rejection.** A new shared
+  classifier (`_classify_tunnel_failure`) labels a failed tunnel attempt as
+  `timeout` (Go `context deadline exceeded` / `i/o timeout` /
+  `Client.Timeout`; curl exit 28) vs `reset` (RST / closed pipe / refused /
+  SSL error; curl 35/52/56). A timeout that survives the 4× retry now reads
+  "slow or throttled tunnel egress, not a fingerprint block — raise
+  TIMEOUT", instead of implying DPI. Active resets keep the
+  protocol-fingerprint-DPI / config-drift verdict. The retry no longer
+  gates on probe 2 (a timeout while "awaiting headers" already proves the
+  connection was established), so it fires correctly under `--only xray`.
+
+- **JSON schema additions.** `probes.xray_protocol` and
+  `probes.xray_full_config` each gain `failure_kind` (timeout | reset |
+  other | null) and `slow_handshake_retry` (bool). `xray_full_config` also
+  gains `synthesized_from_url` (bool); when true, `config_path` is null
+  (the temp path is never emitted).
+
+- New tests: `tests/test_xray_url_synth.sh` (URL synthesis + schema +
+  tempfile cleanup, using an RFC 5737 TEST-NET host). Full suite is now 9
+  tests, all passing on macOS + Ubuntu CI.
+
 ## [0.2.5] - 2026-05-29
 
 ### Added

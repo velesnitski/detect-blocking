@@ -28,7 +28,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.2.0"
+readonly DETECT_BLOCKING_VERSION="0.2.2"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -97,6 +97,9 @@ COMPARE_SNI="${COMPARE_SNI:-}"
 COMPARE_PORT="${COMPARE_PORT:-}"
 PORT_SURVEY=0
 XRAY_CONFIG="${XRAY_CONFIG:-}"
+XRAY_JSON_CONFIG="${XRAY_JSON_CONFIG:-}"
+XRAY_JSON_XRAY_PID=""
+XRAY_JSON_PATCHED_PATH=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -119,6 +122,8 @@ while [ $# -gt 0 ]; do
     --port-survey)    PORT_SURVEY=1; shift ;;
     --xray-config)    XRAY_CONFIG="${2:-}"; shift 2 ;;
     --xray-config=*)  XRAY_CONFIG="${1#--xray-config=}"; shift ;;
+    --xray-config-json)    XRAY_JSON_CONFIG="${2:-}"; shift 2 ;;
+    --xray-config-json=*)  XRAY_JSON_CONFIG="${1#--xray-config-json=}"; shift ;;
     --quiet|-q)    LOG_QUIET=1; shift ;;
     --json)        JSON_MODE=1; LOG_QUIET=1; shift ;;
     --version|-V)
@@ -128,7 +133,7 @@ while [ $# -gt 0 ]; do
     --help|-h)
       sed -n '2,27p' "$0"
       printf '\nversion: %s\n' "$DETECT_BLOCKING_VERSION"
-      printf '\nProbe names (for --only / --skip): env, dns, tcp, tls, ua, rst, udp, openvpn, control, ipv6, compare, xray\n'
+      printf '\nProbe names (for --only / --skip): env, dns, tcp, tls, ua, rst, udp, openvpn, control, ipv6, compare, xray, xrayjson\n'
       printf '\nFlags:\n'
       printf '  --json (needs jq)   machine-readable JSON output (compact in batch/watch loops)\n'
       printf '  --quiet, -q         suppress stdout (logging still works)\n'
@@ -143,6 +148,8 @@ while [ $# -gt 0 ]; do
       printf '  --port-survey       scan common alternative VPN/proxy ports (8443, 2083, 2087, ...)\n'
       printf '  --xray-config URL   delegate end-to-end protocol test to xray-knife (optional dep)\n'
       printf '                      accepts vless://, vmess://, trojan://, ss://, hysteria2:// URLs\n'
+      printf '  --xray-config-json FILE  full-config probe via xray-core + SOCKS5 (covers fragment,\n'
+      printf '                      dialerProxy, chained outbounds; needs xray + jq)\n'
       exit 0
       ;;
     -*) die "unknown option: $1" ;;
@@ -368,6 +375,14 @@ XRAY_RTT_MS=""           # parsed end-to-end RTT in milliseconds
 XRAY_TARGET_IP=""        # echoed Real IP from delegation output
 XRAY_TARGET_LOC=""       # echoed location (country) from delegation output
 XRAY_URL_DISPLAY=""      # creds-masked URL for human-readable / JSON output
+
+# --xray-config-json (probe 12) state vars
+XRAY_JSON_STATUS=""      # ok, failed, xray-missing, jq-missing, config-missing,
+                         # config-malformed, no-port, xray-bind-failed, no-config
+XRAY_JSON_SOCKS_PORT=""  # actual port the patched config binds (random high)
+XRAY_JSON_EGRESS_IP=""   # ip= line from cloudflare trace
+XRAY_JSON_EGRESS_LOC=""  # colo= line from cloudflare trace (e.g. AMS, FRA)
+XRAY_JSON_RTT_MS=""      # round-trip via the SOCKS tunnel
 
 # ---------- colors (TTY-aware, suppressed when --quiet) ----------
 
@@ -645,6 +660,30 @@ _find_xray_tester() {
     if command -v "$c" >/dev/null 2>&1; then printf '%s' "$c"; return 0; fi
   done
   return 1
+}
+
+# Find an unused TCP port in the IANA dynamic range. Used by --xray-config-json
+# to patch the SOCKS inbound port so the test doesn't collide with a running
+# client (v2rayN/NekoBox/etc. typically squat on 10808-10809).
+_find_free_port() {
+  local port _i
+  for _i in 1 2 3 4 5 6 7 8 9 10; do
+    port=$(( 49152 + RANDOM % 16383 ))
+    if ! nc -z 127.0.0.1 "$port" 2>/dev/null; then
+      printf '%s' "$port"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Millisecond-precision wall clock. Tries hires perl, falls back to second-
+# precision date * 1000.
+_now_ms() {
+  if check_cmd perl; then
+    perl -MTime::HiRes -e 'printf "%d", Time::HiRes::time*1000' 2>/dev/null && return 0
+  fi
+  printf '%s000' "$(date +%s)"
 }
 
 # Mask credentials in an Xray protocol URL for safe display in logs / JSON.
@@ -1365,6 +1404,154 @@ probe_xray_protocol() {
   fi
 }
 
+# Probe 12 — full-config end-to-end test via xray-core + SOCKS5.
+# Covers what URL-based probe 11 cannot: chained outbounds (dialerProxy),
+# fragment, noises, custom routing rules — the entire client config.json
+# is executed as-is in a sandboxed background xray process, and we probe
+# end-to-end through its SOCKS inbound. Compared to probe 11:
+#   probe 11: URL → minimal generated config → test    (fast, lossy)
+#   probe 12: your config.json → run xray → SOCKS test (slow, full-fidelity)
+# Both can run in the same invocation for comparison.
+probe_xray_json() {
+  if [ -z "$XRAY_JSON_CONFIG" ]; then
+    XRAY_JSON_STATUS="no-config"
+    return 0
+  fi
+
+  hdr "12. Xray full-config (json) end-to-end test"
+
+  if [ ! -r "$XRAY_JSON_CONFIG" ]; then
+    fail "config file not readable: $XRAY_JSON_CONFIG"
+    XRAY_JSON_STATUS="config-missing"
+    return 0
+  fi
+
+  if ! check_cmd xray; then
+    warn "skipping — 'xray' binary not in PATH"
+    info "install: go install github.com/xtls/xray-core/main@latest (rename to 'xray')"
+    info "or download: https://github.com/XTLS/Xray-core/releases"
+    XRAY_JSON_STATUS="xray-missing"
+    return 0
+  fi
+
+  if ! check_cmd jq; then
+    warn "skipping — jq required for config port-patching"
+    XRAY_JSON_STATUS="jq-missing"
+    return 0
+  fi
+
+  # 1) Reserve a free local port — avoid clashing with a running client
+  #    sitting on 10808 / 10809.
+  local socks_port
+  if ! socks_port=$(_find_free_port); then
+    fail "no free local port available in dynamic range"
+    XRAY_JSON_STATUS="no-port"
+    return 0
+  fi
+  XRAY_JSON_SOCKS_PORT="$socks_port"
+  info "allocating socks5 inbound on 127.0.0.1:$socks_port"
+
+  # 2) Patch the json: keep only socks-protocol inbounds, force them to
+  #    127.0.0.1:$socks_port. If none exist, synthesise a minimal one.
+  XRAY_JSON_PATCHED_PATH=$(mktemp -t detect_blocking.xrayjson.XXXXXX)
+  if ! jq --argjson p "$socks_port" '
+       (.inbounds // []) as $orig
+       | .inbounds = (
+           [$orig[] | select(.protocol == "socks")
+             | .listen = "127.0.0.1"
+             | .port = $p
+             | .settings = ((.settings // {}) | .auth = "noauth" | .udp = true)
+           ]
+         )
+       | (if (.inbounds | length) == 0 then
+           .inbounds = [{
+             tag: "detect-blocking-probe",
+             listen: "127.0.0.1",
+             port: $p,
+             protocol: "socks",
+             settings: { auth: "noauth", udp: true }
+           }]
+         else . end)
+     ' "$XRAY_JSON_CONFIG" > "$XRAY_JSON_PATCHED_PATH" 2>/dev/null; then
+    fail "jq failed to patch config (malformed json?)"
+    XRAY_JSON_STATUS="config-malformed"
+    return 0
+  fi
+
+  # 3) Launch xray with the patched config. Stderr → temp file so we can
+  #    surface a diagnostic line on failure.
+  local xray_log
+  xray_log=$(mktemp -t detect_blocking.xraylog.XXXXXX)
+  xray run -c "$XRAY_JSON_PATCHED_PATH" >"$xray_log" 2>&1 &
+  XRAY_JSON_XRAY_PID=$!
+  info "xray-core started (pid $XRAY_JSON_XRAY_PID)"
+
+  # 4) Poll for SOCKS readiness — up to TIMEOUT seconds, 200ms granularity.
+  local ready=0 _i poll_max
+  poll_max=$(( TIMEOUT * 5 ))
+  [ "$poll_max" -lt 10 ] && poll_max=10
+  for _i in $(seq 1 "$poll_max"); do
+    if nc -z 127.0.0.1 "$socks_port" 2>/dev/null; then
+      ready=1; break
+    fi
+    if ! kill -0 "$XRAY_JSON_XRAY_PID" 2>/dev/null; then
+      break
+    fi
+    sleep 0.2
+  done
+
+  if [ "$ready" -ne 1 ]; then
+    fail "xray did not bind 127.0.0.1:$socks_port within ~${TIMEOUT}s"
+    local _diag
+    _diag=$(grep -iE 'error|failed|fatal|panic|cannot' "$xray_log" | head -1 | head -c 200)
+    [ -n "$_diag" ] && info "xray says: $_diag"
+    rm -f "$xray_log"
+    XRAY_JSON_STATUS="xray-bind-failed"
+    return 0
+  fi
+
+  rm -f "$xray_log"
+  info "tunnel inbound ready → probing through it"
+
+  # 5) HTTP GET through SOCKS5 to cloudflare.com/cdn-cgi/trace (returns
+  #    line-based key=value text; includes egress 'ip=' and colo).
+  local t0 t1 trace
+  t0=$(_now_ms)
+  trace=$(curl -sS --max-time "$TIMEOUT" \
+          --socks5h "127.0.0.1:$socks_port" \
+          https://cloudflare.com/cdn-cgi/trace 2>&1)
+  t1=$(_now_ms)
+  XRAY_JSON_RTT_MS=$(( t1 - t0 ))
+
+  XRAY_JSON_EGRESS_IP=$(printf '%s' "$trace" | awk -F= '/^ip=/{print $2; exit}')
+  XRAY_JSON_EGRESS_LOC=$(printf '%s' "$trace" | awk -F= '/^colo=/{print $2; exit}')
+
+  # 6) Verdict — trace must contain a Cloudflare host marker AND an egress IP.
+  if [ -n "$XRAY_JSON_EGRESS_IP" ] && printf '%s' "$trace" | grep -q '^h=cloudflare\.com'; then
+    XRAY_JSON_STATUS="ok"
+    ok "full-config tunnel works, egress $XRAY_JSON_EGRESS_IP${XRAY_JSON_EGRESS_LOC:+ ($XRAY_JSON_EGRESS_LOC)}, RTT ${XRAY_JSON_RTT_MS} ms"
+    # Cross-reference: tunnel works despite transport-layer DPI signals.
+    if [ "${TLS_PROPER_SNI_OK:-1}" = "0" ] || [ "${DOH_INTEGRITY_STATE:-ok}" = "compromised" ]; then
+      add_verdict "Xray full-config bypasses local DPI/DNS-MITM despite environment signals"
+    fi
+    # Cross-reference with probe 11 (URL-based, lossy): if URL probe failed
+    # but full json succeeded, the lost pieces (fragment, dialerProxy, etc.)
+    # are the bypass mechanism.
+    if [ "${XRAY_STATUS:-}" = "failed" ]; then
+      add_verdict "Fragment / chained-outbound layer is the bypass — share-link form alone is not enough"
+    fi
+  else
+    XRAY_JSON_STATUS="failed"
+    fail "tunnel did not reach Cloudflare cdn-cgi/trace"
+    local _curl_diag
+    _curl_diag=$(printf '%s\n' "$trace" | grep -iE 'curl:|error|refused|timed out|unreachable' | head -1 | head -c 200)
+    [ -n "$_curl_diag" ] && info "curl says: $_curl_diag"
+    if [ "${TCP_OK:-1}" = "1" ] && [ "${TLS_PROPER_SNI_OK:-0}" = "1" ]; then
+      add_verdict "Xray full-config tunnel fails while plain TLS to server works — protocol-fingerprint DPI or config drift"
+    fi
+  fi
+}
+
 probe_ipv6() {
   hdr "9. IPv6 reachability"
 
@@ -1477,6 +1664,12 @@ _emit_json() {
     --arg xray_target_ip    "$XRAY_TARGET_IP" \
     --arg xray_target_loc   "$XRAY_TARGET_LOC" \
     --arg xray_url_display  "$XRAY_URL_DISPLAY" \
+    --arg xj_status         "$XRAY_JSON_STATUS" \
+    --arg xj_socks_port     "$XRAY_JSON_SOCKS_PORT" \
+    --arg xj_egress_ip      "$XRAY_JSON_EGRESS_IP" \
+    --arg xj_egress_loc     "$XRAY_JSON_EGRESS_LOC" \
+    --arg xj_rtt            "$XRAY_JSON_RTT_MS" \
+    --arg xj_config_path    "$XRAY_JSON_CONFIG" \
     --argjson verdicts      "$verdicts_json" '
     def words: split(" ") | map(select(length > 0));
     def opt(s): if s == "" then null else s end;
@@ -1561,6 +1754,14 @@ _emit_json() {
           egress_ip: opt($xray_target_ip),
           egress_location: opt($xray_target_loc),
           url_display: opt($xray_url_display)
+        },
+        xray_full_config: {
+          status: opt($xj_status),
+          config_path: opt($xj_config_path),
+          socks_port_used: (if $xj_socks_port == "" then null else ($xj_socks_port | tonumber? // null) end),
+          egress_ip: opt($xj_egress_ip),
+          egress_location: opt($xj_egress_loc),
+          rtt_ms: (if $xj_rtt == "" then null else ($xj_rtt | tonumber? // null) end)
         }
       },
       verdicts: $verdicts
@@ -1571,10 +1772,21 @@ _emit_json() {
 
 _init_log
 
-# Cleanup trap: probe-5 temp files + optional tcpdump capture (--pcap).
+# Cleanup trap: probe-5 temp files + optional tcpdump capture + probe-12
+# xray-core child process + patched config tempfile.
 _cleanup() {
   rm -f "$RST_TMP_OUT" "$RST_TMP_TIME" 2>/dev/null
   [ -n "$PCAP_PID" ] && kill "$PCAP_PID" 2>/dev/null
+  if [ -n "$XRAY_JSON_XRAY_PID" ]; then
+    kill "$XRAY_JSON_XRAY_PID" 2>/dev/null
+    # Give it ~0.5s to exit gracefully, then SIGKILL if still alive.
+    for _ in 1 2 3; do
+      kill -0 "$XRAY_JSON_XRAY_PID" 2>/dev/null || break
+      sleep 0.2
+    done
+    kill -9 "$XRAY_JSON_XRAY_PID" 2>/dev/null
+  fi
+  [ -n "$XRAY_JSON_PATCHED_PATH" ] && rm -f "$XRAY_JSON_PATCHED_PATH" 2>/dev/null
 }
 trap _cleanup EXIT
 
@@ -1640,6 +1852,7 @@ _should_run control && probe_known_blocked
 _should_run ipv6    && probe_ipv6
 _should_run compare && probe_compare_matrix
 _should_run xray    && probe_xray_protocol
+_should_run xrayjson && probe_xray_json
 
 # ---------- summary ----------
 
@@ -1690,6 +1903,9 @@ else
       *"Xray protocol bypasses local DPI"*) rec="your protocol stack is working as designed — local DPI sees the cover, not the payload" ;;
       *"Xray-protocol handshake fails while plain TLS"*) rec="protocol-fingerprint DPI or config drift — verify UUID/keys, try Reality with a fresh target SNI, or switch to a different protocol family" ;;
       *"Xray-protocol handshake fails"*) rec="end-to-end test failed; address the underlying transport probe verdicts first, then re-run with the same --xray-config" ;;
+      *"Xray full-config bypasses local DPI"*) rec="full config (with chained outbounds / fragment / noises) tunnels through — keep deploying this exact config to clients" ;;
+      *"Fragment / chained-outbound layer is the bypass"*) rec="the lost-in-translation pieces of the share-link form (fragment, dialerProxy, noises) ARE the bypass; clients must consume the full json, not the URL" ;;
+      *"Xray full-config tunnel fails while plain TLS"*) rec="protocol-fingerprint DPI on the tunnel — verify UUID/keys, try a different SNI front, or change flow= variant" ;;
       *) rec="" ;;
     esac
     if [ -n "$rec" ]; then

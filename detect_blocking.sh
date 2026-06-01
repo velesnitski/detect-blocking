@@ -28,7 +28,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.3.0"
+readonly DETECT_BLOCKING_VERSION="0.3.1"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -3236,10 +3236,6 @@ _should_run openvpn && probe_openvpn
 _should_run control && probe_known_blocked
 _should_run ipv6    && probe_ipv6
 _should_run compare && probe_compare_matrix
-# Pre-flight (static / cheap) first: a config typo or clock skew should surface
-# before the slow network probes, not masquerade as DPI three screens down.
-{ _should_run xray || _should_run xrayjson; } && probe_xray_lint
-{ _should_run xray || _should_run xrayjson; } && probe_clock_skew
 _should_run xray    && probe_xray_protocol
 _should_run xrayjson && probe_xray_json
 _should_run xrayjson && probe_xray_throughput
@@ -3247,6 +3243,10 @@ _should_run xrayjson && probe_xray_speedtest
 { _should_run xray || _should_run xrayjson; } && probe_xray_cover
 _should_run xrayjson && probe_xray_egress
 _should_run xrayjson && probe_xray_stability
+# Lint + clock-skew run in numeric position (after 17, before 20). They're
+# static/cheap and their findings also surface in the consolidated verdict.
+{ _should_run xray || _should_run xrayjson; } && probe_xray_lint
+{ _should_run xray || _should_run xrayjson; } && probe_clock_skew
 { _should_run xray || _should_run xrayjson; } && probe_xray_active_probe
 _should_run xrayjson && probe_xray_fleet
 

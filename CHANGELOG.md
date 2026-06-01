@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-06-01
+
+### Changed
+
+- **Probes 18 (lint) and 19 (clock skew) now run in numeric position** —
+  after 17, before 20 — instead of as a pre-flight block before 11. The
+  output reads in straight 11→21 order. They remain static/cheap and their
+  findings still surface in the consolidated verdict block, so the
+  diagnostic value is unchanged; only the print order moved.
+
 ## [0.3.0] - 2026-06-01
 
 ### Changed

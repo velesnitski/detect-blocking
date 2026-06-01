@@ -68,6 +68,9 @@ emits a clearly labelled verdict for each detected issue.
 | 19 | Clock skew (auto) | Reality auth is time-windowed; a client clock off by minutes fails the handshake like a block. Compares local time to a server `Date` header, warns past ±60s |
 | 20 | Active-probe resistance (auto) | Probe 15 checks the cover *cert*; this checks the cover *behaviour* — does an unauthenticated HTTPS request get relayed to the genuine cover site (real Reality) or return garbage (fake)? |
 | 21 | Per-outbound fleet matrix (auto on multi-outbound) | Tunnel-tests **each outbound** of a balancer/multi-outbound config and prints a health table by tag; tells a single dead endpoint apart from a fleet-wide config fault. Auto-enables when the JSON has >1 outbound; `--no-fleet` to disable |
+| 22 | Bufferbloat / latency-under-load (auto with 12) | Warm RTT idle vs under a saturating download — the latency the tunnel adds when busy (what makes a "fast" link laggy on calls/gaming). `--no-bufferbloat` to skip |
+| 23 | Path MTU to server (auto) | DF-bit `ping` sweep finds the path MTU; a clamp below 1500 fragments the Reality ClientHello and can cause intermittent handshake failures that mimic DPI |
+| 24 | TLS-negotiation parity (auto) | Does the server negotiate the same TLS version / ALPN / cipher as the genuine cover? Stealth depth-3 (15 cert → 20 HTTP → 24 negotiation); a fake/wrong-`dest` server diverges |
 
 The verdict ends with a list of detected blocks plus an actionable
 recommendation for each (rotate IP, switch to Reality, use uTLS, etc).
@@ -663,6 +666,42 @@ JSON adds `probes.xray_lint` (findings list), `probes.xray_clock`
 (skew_seconds), `probes.xray_active_probe` (relay vs genuine HTTP code +
 match), and `probes.xray_fleet` (per-outbound table).
 
+### Probes 22-24 — quality-of-experience + transport + stealth depth
+
+All three are **pure bash** (no extra dependency beyond `curl`/`openssl`/`ping`)
+and share-safe (ms / booleans / generic protocol values only).
+
+**Probe 22 — bufferbloat / latency-under-load.** 13/14 tell you the tunnel is
+*fast*; 22 tells you whether it stays *responsive when busy*. It measures warm
+RTT (keep-alive, so the handshake is excluded) idle vs under a bounded
+saturating download and reports the inflation — the queueing delay added under
+load, which is what makes calls/gaming stutter during a download. Bands:
+`<100ms` low · `<400ms` moderate · `≥400ms` heavy. `--no-bufferbloat` to skip.
+
+**Probe 23 — path MTU to the server.** A DF-bit `ping` sweep finds the largest
+unfragmented payload to the server IP. A clamp below 1500 fragments the Reality
+ClientHello and can cause *intermittent* handshake failures that look like
+flaky DPI — so if handshakes are sporadic, this tells you to clamp the MSS.
+Reports `filtered` when ICMP echo is blocked.
+
+**Probe 24 — TLS-negotiation parity.** The third stealth lens (15 = cert,
+20 = HTTP behaviour, 24 = TLS negotiation): does the server negotiate the same
+TLS version, ALPN, and cipher as the genuine cover site fetched out-of-band?
+
+```
+== 24. TLS-negotiation parity (vs genuine cover) ==
+          negotiation: version-match=1, ALPN-match=0, cipher-match=0 (server TLSv1.3/http/1.1, cover TLSv1.3/h2)
+  [WARN]  TLS negotiation differs from the genuine cover
+```
+
+A real relaying Reality server is byte-identical to the cover; a fake or
+wrong-`dest` one diverges (above: it serves `http/1.1` where the real cover
+offers `h2`) — a fingerprint an active prober can exploit, reinforcing 15/20.
+
+JSON adds `probes.xray_bufferbloat` (idle/loaded/inflation/jitter ms),
+`probes.xray_mtu` (path_mtu), and `probes.xray_tls_parity` (version/ALPN/cipher
+match booleans).
+
 ---
 
 ## Requirements
@@ -762,6 +801,7 @@ Top-level keys: `schema_version`, `version`, `timestamp` (ISO-8601 UTC),
 | `XRAY_STABILITY_SIZES` | `0 262144 1048576 4194304` | Probe 17 pulse size ladder in bytes (`0`=tiny); escalate to expose byte-threshold (volumetric) kills |
 | `XRAY_STABILITY_SECONDS` | `45` | Probe 17 overall wall-clock cap for the ladder |
 | `XRAY_STABILITY_INTERVAL` | `2` | Probe 17 pause between pulses |
+| `XRAY_BUFFERBLOAT` | `1` | Probe 22 on/off (set `0`, or `--no-bufferbloat`, to disable) |
 | `LOG_FILE` | *(empty)* | Optional log file path |
 | `LOG_QUIET` | `0` | Suppress stdout when `1` |
 

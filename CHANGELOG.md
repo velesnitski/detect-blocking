@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-01
+
+### Added
+
+Three more Xray probes — all **pure-bash, no new dependency** (just the
+`curl` / `openssl` / `ping` already required), and share-safe (ms, booleans
+and generic protocol values only — never an endpoint, cover domain, or IP).
+
+- **Probe 22 — bufferbloat / latency-under-load.** Probes 13/14 measure
+  bandwidth; this measures the latency the tunnel *adds while saturated* —
+  what makes a fast link feel laggy on calls / gaming. Measures warm RTT
+  (keep-alive, so the handshake is paid once and excluded) idle vs under a
+  bounded saturating download, and reports the inflation + jitter. Bands:
+  `<100ms` low / `<400ms` moderate / `≥400ms` heavy bufferbloat. Runs by
+  default when the tunnel is up; `--no-bufferbloat` opts out.
+
+- **Probe 23 — path MTU to the server.** A clamped path MTU fragments the
+  Reality ClientHello and causes intermittent handshake failures that mimic
+  flaky DPI. A DF-bit `ping` sweep finds the largest unfragmented payload and
+  reports the path MTU (or "filtered" when ICMP is blocked). Runs by default
+  when a config is given; no tunnel needed.
+
+- **Probe 24 — TLS-negotiation parity.** Stealth depth-3: probe 15 checks the
+  cover *cert*, 20 the cover *HTTP behaviour*, and 24 the **TLS negotiation**
+  — does the server negotiate the same TLS version / ALPN / cipher as the
+  genuine cover site? A real relaying Reality server is byte-identical; a fake
+  or wrong-`dest` one diverges (e.g. serves `http/1.1` where the real cover
+  offers `h2`). Reports per-attribute parity booleans + the generic negotiated
+  values.
+
+  JSON adds `probes.xray_bufferbloat`, `probes.xray_mtu`,
+  `probes.xray_tls_parity`. New flag `--no-bufferbloat`, new env
+  `XRAY_BUFFERBLOAT`. New test `tests/test_bufferbloat_mtu_tlsparity.sh`.
+  Suite is now 13; `shellcheck detect_blocking.sh` clean.
+
 ## [0.3.1] - 2026-06-01
 
 ### Changed

@@ -28,7 +28,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.3.1"
+readonly DETECT_BLOCKING_VERSION="0.4.0"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -131,6 +131,7 @@ while [ $# -gt 0 ]; do
     --no-stability) XRAY_STABILITY=0; shift ;;
     --fleet)        XRAY_FLEET=1; XRAY_FLEET_FORCE=1; shift ;;
     --no-fleet)     XRAY_FLEET=0; shift ;;
+    --no-bufferbloat) XRAY_BUFFERBLOAT=0; shift ;;
     --quiet|-q)    LOG_QUIET=1; shift ;;
     --json)        JSON_MODE=1; LOG_QUIET=1; shift ;;
     --version|-V)
@@ -164,6 +165,7 @@ while [ $# -gt 0 ]; do
       printf '  --stability         force probe 17 even inside --watch/--from-file loops\n'
       printf '  --no-fleet          disable probe 21 (it auto-enables on multi-outbound configs; N xray spawns)\n'
       printf '  --fleet             force probe 21 even inside --watch/--from-file loops\n'
+      printf '  --no-bufferbloat    disable probe 22 (latency-under-load; saturates the tunnel briefly)\n'
       exit 0
       ;;
     -*) die "unknown option: $1" ;;
@@ -574,6 +576,33 @@ XRAY_FLEET_STATUS=""        # ok, skipped, disabled, xray-missing, jq-missing, s
 XRAY_FLEET_TOTAL=""         # outbounds tested
 XRAY_FLEET_OK=""            # outbounds whose tunnel reached egress
 XRAY_FLEET_RESULTS=""       # "tag|state|rtt ..." for JSON
+
+# ---- probe 22: bufferbloat / latency-under-load ----
+# 13/14 measure bandwidth; this measures the latency a "fast" tunnel adds while
+# saturated — the thing that makes calls/gaming laggy. Warm RTT (keep-alive, so
+# the handshake is paid once and excluded) idle vs under a saturating download.
+XRAY_BUFFERBLOAT="${XRAY_BUFFERBLOAT:-1}"  # 1 = run (--no-bufferbloat opts out)
+XRAY_BUFFERBLOAT_STATUS=""  # ok, moderate, heavy, skipped, disabled, curl-missing, no-data
+XRAY_BUFFERBLOAT_IDLE_MS="" # warm RTT idle
+XRAY_BUFFERBLOAT_LOAD_MS="" # warm RTT under saturating download
+XRAY_BUFFERBLOAT_INFLATE_MS="" # load - idle (the queueing delay added under load)
+XRAY_BUFFERBLOAT_JITTER_MS=""  # spread of loaded samples
+
+# ---- probe 23: path MTU to the server ----
+# A clamped path MTU fragments the Reality ClientHello and causes intermittent
+# handshake failures that look like flaky DPI. DF-bit ping sweep finds it.
+XRAY_MTU_STATUS=""          # ok, clamped, filtered, skipped, no-ping
+XRAY_MTU_PATH=""            # discovered path MTU (bytes)
+
+# ---- probe 24: TLS-negotiation parity (stealth depth-3) ----
+# 15 checks the cover cert, 20 the cover HTTP behaviour; this checks the TLS
+# NEGOTIATION (version / ALPN / cipher). A real relaying Reality server is
+# byte-identical to the genuine cover; a fake / wrong-dest one diverges.
+# Output: per-attribute parity booleans + the generic negotiated values only.
+XRAY_TLSPAR_STATUS=""       # ok, mismatch, skipped, no-sni, openssl-missing, unreachable
+XRAY_TLSPAR_VER_MATCH=""    # 1 / 0  TLS version parity
+XRAY_TLSPAR_ALPN_MATCH=""   # 1 / 0  ALPN parity
+XRAY_TLSPAR_CIPHER_MATCH="" # 1 / 0  cipher parity
 
 # ---------- colors (TTY-aware, suppressed when --quiet) ----------
 
@@ -2805,6 +2834,213 @@ EOF
   fi
 }
 
+# Warm round-trip (ms) through the tunnel: one keep-alive curl fetches the tiny
+# trace endpoint N times — the first pays the handshake, the rest are warm, so
+# their min is the true per-request RTT with handshake cost excluded. Echoes
+# "min max" in ms, or empty on failure. $1 = socks port, $2 = max-time.
+_tunnel_warm_rtt() {
+  local port="$1" mt="$2" out line first=1 v min="" max=""
+  # speed.cloudflare.com/__down?bytes=0 → a clean 200 with an empty body and no
+  # redirect, same host as the load download so keep-alive reuse is consistent.
+  local u="https://speed.cloudflare.com/__down?bytes=0"
+  out=$(curl -sS --max-time "$mt" --socks5-hostname "127.0.0.1:$port" \
+        -o /dev/null -w '%{time_total}\n' \
+        "$u" "$u" "$u" "$u" "$u" 2>/dev/null) || return 1
+  while IFS= read -r line; do
+    if [ "$first" = "1" ]; then first=0; continue; fi   # drop handshake sample
+    # seconds.float → integer ms
+    v=$(printf '%s' "$line" | awk '{printf "%d", ($1*1000)+0.5}')
+    case "$v" in ''|*[!0-9]*) continue ;; esac
+    [ -z "$min" ] && min="$v"; [ "$v" -lt "$min" ] && min="$v"
+    [ -z "$max" ] && max="$v"; [ "$v" -gt "$max" ] && max="$v"
+  done <<EOF
+$out
+EOF
+  [ -n "$min" ] || return 1
+  printf '%s %s' "$min" "$max"
+}
+
+# Probe 22 — bufferbloat / latency-under-load. Warm RTT idle vs under a
+# saturating download through the same tunnel. The inflation (load − idle) is
+# the queueing delay the tunnel adds when busy — what makes a fast link feel
+# laggy on realtime traffic. Output: ms only, never an endpoint.
+probe_xray_bufferbloat() {
+  if [ "$XRAY_BUFFERBLOAT" != "1" ]; then
+    XRAY_BUFFERBLOAT_STATUS="disabled"
+    return 0
+  fi
+  if [ "$XRAY_JSON_STATUS" != "ok" ]; then
+    XRAY_BUFFERBLOAT_STATUS="skipped"
+    return 0
+  fi
+
+  hdr "22. Bufferbloat (latency under load)"
+
+  if ! check_cmd curl; then
+    warn "skipping — curl not available"
+    XRAY_BUFFERBLOAT_STATUS="curl-missing"
+    return 0
+  fi
+
+  local port="$XRAY_JSON_SOCKS_PORT" mt idle load loadpid
+  mt=$(( ( ${XRAY_JSON_RTT_MS:-3000} + 999 ) / 1000 + 10 ))
+
+  idle=$(_tunnel_warm_rtt "$port" "$mt")
+  if [ -z "$idle" ]; then
+    warn "could not measure idle RTT through the tunnel"
+    XRAY_BUFFERBLOAT_STATUS="no-data"
+    return 0
+  fi
+  XRAY_BUFFERBLOAT_IDLE_MS="${idle%% *}"
+
+  # Saturate the tunnel in the background (bounded), then sample warm RTT.
+  curl -sS --max-time 8 --socks5-hostname "127.0.0.1:$port" -o /dev/null \
+    "https://speed.cloudflare.com/__down?bytes=$((12*1024*1024))" >/dev/null 2>&1 &
+  loadpid=$!
+  sleep 1
+  load=$(_tunnel_warm_rtt "$port" "$mt")
+  kill "$loadpid" 2>/dev/null; wait "$loadpid" 2>/dev/null
+
+  if [ -z "$load" ]; then
+    warn "could not measure loaded RTT (tunnel dropped under load?)"
+    XRAY_BUFFERBLOAT_STATUS="no-data"
+    return 0
+  fi
+  XRAY_BUFFERBLOAT_LOAD_MS="${load%% *}"
+  XRAY_BUFFERBLOAT_JITTER_MS=$(( ${load#* } - ${load%% *} ))
+  local inflate=$(( XRAY_BUFFERBLOAT_LOAD_MS - XRAY_BUFFERBLOAT_IDLE_MS ))
+  [ "$inflate" -lt 0 ] && inflate=0
+  XRAY_BUFFERBLOAT_INFLATE_MS="$inflate"
+
+  info "warm RTT idle ${XRAY_BUFFERBLOAT_IDLE_MS} ms → under load ${XRAY_BUFFERBLOAT_LOAD_MS} ms (jitter ${XRAY_BUFFERBLOAT_JITTER_MS} ms)"
+
+  if [ "$inflate" -lt 100 ]; then
+    ok "low bufferbloat: +${inflate} ms under load — fine for calls / gaming"
+    XRAY_BUFFERBLOAT_STATUS="ok"
+  elif [ "$inflate" -lt 400 ]; then
+    warn "moderate bufferbloat: +${inflate} ms under load"
+    XRAY_BUFFERBLOAT_STATUS="moderate"
+    add_verdict "Tunnel adds ${inflate} ms of latency under load (moderate bufferbloat) — throughput is fine but realtime traffic (calls, gaming) will feel it when the link is busy"
+  else
+    fail "heavy bufferbloat: +${inflate} ms under load"
+    XRAY_BUFFERBLOAT_STATUS="heavy"
+    add_verdict "Tunnel adds ${inflate} ms of latency under load (heavy bufferbloat) — the link buffers badly when saturated; realtime traffic stalls during any download. Often the server/egress queue; consider a CAKE/fq_codel qdisc on the server or a less-congested egress"
+  fi
+}
+
+# Probe 23 — path MTU to the server. A clamped MTU fragments the Reality
+# ClientHello and causes intermittent handshake failures that mimic DPI. DF-bit
+# ping sweep finds the largest unfragmented payload. Output: an MTU number.
+probe_xray_mtu() {
+  if [ -z "$XRAY_CONFIG" ] && [ -z "$XRAY_JSON_CONFIG" ]; then
+    XRAY_MTU_STATUS="skipped"
+    return 0
+  fi
+
+  hdr "23. Path MTU to server"
+
+  if ! check_cmd ping; then
+    warn "skipping — ping not available"
+    XRAY_MTU_STATUS="no-ping"
+    return 0
+  fi
+
+  # DF-bit flag differs: GNU ping uses '-M do', BSD/macOS uses '-D'.
+  local df sz ok_payload="" found=0
+  if ping -M "do" -c 1 -s 56 "$VPN_HOST" >/dev/null 2>&1; then
+    df="-M do"
+  else
+    df="-D"
+  fi
+
+  # Descending payload ladder; path MTU = largest passing payload + 28 (IP+ICMP).
+  for sz in 1472 1452 1400 1372 1272 1172 972; do
+    # shellcheck disable=SC2086
+    if ping $df -c 1 -s "$sz" "$VPN_HOST" >/dev/null 2>&1; then
+      ok_payload="$sz"; found=1; break
+    fi
+  done
+
+  if [ "$found" != "1" ]; then
+    # Either ICMP is filtered, or even small DF packets fail. Confirm with a
+    # plain (no-DF) ping: if that works too, ICMP echo is simply blocked.
+    if ping -c 1 "$VPN_HOST" >/dev/null 2>&1; then
+      info "host answers ping but no DF size passed — unusual; treating MTU as undetermined"
+    else
+      info "host does not answer ICMP echo — MTU undetermined (ICMP filtered)"
+    fi
+    XRAY_MTU_STATUS="filtered"
+    return 0
+  fi
+
+  XRAY_MTU_PATH=$(( ok_payload + 28 ))
+  if [ "$XRAY_MTU_PATH" -ge 1500 ]; then
+    ok "path MTU ${XRAY_MTU_PATH} — full, no clamping"
+    XRAY_MTU_STATUS="ok"
+  else
+    warn "path MTU clamped to ${XRAY_MTU_PATH} (< 1500)"
+    XRAY_MTU_STATUS="clamped"
+    add_verdict "Path MTU to the server is ${XRAY_MTU_PATH} (clamped below 1500) — large TLS ClientHellos may fragment and cause intermittent handshake failures that look like DPI. Usually benign, but if handshakes are flaky, clamp the client/server MSS to match"
+  fi
+}
+
+# Probe 24 — TLS-negotiation parity. Compares the TLS the server negotiates
+# (version / ALPN / cipher) against the genuine cover site. A relaying Reality
+# server matches; a fake / wrong-dest one diverges. Booleans + generic values
+# only — never the cover domain.
+probe_xray_tls_parity() {
+  local sni
+  sni=$(_xray_cover_sni)
+  if [ -z "$sni" ]; then
+    XRAY_TLSPAR_STATUS="skipped"
+    return 0
+  fi
+
+  hdr "24. TLS-negotiation parity (vs genuine cover)"
+
+  if ! check_cmd openssl; then
+    warn "skipping — openssl not available"
+    XRAY_TLSPAR_STATUS="openssl-missing"
+    return 0
+  fi
+
+  # Negotiate against the server (the IP) and the genuine cover, same SNI/ALPN.
+  local s_out c_out s_ver c_ver s_alpn c_alpn s_ciph c_ciph
+  s_out=$(echo Q | openssl s_client -connect "$VPN_HOST:$VPN_PORT_TCP" \
+          -servername "$sni" -alpn h2,http/1.1 2>/dev/null)
+  c_out=$(echo Q | openssl s_client -connect "$sni:443" \
+          -servername "$sni" -alpn h2,http/1.1 2>/dev/null)
+
+  if [ -z "$s_out" ] || [ -z "$c_out" ]; then
+    warn "could not complete both TLS negotiations (server or cover unreachable)"
+    XRAY_TLSPAR_STATUS="unreachable"
+    return 0
+  fi
+
+  # Extract negotiated TLS version, ALPN, and cipher from each.
+  s_ver=$(printf '%s' "$s_out"  | sed -nE 's/^[[:space:]]*Protocol[[:space:]]*:[[:space:]]*(.*)/\1/p' | head -1)
+  c_ver=$(printf '%s' "$c_out"  | sed -nE 's/^[[:space:]]*Protocol[[:space:]]*:[[:space:]]*(.*)/\1/p' | head -1)
+  s_alpn=$(printf '%s' "$s_out" | sed -nE 's/^ALPN protocol:[[:space:]]*(.*)/\1/p' | head -1)
+  c_alpn=$(printf '%s' "$c_out" | sed -nE 's/^ALPN protocol:[[:space:]]*(.*)/\1/p' | head -1)
+  s_ciph=$(printf '%s' "$s_out" | sed -nE 's/^[[:space:]]*Cipher[[:space:]]*:[[:space:]]*(.*)/\1/p' | head -1)
+  c_ciph=$(printf '%s' "$c_out" | sed -nE 's/^[[:space:]]*Cipher[[:space:]]*:[[:space:]]*(.*)/\1/p' | head -1)
+
+  [ -n "$s_ver" ] && [ "$s_ver" = "$c_ver" ] && XRAY_TLSPAR_VER_MATCH=1 || XRAY_TLSPAR_VER_MATCH=0
+  [ "$s_alpn" = "$c_alpn" ] && XRAY_TLSPAR_ALPN_MATCH=1 || XRAY_TLSPAR_ALPN_MATCH=0
+  [ -n "$s_ciph" ] && [ "$s_ciph" = "$c_ciph" ] && XRAY_TLSPAR_CIPHER_MATCH=1 || XRAY_TLSPAR_CIPHER_MATCH=0
+
+  info "negotiation: version-match=${XRAY_TLSPAR_VER_MATCH}, ALPN-match=${XRAY_TLSPAR_ALPN_MATCH}, cipher-match=${XRAY_TLSPAR_CIPHER_MATCH} (server ${s_ver:-?}/${s_alpn:-none}, cover ${c_ver:-?}/${c_alpn:-none})"
+
+  if [ "$XRAY_TLSPAR_VER_MATCH" = "1" ] && [ "$XRAY_TLSPAR_ALPN_MATCH" = "1" ] && [ "$XRAY_TLSPAR_CIPHER_MATCH" = "1" ]; then
+    ok "TLS negotiation matches the genuine cover (version + ALPN + cipher) → relays cleanly"
+    XRAY_TLSPAR_STATUS="ok"
+  else
+    warn "TLS negotiation differs from the genuine cover"
+    XRAY_TLSPAR_STATUS="mismatch"
+    add_verdict "Server's TLS negotiation (version/ALPN/cipher) does not match the genuine cover site — it doesn't fully impersonate the host its serverName claims, a fingerprint an active prober can use. Point Reality 'dest' at the exact cover the client's serverName expects (and confirm probes 15/20)"
+  fi
+}
+
 probe_ipv6() {
   hdr "9. IPv6 reachability"
 
@@ -2970,6 +3206,17 @@ _emit_json() {
     --arg xf_total          "$XRAY_FLEET_TOTAL" \
     --arg xf_ok             "$XRAY_FLEET_OK" \
     --arg xf_results        "$XRAY_FLEET_RESULTS" \
+    --arg xbb_status        "$XRAY_BUFFERBLOAT_STATUS" \
+    --arg xbb_idle          "$XRAY_BUFFERBLOAT_IDLE_MS" \
+    --arg xbb_load          "$XRAY_BUFFERBLOAT_LOAD_MS" \
+    --arg xbb_inflate       "$XRAY_BUFFERBLOAT_INFLATE_MS" \
+    --arg xbb_jitter        "$XRAY_BUFFERBLOAT_JITTER_MS" \
+    --arg xmtu_status       "$XRAY_MTU_STATUS" \
+    --arg xmtu_path         "$XRAY_MTU_PATH" \
+    --arg xtp_status        "$XRAY_TLSPAR_STATUS" \
+    --arg xtp_ver           "$XRAY_TLSPAR_VER_MATCH" \
+    --arg xtp_alpn          "$XRAY_TLSPAR_ALPN_MATCH" \
+    --arg xtp_cipher        "$XRAY_TLSPAR_CIPHER_MATCH" \
     --argjson verdicts      "$verdicts_json" '
     def words: split(" ") | map(select(length > 0));
     def opt(s): if s == "" then null else s end;
@@ -3145,6 +3392,23 @@ _emit_json() {
                   | { tag: .[0], state: .[1], rtt_ms: (.[2] | tonumber? // null) }))
             end
           )
+        },
+        xray_bufferbloat: {
+          status: opt($xbb_status),
+          idle_rtt_ms: (if $xbb_idle == "" then null else ($xbb_idle | tonumber? // null) end),
+          loaded_rtt_ms: (if $xbb_load == "" then null else ($xbb_load | tonumber? // null) end),
+          inflation_ms: (if $xbb_inflate == "" then null else ($xbb_inflate | tonumber? // null) end),
+          jitter_ms: (if $xbb_jitter == "" then null else ($xbb_jitter | tonumber? // null) end)
+        },
+        xray_mtu: {
+          status: opt($xmtu_status),
+          path_mtu: (if $xmtu_path == "" then null else ($xmtu_path | tonumber? // null) end)
+        },
+        xray_tls_parity: {
+          status: opt($xtp_status),
+          version_match: tri_bool(($xtp_ver | tonumber? // -1)),
+          alpn_match: tri_bool(($xtp_alpn | tonumber? // -1)),
+          cipher_match: tri_bool(($xtp_cipher | tonumber? // -1))
         }
       },
       verdicts: $verdicts
@@ -3249,6 +3513,9 @@ _should_run xrayjson && probe_xray_stability
 { _should_run xray || _should_run xrayjson; } && probe_clock_skew
 { _should_run xray || _should_run xrayjson; } && probe_xray_active_probe
 _should_run xrayjson && probe_xray_fleet
+_should_run xrayjson && probe_xray_bufferbloat
+{ _should_run xray || _should_run xrayjson; } && probe_xray_mtu
+{ _should_run xray || _should_run xrayjson; } && probe_xray_tls_parity
 
 # ---------- summary ----------
 

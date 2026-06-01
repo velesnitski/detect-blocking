@@ -71,6 +71,8 @@ emits a clearly labelled verdict for each detected issue.
 | 22 | Bufferbloat / latency-under-load (auto with 12) | Warm RTT idle vs under a saturating download — the latency the tunnel adds when busy (what makes a "fast" link laggy on calls/gaming). `--no-bufferbloat` to skip |
 | 23 | Path MTU to server (auto) | DF-bit `ping` sweep finds the path MTU; a clamp below 1500 fragments the Reality ClientHello and can cause intermittent handshake failures that mimic DPI |
 | 24 | TLS-negotiation parity (auto) | Does the server negotiate the same TLS version / ALPN / cipher as the genuine cover? Stealth depth-3 (15 cert → 20 HTTP → 24 negotiation); a fake/wrong-`dest` server diverges |
+| 25 | Cover-SNI region-throttle (auto) | Is the cover domain itself shaped in-region (which the tunnel silently inherits)? Direct fetch from the cover vs a neutral baseline; `inconclusive` when the cover serves no measurable payload |
+| 26 | Detectability score (synthesis) | Folds the stealth signals (15/20/24) into one 0-100 fingerprintability score + band for at-a-glance fleet triage |
 
 The verdict ends with a list of detected blocks plus an actionable
 recommendation for each (rotate IP, switch to Reality, use uTLS, etc).
@@ -701,6 +703,56 @@ offers `h2`) — a fingerprint an active prober can exploit, reinforcing 15/20.
 JSON adds `probes.xray_bufferbloat` (idle/loaded/inflation/jitter ms),
 `probes.xray_mtu` (path_mtu), and `probes.xray_tls_parity` (version/ALPN/cipher
 match booleans).
+
+### Probes 25-26 + baseline mode — synthesis & regression detection
+
+**Probe 25 — cover-SNI region-throttle** automates a real production trap: the
+cover domain itself being shaped in-region, which the Reality tunnel (which
+presents that SNI) silently inherits — "fast handshake, slow data." It
+compares a direct bulk fetch from the genuine cover vs a neutral baseline from
+your vantage; a stark slowdown means *pick a different cover*. Best-effort —
+reports `inconclusive` when the cover serves no measurable payload.
+
+**Probe 26 — detectability score** folds the three stealth probes into one
+number, because a censor sees one server, not three findings:
+
+```
+== 26. Detectability score (stealth synthesis) ==
+          signals: cover cert self-signed (15); no coherent HTTP to unauth prober (20); TLS negotiation ≠ cover (24)
+  [FAIL]  detectability 80/100 (critical) — an active prober would flag this server
+```
+
+Weighted so a self-signed cover (critical) outranks a wrong-`dest` server
+(high) outranks a clean relay (low) — at-a-glance triage across a fleet.
+
+#### Baseline / diff — turn the suite into a regression detector
+
+Point-in-time probes answer *"is X true now?"* The higher-value operational
+question is *"what changed since this node was healthy?"*
+
+```sh
+# Capture a healthy reference:
+./detect_blocking.sh --xray-config-json ~/.xray.json --save-baseline ~/.db-baseline.json
+
+# Later (e.g. from cron) — report only what drifted:
+./detect_blocking.sh --xray-config-json ~/.xray.json --diff-baseline ~/.db-baseline.json
+```
+
+```
+== Baseline diff (vs 2026-05-30T08:00:00Z) ==
+  [WARN]  cover_selfsigned: false -> true
+  [WARN]  capacity_mbps: 20 -> 5
+  [WARN]  detect: 0 -> 80
+  [WARN]  server host: changed
+```
+
+The compared signature is statuses / geo / booleans / bucketed numbers only —
+run-to-run jitter won't trip it, and a changed server/egress IP is reported as
+`changed`, never the value (so the diff is safe to paste). jq-only, no new
+dependency.
+
+JSON adds `probes.xray_cover_throttle` (cover vs baseline bytes/sec) and
+`probes.xray_detectability` (score + band).
 
 ---
 

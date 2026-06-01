@@ -28,7 +28,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.4.0"
+readonly DETECT_BLOCKING_VERSION="0.5.0"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -132,6 +132,10 @@ while [ $# -gt 0 ]; do
     --fleet)        XRAY_FLEET=1; XRAY_FLEET_FORCE=1; shift ;;
     --no-fleet)     XRAY_FLEET=0; shift ;;
     --no-bufferbloat) XRAY_BUFFERBLOAT=0; shift ;;
+    --save-baseline)   SAVE_BASELINE="${2:-}"; shift 2 ;;
+    --save-baseline=*) SAVE_BASELINE="${1#--save-baseline=}"; shift ;;
+    --diff-baseline)   DIFF_BASELINE="${2:-}"; shift 2 ;;
+    --diff-baseline=*) DIFF_BASELINE="${1#--diff-baseline=}"; shift ;;
     --quiet|-q)    LOG_QUIET=1; shift ;;
     --json)        JSON_MODE=1; LOG_QUIET=1; shift ;;
     --version|-V)
@@ -166,6 +170,8 @@ while [ $# -gt 0 ]; do
       printf '  --no-fleet          disable probe 21 (it auto-enables on multi-outbound configs; N xray spawns)\n'
       printf '  --fleet             force probe 21 even inside --watch/--from-file loops\n'
       printf '  --no-bufferbloat    disable probe 22 (latency-under-load; saturates the tunnel briefly)\n'
+      printf '  --save-baseline FILE  write this run'"'"'s share-safe JSON to FILE (a healthy reference)\n'
+      printf '  --diff-baseline FILE  run, then report what changed vs the baseline in FILE (regression mode)\n'
       exit 0
       ;;
     -*) die "unknown option: $1" ;;
@@ -603,6 +609,29 @@ XRAY_TLSPAR_STATUS=""       # ok, mismatch, skipped, no-sni, openssl-missing, un
 XRAY_TLSPAR_VER_MATCH=""    # 1 / 0  TLS version parity
 XRAY_TLSPAR_ALPN_MATCH=""   # 1 / 0  ALPN parity
 XRAY_TLSPAR_CIPHER_MATCH="" # 1 / 0  cipher parity
+
+# ---- probe 25: cover-SNI region-throttle ----
+# Automates the real incident: the cover domain itself being shaped in-region,
+# which the tunnel silently inherits. Measure a DIRECT bulk fetch from the
+# genuine cover vs a neutral baseline from the same vantage; a stark slowdown
+# means the cover SNI is throttled here. Output: KB/s + ratio, no domain.
+XRAY_COVERTHR_STATUS=""     # ok, throttled, inconclusive, skipped, no-sni, curl-missing
+XRAY_COVERTHR_COVER_BPS=""  # bytes/sec fetching the cover root
+XRAY_COVERTHR_BASE_BPS=""   # bytes/sec fetching the neutral baseline
+
+# ---- probe 26: detectability score (stealth synthesis) ----
+# A censor sees one server, not three findings. Fold the stealth signals
+# (cover cert / active-probe / TLS-parity) into one 0-100 fingerprintability
+# score for at-a-glance triage. Pure synthesis of probes 15/20/24.
+XRAY_DETECT_STATUS=""       # ok, skipped
+XRAY_DETECT_SCORE=""        # 0-100 (higher = more detectable)
+XRAY_DETECT_BAND=""         # low | moderate | high | critical
+
+# ---- baseline / diff mode (longitudinal regression detection) ----
+# --save-baseline FILE writes this run's share-safe JSON; --diff-baseline FILE
+# runs then reports what changed since that baseline. jq-only, no new deps.
+SAVE_BASELINE="${SAVE_BASELINE:-}"
+DIFF_BASELINE="${DIFF_BASELINE:-}"
 
 # ---------- colors (TTY-aware, suppressed when --quiet) ----------
 
@@ -3050,6 +3079,107 @@ probe_xray_tls_parity() {
   fi
 }
 
+# Probe 25 — cover-SNI region-throttle. A DIRECT bulk fetch from the genuine
+# cover site vs a neutral baseline, from this vantage. If the cover is shaped
+# in-region the tunnel (which uses that SNI) silently inherits the throttle.
+# Best-effort: needs the cover to serve a measurable payload at its root.
+# Output: KB/s + ratio, never the cover domain.
+probe_xray_coverthrottle() {
+  local sni
+  sni=$(_xray_cover_sni)
+  if [ -z "$sni" ]; then
+    XRAY_COVERTHR_STATUS="skipped"
+    return 0
+  fi
+
+  hdr "25. Cover-SNI region-throttle"
+
+  if ! check_cmd curl; then
+    warn "skipping — curl not available"
+    XRAY_COVERTHR_STATUS="curl-missing"
+    return 0
+  fi
+
+  # Bulk-ish fetch from the cover root and from a neutral baseline of a
+  # comparable size; compare speed_download (bytes/sec). Cap by time + size.
+  local cover_stats base_stats cbytes cbps bbps
+  cover_stats=$(curl -sS -L --max-time "$(( TIMEOUT + 8 ))" -o /dev/null \
+    -w '%{size_download} %{speed_download}' "https://${sni}/" 2>/dev/null)
+  base_stats=$(curl -sS --max-time "$(( TIMEOUT + 8 ))" -o /dev/null \
+    -w '%{size_download} %{speed_download}' \
+    "https://speed.cloudflare.com/__down?bytes=$((2*1024*1024))" 2>/dev/null)
+
+  cbytes=$(printf '%s' "$cover_stats" | awk '{print $1+0}')
+  cbps=$(printf '%s'   "$cover_stats" | awk '{print int($2)}')
+  bbps=$(printf '%s'   "$base_stats"  | awk '{print int($2)}')
+  XRAY_COVERTHR_COVER_BPS="$cbps"
+  XRAY_COVERTHR_BASE_BPS="$bbps"
+
+  # Need enough cover payload to measure, and a working baseline, to judge.
+  if [ "${cbytes:-0}" -lt 51200 ] || [ "${bbps:-0}" -le 0 ]; then
+    info "cover served ${cbytes:-0} bytes; baseline $(( ${bbps:-0} / 1024 )) KB/s"
+    warn "not enough cover payload to measure throttle reliably — inconclusive"
+    XRAY_COVERTHR_STATUS="inconclusive"
+    return 0
+  fi
+
+  info "direct fetch: cover $(( cbps / 1024 )) KB/s vs baseline $(( bbps / 1024 )) KB/s"
+
+  # Throttle signal: cover throughput is a small fraction of baseline AND
+  # absolutely low. Tuned to avoid flagging normal cover<CDN differences.
+  if [ "$cbps" -lt 51200 ] && [ "$(( cbps * 5 ))" -lt "$bbps" ]; then
+    fail "cover throughput $(( cbps / 1024 )) KB/s is a fraction of baseline → cover SNI appears throttled here"
+    XRAY_COVERTHR_STATUS="throttled"
+    add_verdict "The configured cover domain is itself throttled from this vantage (cover $(( cbps / 1024 )) KB/s vs baseline $(( bbps / 1024 )) KB/s) — the Reality tunnel, which presents that SNI, will silently inherit the shaping. This is the 'fast handshake, slow data' trap: pick a cover that is NOT shaped in the target region"
+  else
+    ok "cover not throttled here ($(( cbps / 1024 )) KB/s vs baseline $(( bbps / 1024 )) KB/s)"
+    XRAY_COVERTHR_STATUS="ok"
+  fi
+}
+
+# Probe 26 — detectability score. Folds the stealth signals (probes 15/20/24)
+# into one 0-100 fingerprintability score so a fleet can be triaged at a glance.
+# Higher = more detectable. Pure synthesis, no network.
+probe_xray_detectability() {
+  # Only meaningful when the stealth probes ran (a Reality config was present).
+  case "$XRAY_COVER_STATUS" in ''|skipped) XRAY_DETECT_STATUS="skipped"; return 0 ;; esac
+
+  hdr "26. Detectability score (stealth synthesis)"
+
+  local score=0 reasons=""
+  _det_add() { score=$(( score + $1 )); reasons="${reasons}${reasons:+; }$2"; }
+
+  # Self-signed / fake cover is the single loudest tell.
+  [ "${XRAY_COVER_SELFSIGNED:-0}" = "1" ] && _det_add 40 "cover cert self-signed (15)"
+  [ "${XRAY_COVER_CHAIN_VALID:-1}" = "0" ] && [ "${XRAY_COVER_SELFSIGNED:-0}" != "1" ] && _det_add 15 "cover cert not CA-valid (15)"
+  [ "${XRAY_COVER_CN_MATCH:-1}" = "0" ] && _det_add 10 "cover CN ≠ serverName (15)"
+  # Active-probe behaviour: not relaying to the real cover.
+  case "$XRAY_ACTIVE_STATUS" in
+    exposed)  _det_add 25 "no coherent HTTP to unauth prober (20)" ;;
+    mismatch) _det_add 15 "unauth response ≠ cover (20)" ;;
+  esac
+  # TLS-negotiation divergence from the cover.
+  [ "$XRAY_TLSPAR_STATUS" = "mismatch" ] && _det_add 15 "TLS negotiation ≠ cover (24)"
+
+  [ "$score" -gt 100 ] && score=100
+  XRAY_DETECT_SCORE="$score"
+  if   [ "$score" -ge 70 ]; then XRAY_DETECT_BAND="critical"
+  elif [ "$score" -ge 40 ]; then XRAY_DETECT_BAND="high"
+  elif [ "$score" -ge 15 ]; then XRAY_DETECT_BAND="moderate"
+  else XRAY_DETECT_BAND="low"; fi
+  XRAY_DETECT_STATUS="ok"
+
+  [ -n "$reasons" ] && info "signals: ${reasons}"
+  if [ "$score" -ge 40 ]; then
+    fail "detectability ${score}/100 (${XRAY_DETECT_BAND}) — an active prober would flag this server"
+    add_verdict "Detectability ${score}/100 (${XRAY_DETECT_BAND}) — the stealth signals (probes 15/20/24) combine into a strong fingerprint. Fix the cover relay (real 'dest'/'serverNames') to drop the score; see the individual probes for specifics"
+  elif [ "$score" -ge 15 ]; then
+    warn "detectability ${score}/100 (${XRAY_DETECT_BAND})"
+  else
+    ok "detectability ${score}/100 (${XRAY_DETECT_BAND}) — blends in"
+  fi
+}
+
 probe_ipv6() {
   hdr "9. IPv6 reachability"
 
@@ -3226,6 +3356,12 @@ _emit_json() {
     --arg xtp_ver           "$XRAY_TLSPAR_VER_MATCH" \
     --arg xtp_alpn          "$XRAY_TLSPAR_ALPN_MATCH" \
     --arg xtp_cipher        "$XRAY_TLSPAR_CIPHER_MATCH" \
+    --arg xct_status        "$XRAY_COVERTHR_STATUS" \
+    --arg xct_cover         "$XRAY_COVERTHR_COVER_BPS" \
+    --arg xct_base          "$XRAY_COVERTHR_BASE_BPS" \
+    --arg xd_status         "$XRAY_DETECT_STATUS" \
+    --arg xd_score          "$XRAY_DETECT_SCORE" \
+    --arg xd_band           "$XRAY_DETECT_BAND" \
     --argjson verdicts      "$verdicts_json" '
     def words: split(" ") | map(select(length > 0));
     def opt(s): if s == "" then null else s end;
@@ -3418,10 +3554,80 @@ _emit_json() {
           version_match: tri_bool(($xtp_ver | tonumber? // -1)),
           alpn_match: tri_bool(($xtp_alpn | tonumber? // -1)),
           cipher_match: tri_bool(($xtp_cipher | tonumber? // -1))
+        },
+        xray_cover_throttle: {
+          status: opt($xct_status),
+          cover_bytes_per_second: (if $xct_cover == "" then null else ($xct_cover | tonumber? // null) end),
+          baseline_bytes_per_second: (if $xct_base == "" then null else ($xct_base | tonumber? // null) end)
+        },
+        xray_detectability: {
+          status: opt($xd_status),
+          score: (if $xd_score == "" then null else ($xd_score | tonumber? // null) end),
+          band: opt($xd_band)
         }
       },
       verdicts: $verdicts
     }'
+}
+
+# Compare the current run's JSON ($2) against a saved baseline file ($1) and
+# print the meaningful changes. Share-safe: the compared "signature" is built
+# from statuses / geo / booleans / bucketed numbers only — never raw IPs or
+# domains (a changed server/egress IP is reported as a boolean "changed").
+_emit_baseline_diff() {
+  local bfile="$1" cur="$2" base ts changes
+  if [ ! -r "$bfile" ]; then
+    warn "baseline not readable: $bfile (run --save-baseline first)"
+    return 0
+  fi
+  base=$(cat "$bfile" 2>/dev/null)
+  if ! printf '%s' "$base" | jq -e . >/dev/null 2>&1; then
+    warn "baseline file is not valid JSON: $bfile"
+    return 0
+  fi
+  ts=$(printf '%s' "$base" | jq -r '.timestamp // "unknown"' 2>/dev/null)
+
+  hdr "Baseline diff (vs ${ts})"
+
+  changes=$(jq -rn --argjson b "$base" --argjson c "$cur" '
+    def sig: {
+      proto: .probes.xray_protocol.status,
+      full: .probes.xray_full_config.status,
+      egress_geo: .probes.xray_full_config.egress_location,
+      throughput: .probes.xray_throughput.status,
+      capacity_mbps: (.probes.xray_speedtest.best_mbps | if . == null then null else (. / 5 | floor * 5) end),
+      cover_selfsigned: .probes.xray_cover.self_signed,
+      cover_chain: .probes.xray_cover.chain_valid,
+      active: .probes.xray_active_probe.status,
+      tls_parity: .probes.xray_tls_parity.status,
+      stability: .probes.xray_stability.status,
+      killed: .probes.xray_stability.pulses_killed,
+      egress_country: .probes.xray_egress.country,
+      egress_hosting: .probes.xray_egress.hosting,
+      egress_proxy: .probes.xray_egress.proxy,
+      mtu: .probes.xray_mtu.path_mtu,
+      bufferbloat: .probes.xray_bufferbloat.status,
+      cover_throttle: .probes.xray_cover_throttle.status,
+      detect: (.probes.xray_detectability.score | if . == null then null else (. / 10 | floor * 10) end),
+      fleet_ok: .probes.xray_fleet.outbounds_ok,
+      fleet_total: .probes.xray_fleet.outbounds_total,
+      verdicts: (.verdicts | length)
+    };
+    def show: if . == null then "none" else tostring end;
+    ($b | sig) as $bs | ($c | sig) as $cs |
+    ( [ $cs | keys_unsorted[] as $k | select(($bs[$k]) != ($cs[$k]))
+        | "\($k): \($bs[$k] | show) -> \($cs[$k] | show)" ]
+      + (if ($b.target.host) != ($c.target.host) then ["server host: changed"] else [] end)
+    ) | .[]
+  ' 2>/dev/null)
+
+  if [ -z "$changes" ]; then
+    ok "no changes since baseline"
+  else
+    printf '%s\n' "$changes" | while IFS= read -r ln; do
+      [ -n "$ln" ] && warn "$ln"
+    done
+  fi
 }
 
 # ---------- main ----------
@@ -3525,11 +3731,34 @@ _should_run xrayjson && probe_xray_fleet
 _should_run xrayjson && probe_xray_bufferbloat
 { _should_run xray || _should_run xrayjson; } && probe_xray_mtu
 { _should_run xray || _should_run xrayjson; } && probe_xray_tls_parity
+{ _should_run xray || _should_run xrayjson; } && probe_xray_coverthrottle
+{ _should_run xray || _should_run xrayjson; } && probe_xray_detectability
 
 # ---------- summary ----------
 
+# Baseline save / diff (longitudinal regression mode). Reuses the JSON emitter
+# (captured once), so jq runs at most once extra. No new dependency.
+if [ -n "$SAVE_BASELINE" ] || [ -n "$DIFF_BASELINE" ]; then
+  if check_cmd jq; then
+    _CURRENT_JSON=$(_emit_json)
+    if [ -n "$SAVE_BASELINE" ]; then
+      if printf '%s\n' "$_CURRENT_JSON" > "$SAVE_BASELINE" 2>/dev/null; then
+        [ "$JSON_MODE" = "1" ] || info "baseline saved → $SAVE_BASELINE"
+      else
+        warn "could not write baseline to $SAVE_BASELINE"
+      fi
+    fi
+    # Human diff section (skipped in --json mode to keep stdout pure JSON).
+    if [ -n "$DIFF_BASELINE" ] && [ "$JSON_MODE" != "1" ]; then
+      _emit_baseline_diff "$DIFF_BASELINE" "$_CURRENT_JSON"
+    fi
+  else
+    warn "baseline mode needs jq — skipping --save/--diff-baseline"
+  fi
+fi
+
 if [ "$JSON_MODE" = "1" ]; then
-  _emit_json
+  if [ -n "${_CURRENT_JSON:-}" ]; then printf '%s\n' "$_CURRENT_JSON"; else _emit_json; fi
   _log_line DONE "$VPN_HOST"
   exit 0
 fi

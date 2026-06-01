@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-01
+
+### Added
+
+Two leaps beyond point-in-time probing — **longitudinal** (what changed) and
+**synthesis** (one answer from many signals) — plus a probe that closes a real
+production loop. All pure-bash (jq/curl/openssl already required), share-safe.
+
+- **Baseline + diff mode (`--save-baseline FILE` / `--diff-baseline FILE`).**
+  Turns the suite into a regression detector. `--save-baseline` writes this
+  run's share-safe JSON as a healthy reference; `--diff-baseline` runs and
+  reports what changed since — cover went fake, egress geo/reputation flipped,
+  capacity regressed, a fleet outbound died, detectability climbed, etc. The
+  compared signature is built from statuses / geo / booleans / bucketed
+  numbers only (so run-to-run jitter doesn't trip it), and a changed
+  server/egress IP is reported as a boolean "changed" — never the value.
+  `cron` it to catch the moment a node degrades.
+
+- **Probe 26 — detectability score (stealth synthesis).** A censor sees one
+  server, not three findings. Folds probes 15 (cover cert), 20 (active-probe)
+  and 24 (TLS parity) into a single 0-100 fingerprintability score + band
+  (low / moderate / high / critical) for at-a-glance fleet triage. Weighted
+  so a self-signed cover (critical) ranks above a wrong-`dest` server (high)
+  above a clean relay (low).
+
+- **Probe 25 — cover-SNI region-throttle.** Automates a real incident: the
+  cover domain itself being shaped in-region, which the tunnel silently
+  inherits ("fast handshake, slow data"). Compares a direct bulk fetch from
+  the genuine cover vs a neutral baseline from this vantage; flags a stark
+  slowdown. Best-effort — reports `inconclusive` when the cover serves no
+  measurable payload (e.g. an API/asset host). Output: KB/s + ratio, no
+  domain.
+
+  JSON adds `probes.xray_cover_throttle`, `probes.xray_detectability`. New
+  flags `--save-baseline` / `--diff-baseline`. New test
+  `tests/test_score_throttle_baseline.sh`. Suite is now 14; shellcheck clean.
+
 ## [0.4.0] - 2026-06-01
 
 ### Added

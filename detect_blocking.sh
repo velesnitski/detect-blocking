@@ -2945,18 +2945,25 @@ probe_xray_mtu() {
     return 0
   fi
 
-  # DF-bit flag differs: GNU ping uses '-M do', BSD/macOS uses '-D'.
-  local df sz ok_payload="" found=0
-  if ping -M "do" -c 1 -s 56 "$VPN_HOST" >/dev/null 2>&1; then
-    df="-M do"
+  # DF-bit + reply-timeout flags differ between ping flavours. Detect support
+  # against loopback (always answers) so detection doesn't depend on whether
+  # the TARGET answers — and ALWAYS carry a timeout so a non-answering / ICMP-
+  # filtered host can't hang the sweep (no timeout = ~10s/ping × ladder).
+  local pf sz ok_payload="" found=0
+  if ping -M "do" -c 1 -W 1 127.0.0.1 >/dev/null 2>&1; then
+    pf="-M do -W 2"          # GNU/iputils: -M do = DF, -W = reply timeout (s)
+  elif ping -D -c 1 -t 1 127.0.0.1 >/dev/null 2>&1; then
+    pf="-D -t 2"             # BSD/macOS: -D = DF, -t = total timeout (s)
   else
-    df="-D"
+    info "ping flavour unrecognized — MTU undetermined"
+    XRAY_MTU_STATUS="no-ping"
+    return 0
   fi
 
   # Descending payload ladder; path MTU = largest passing payload + 28 (IP+ICMP).
   for sz in 1472 1452 1400 1372 1272 1172 972; do
     # shellcheck disable=SC2086
-    if ping $df -c 1 -s "$sz" "$VPN_HOST" >/dev/null 2>&1; then
+    if ping $pf -c 1 -s "$sz" "$VPN_HOST" >/dev/null 2>&1; then
       ok_payload="$sz"; found=1; break
     fi
   done
@@ -2964,7 +2971,9 @@ probe_xray_mtu() {
   if [ "$found" != "1" ]; then
     # Either ICMP is filtered, or even small DF packets fail. Confirm with a
     # plain (no-DF) ping: if that works too, ICMP echo is simply blocked.
-    if ping -c 1 "$VPN_HOST" >/dev/null 2>&1; then
+    local base="-W 2"; case "$pf" in *-t\ *) base="-t 2" ;; esac
+    # shellcheck disable=SC2086
+    if ping $base -c 1 "$VPN_HOST" >/dev/null 2>&1; then
       info "host answers ping but no DF size passed — unusual; treating MTU as undetermined"
     else
       info "host does not answer ICMP echo — MTU undetermined (ICMP filtered)"

@@ -28,7 +28,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.5.0"
+readonly DETECT_BLOCKING_VERSION="0.5.1"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -3115,11 +3115,34 @@ probe_xray_coverthrottle() {
   XRAY_COVERTHR_COVER_BPS="$cbps"
   XRAY_COVERTHR_BASE_BPS="$bbps"
 
-  # Need enough cover payload to measure, and a working baseline, to judge.
+  # Need enough cover payload to measure directly. Many covers (API/asset
+  # hosts) serve almost nothing at the root — but the TUNNEL already presents
+  # the cover SNI in bulk, so probe 13/14's throughput IS the cover-SNI
+  # throughput. Use it as the cross-check instead of giving up.
   if [ "${cbytes:-0}" -lt 51200 ] || [ "${bbps:-0}" -le 0 ]; then
-    info "cover served ${cbytes:-0} bytes; baseline $(( ${bbps:-0} / 1024 )) KB/s"
-    warn "not enough cover payload to measure throttle reliably — inconclusive"
-    XRAY_COVERTHR_STATUS="inconclusive"
+    info "cover root served only ${cbytes:-0} bytes — too little for a direct measurement; cross-checking the tunnel (it presents this SNI)"
+    local tun_bps="${XRAY_SPEEDTEST_BEST_BPS:-}"
+    [ -z "$tun_bps" ] && tun_bps="${XRAY_THROUGHPUT_BPS:-}"
+    case "$tun_bps" in ''|*[!0-9]*) tun_bps="" ;; esac
+
+    if [ -n "$tun_bps" ] && [ "$tun_bps" -gt 0 ]; then
+      if [ "$tun_bps" -ge 256000 ]; then
+        ok "cover SNI not throttled at this vantage — the tunnel carries it at $(( tun_bps * 8 / 1000000 )) Mbps (a volumetric throttle would cap it to tens of KB/s)"
+        XRAY_COVERTHR_STATUS="ok"
+      elif [ "$tun_bps" -lt 51200 ] && [ "${TCP_OK:-1}" = "1" ] && [ "${TLS_PROPER_SNI_OK:-1}" = "1" ]; then
+        fail "cover SNI may be shaped here — tunnel carrying it manages only $(( tun_bps / 1024 )) KB/s while transport is clean"
+        XRAY_COVERTHR_STATUS="throttled"
+        add_verdict "The cover SNI may be throttled at this vantage — the tunnel that presents it manages only $(( tun_bps / 1024 )) KB/s while the transport layer (probes 2-5) is clean. If this is the affected region, the tunnel is inheriting a shape on the cover SNI: switch to a cover that isn't throttled here"
+      else
+        warn "tunnel throughput modest ($(( tun_bps / 1024 )) KB/s) — can't cleanly separate cover-SNI shaping from normal tunnel overhead; inconclusive"
+        XRAY_COVERTHR_STATUS="inconclusive"
+      fi
+    else
+      warn "no direct cover payload and no tunnel throughput to cross-check — inconclusive"
+      info "to test manually, bulk-download a large resource served under this SNI from the affected region"
+      XRAY_COVERTHR_STATUS="inconclusive"
+    fi
+    info "note: a region-throttle only shows where it's enforced — run this from the affected region (e.g. RU) to detect it there, not from a clean vantage"
     return 0
   fi
 

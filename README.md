@@ -71,7 +71,7 @@ emits a clearly labelled verdict for each detected issue.
 | 22 | Bufferbloat / latency-under-load (auto with 12) | Warm RTT idle vs under a saturating download — the latency the tunnel adds when busy (what makes a "fast" link laggy on calls/gaming). `--no-bufferbloat` to skip |
 | 23 | Path MTU to server (auto) | DF-bit `ping` sweep finds the path MTU; a clamp below 1500 fragments the Reality ClientHello and can cause intermittent handshake failures that mimic DPI |
 | 24 | TLS-negotiation parity (auto) | Does the server negotiate the same TLS version / ALPN / cipher as the genuine cover? Stealth depth-3 (15 cert → 20 HTTP → 24 negotiation); a fake/wrong-`dest` server diverges |
-| 25 | Cover-SNI region-throttle (auto) | Is the cover domain itself shaped in-region (which the tunnel silently inherits)? Direct fetch from the cover vs a neutral baseline; `inconclusive` when the cover serves no measurable payload |
+| 25 | Cover-SNI region-throttle (auto) | Is the cover domain itself shaped in-region (which the tunnel silently inherits)? Direct fetch vs a neutral baseline; when the cover root is too small, cross-checks the tunnel throughput (which carries the cover SNI) |
 | 26 | Detectability score (synthesis) | Folds the stealth signals (15/20/24) into one 0-100 fingerprintability score + band for at-a-glance fleet triage |
 
 The verdict ends with a list of detected blocks plus an actionable
@@ -710,8 +710,12 @@ match booleans).
 cover domain itself being shaped in-region, which the Reality tunnel (which
 presents that SNI) silently inherits — "fast handshake, slow data." It
 compares a direct bulk fetch from the genuine cover vs a neutral baseline from
-your vantage; a stark slowdown means *pick a different cover*. Best-effort —
-reports `inconclusive` when the cover serves no measurable payload.
+your vantage; a stark slowdown means *pick a different cover*. When the cover
+root is too small to measure directly (common — API/asset hosts), it
+**cross-checks the tunnel throughput** (which already carries the cover SNI in
+bulk): a healthy tunnel proves the SNI isn't throttled at this vantage, a
+collapsed one on clean transport flags it. Note it only detects a throttle
+*where it's enforced* — run from the affected region, not a clean vantage.
 
 **Probe 26 — detectability score** folds the three stealth probes into one
 number, because a censor sees one server, not three findings:

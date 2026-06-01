@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-06-01
+
+### Changed
+
+- **Probe 25 cross-checks the tunnel instead of bailing to "inconclusive".**
+  Many covers (API / asset hosts) serve almost nothing at the root, so the
+  direct fetch couldn't measure a throttle and the
+  probe gave an unhelpful "not enough cover payload — inconclusive". But the
+  tunnel itself presents the cover SNI in bulk, so probe 13/14's throughput
+  *is* the cover-SNI throughput. Probe 25 now falls back to it: a healthy
+  tunnel (≥ ~2 Mbps) → "cover SNI not throttled at this vantage — the tunnel
+  carries it at N Mbps (a volumetric throttle would cap it to tens of KB/s)";
+  a collapsed tunnel on clean transport → "may be shaped here". It also now
+  notes that a region-throttle only shows where it's enforced (run from the
+  affected region, not a clean vantage). Still `inconclusive` only when there's
+  neither a measurable cover payload nor any tunnel throughput to cross-check.
+
 ## [0.5.0] - 2026-06-01
 
 ### Added

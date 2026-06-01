@@ -7,6 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-01
+
+### Changed
+
+- **Probe 17 rebuilt around an escalating size ladder.** It used to pulse
+  only tiny trace requests on a duration timer and lumped "slow timeout" in
+  with "killed", which mislabelled healthy high-RTT tunnels as "unstable"
+  (e.g. 0/3). It now pulses a byte ladder (`0 262144 1048576 4194304` by
+  default) and classifies each pulse by curl exit code — **ok / slow
+  (timeout) / killed (reset)**. A reset that appears only on the larger
+  pulses is reported as **volumetric kill-shaping** (the censor allows small
+  flows, drops large ones) with the byte size that tripped it — a signature
+  trace-only pulses can never reveal. Timeouts with no resets are now
+  reported as *slow / degraded*, not "killed". Per-pulse budgets are
+  handshake-aware and scale with size. New env `XRAY_STABILITY_SIZES`;
+  `XRAY_STABILITY_SECONDS` is now an overall wall-clock cap (default 45),
+  `XRAY_STABILITY_INTERVAL` a brief inter-pulse pause. JSON `xray_stability`
+  gains `pulses_killed`, `pulses_slow`, `kill_at_bytes`, and a `per_pulse[]`
+  ladder (existing fields retained).
+
+### Added
+
+Four more Xray probes, completing the suite across reachability, performance,
+stealth, integrity, stability — and a new **correctness** dimension. As with
+15-17, all output and JSON are share-safe: verdicts, booleans, counts, status
+codes and operator tags only — never a secret value, cover domain, or IP.
+
+- **Probe 18 — config pre-flight lint (static, no network).** Validates the
+  parsed URL/JSON for common Reality/VLESS misconfigs before the network
+  probes run, so a typo surfaces in milliseconds instead of masquerading as
+  DPI three screens down. Checks: `flow=xtls-rprx-vision` requires
+  `network=tcp`; `security=reality` requires a `publicKey`; `shortId` must be
+  hex ≤16 chars; `serverName` must be a domain not a bare IP; uTLS
+  `fingerprint` recommended; vless `encryption=none`. Each finding names the
+  protocol knob, never the secret. Runs first (pre-flight) when a config is
+  present.
+
+- **Probe 19 — clock skew.** Reality authentication is time-windowed, so a
+  client clock off by minutes fails the handshake in a way that looks
+  identical to a fingerprint block. Compares local time to a server `Date`
+  header (GNU + BSD `date` portable) and warns past ±60s. Runs pre-flight.
+
+- **Probe 20 — active-probe resistance.** Probe 15 checks the cover *cert*;
+  this checks the cover *behaviour* the way a censor does — sends a real HTTPS
+  request to the server with the cover SNI and compares the response to the
+  genuine cover site fetched out-of-band. A real Reality server relays unauth
+  clients to dest → matching response; a fake one returns no coherent HTTP or
+  a mismatch. Reports relay vs genuine HTTP codes + a match boolean.
+
+- **Probe 21 — per-outbound fleet health matrix (auto on multi-outbound).**
+  For balancer / multi-outbound JSON configs, tunnel-tests each outbound (its
+  own xray spawn) and prints a health table keyed by the operator-defined tag
+  — never the address or port. Distinguishes a single dead endpoint from a
+  fleet-wide config problem (all outbounds down → "fix the shared knobs").
+  **Auto-enables** when the JSON config has >1 proxy outbound; stays silent
+  (no header, no work) for single-outbound or URL-form configs. `--no-fleet`
+  disables; `--fleet` forces it inside `--watch`/`--from-file` loops (it
+  auto-skips there otherwise, since it's N xray spawns).
+
+  JSON schema adds `probes.xray_lint`, `probes.xray_clock`,
+  `probes.xray_active_probe`, `probes.xray_fleet`. New flags: `--no-fleet`,
+  `--fleet` (force in loops).
+  New test `tests/test_lint_clock_active_fleet.sh` (gating, schema, lint flags
+  a bad config + passes a clean one, and asserts no secret leaks into
+  findings). Suite is now 12, `shellcheck detect_blocking.sh` clean.
+
+  Default behaviour: 11-20 run by default when a config is given (gated by
+  available binaries and whether the tunnel comes up); 21 is opt-in. A full
+  run with a live tunnel pulls ~60 MB and takes ~30-60s — trim with
+  `--no-speedtest` / `--no-egress-check` / `--no-stability` / `--only` /
+  `--skip`; `--watch` and `--from-file` loops auto-skip the heavy probes.
+
 ## [0.2.10] - 2026-05-29
 
 ### Fixed

@@ -45,6 +45,10 @@ endpoint and emits a clearly labelled verdict for each detected blocking type.
 | 15 | Reality cover authenticity (auto) | Plain-TLS probe like a censor's active prober: is the presented cert a CA-valid cover, or **self-signed/mismatched** (fake cover, trivially fingerprinted)? Booleans only — never prints the cover domain |
 | 16 | Egress integrity (auto with 12) | Through the tunnel: egress geo + **datacenter/proxy/mobile flags** (is the exit IP already on "this is a VPN" lists?) + DNS-resolver region. Country + flags only, never the IP. `--no-egress-check` to skip the 3rd-party lookup |
 | 17 | Held-session stability (auto with 12) | Holds the tunnel ~20s with periodic pulses to catch **delayed mid-session RST / kill-shaping** that short bursts (13/14) miss. `--no-stability` to skip; auto-skipped in `--watch`/`--from-file` loops |
+| 18 | Config pre-flight lint (auto) | Static validation of the URL/JSON for common Reality/VLESS misconfigs (`flow`/`network` mismatch, bad `shortId`, bare-IP SNI, missing `pbk`, …) **before** the network probes — so a typo doesn't masquerade as DPI. Names the knob, never the secret |
+| 19 | Clock skew (auto) | Reality auth is time-windowed; a client clock off by minutes fails the handshake like a block. Compares local time to a server `Date` header, warns past ±60s |
+| 20 | Active-probe resistance (auto) | Probe 15 checks the cover *cert*; this checks the cover *behaviour* — does an unauthenticated HTTPS request get relayed to the genuine cover site (real Reality) or return garbage (fake)? |
+| 21 | Per-outbound fleet matrix (auto on multi-outbound) | Tunnel-tests **each outbound** of a balancer/multi-outbound config and prints a health table by tag; tells a single dead endpoint apart from a fleet-wide config fault. Auto-enables when the JSON has >1 outbound; `--no-fleet` to disable |
 
 The verdict ends with a list of detected blocks plus an actionable
 recommendation for each (rotate IP, switch to Reality, use uTLS, etc).
@@ -553,24 +557,91 @@ It sends the egress IP to a 3rd-party IP-info service (`ip-api.com` by
 default). Disable with `--no-egress-check`, or point `XRAY_EGRESS_INFO_URL`
 at your own.
 
-**Probe 17 — held-session stability.** Holds the tunnel for a real-elapsed
-window (default 20s) and pulses small requests, catching the censor tactic
-of allowing the handshake then RST-ing the proven tunnel seconds later:
+**Probe 17 — held-session stability.** Pulses an **escalating size ladder**
+through the tunnel (tiny → 256 KB → 1 MB → 4 MB) and classifies each pulse by
+curl exit code — **ok**, **slow** (timeout), or **killed** (reset/closed
+mid-stream). This catches the censor tactic of allowing the handshake and
+trivial traffic, then RST-ing the connection once a transfer crosses a byte
+threshold — **volumetric kill-shaping** that trace-only pulses can never
+reveal:
 
 ```
 == 17. Held-session stability (delayed-RST detection) ==
-          holding tunnel ~20s (real elapsed), pulsing every 4s
-  [OK]    tunnel stable: 4/4 pulses over ~20s (RTT 110-180 ms)
-          note: only catches kills within ~20s — raise XRAY_STABILITY_SECONDS to probe for slower kill-shaping
+          pulse ladder: 0 262144 1048576 4194304 bytes (0 = tiny), ≤45s total
+            tiny  pulse: ok (120 ms)
+            256KB pulse: ok (180 ms)
+            1MB   pulse: ok (240 ms)
+            4MB   pulse: killed
+  [FAIL]  tunnel reset at the 4MB pulse (smaller pulses passed) — volumetric kill-shaping
 ```
 
-If the tunnel works then dies mid-window, the verdict is
-`delayed RST / post-detection kill-shaping` with the time-to-kill. Runs by
-default; auto-skips in `--watch`/`--from-file` loops (`--stability` forces
-it there), `--no-stability` disables.
+A reset that appears only on the larger pulses is the volumetric signature; a
+reset on every pulse is a connection-level kill; timeouts with **no** resets
+are reported as merely *slow* (degraded), not killed — so a high-RTT tunnel is
+no longer mislabelled "unstable." Runs by default; auto-skips in
+`--watch`/`--from-file` loops (`--stability` forces it there), `--no-stability`
+disables. Tune the ladder with `XRAY_STABILITY_SIZES`.
 
 JSON adds `probes.xray_cover` (booleans), `probes.xray_egress` (country +
-flags), and `probes.xray_stability` (pulse counts + RTT range + time-to-kill).
+flags), and `probes.xray_stability` (per-pulse ladder with ok/slow/killed
+states, `kill_at_bytes`, RTT range).
+
+### Probes 18-21 — correctness + behavioural stealth + fleet
+
+**Probe 18 — config pre-flight lint** runs *before* the network probes
+(static, instant) and catches the misconfigs that otherwise masquerade as
+DPI: `flow=xtls-rprx-vision` without `network=tcp`, a non-hex or over-long
+`shortId`, a bare-IP `serverName`, a missing `publicKey`, vless
+`encryption≠none`, no uTLS fingerprint. Each finding names the protocol knob,
+never the secret value. This is the cheapest, highest-leverage probe — half
+the "is it DPI?" scares this tool was built to diagnose turn out to be a typo.
+
+**Probe 19 — clock skew** checks a failure mode nobody thinks to: Reality
+authentication is time-windowed, so a client clock off by minutes makes the
+handshake fail *exactly* like a fingerprint block. It compares local time to
+a server `Date` header and warns past ±60s.
+
+**Probe 20 — active-probe resistance** is the behavioural half of probe 15.
+Where 15 inspects the cover *certificate*, 20 inspects the cover *behaviour*
+the way a censor's active prober does — it sends a real HTTPS request to the
+server using the cover SNI and compares the response to the genuine cover
+site fetched out-of-band:
+
+```
+== 20. Active-probe resistance (cover behaviour) ==
+          unauthenticated HTTP probe (what an active prober sends)
+          cover behaviour: relay-code=000, genuine-code=404
+  [FAIL]  server returns no coherent HTTP to an unauth prober → not relaying to the cover
+```
+
+A real Reality server relays unauthenticated clients to the genuine cover →
+matching response. A fake one returns no coherent HTTP (as above) or a
+mismatch — a strong VPN fingerprint when combined with the self-signed cert
+from probe 15.
+
+**Probe 21 — per-outbound fleet matrix** is for balancer / multi-outbound
+configs. It **auto-enables** when the JSON config has more than one proxy
+outbound (and stays silent for single-outbound or URL-form configs), then
+tunnel-tests every outbound (one xray spawn each) and prints a health table
+keyed by the operator-defined tag — never the address or port. `--no-fleet`
+disables it; because it's N xray spawns it auto-skips inside
+`--watch`/`--from-file` loops unless you pass `--fleet`:
+
+```
+== 21. Per-outbound fleet health matrix ==
+          testing 3 outbounds (one xray spawn each)
+            node-a       [OK]   RTT 612 ms
+            node-b       [OK]   RTT 588 ms
+            node-c       [FAIL] tunnel unreachable
+  [WARN]  2/3 outbounds healthy — partial fleet degradation
+```
+
+If *all* outbounds fail, the verdict points at the shared config (cover /
+serverName / keys / flow) rather than a single dead endpoint.
+
+JSON adds `probes.xray_lint` (findings list), `probes.xray_clock`
+(skew_seconds), `probes.xray_active_probe` (relay vs genuine HTTP code +
+match), and `probes.xray_fleet` (per-outbound table).
 
 ---
 
@@ -668,8 +739,9 @@ Top-level keys: `schema_version`, `version`, `timestamp` (ISO-8601 UTC),
 | `XRAY_EGRESS_CHECK` | `1` | Probe 16 on/off (set `0`, or `--no-egress-check`, to skip the 3rd-party IP-info call) |
 | `XRAY_EGRESS_INFO_URL` | `ip-api.com/json` | Probe 16 IP-info endpoint (point at your own to avoid the public service) |
 | `XRAY_STABILITY` | `1` | Probe 17 on/off (set `0`, or `--no-stability`, to disable) |
-| `XRAY_STABILITY_SECONDS` | `20` | Probe 17 hold window (real elapsed); raise to catch slower kill-shaping |
-| `XRAY_STABILITY_INTERVAL` | `4` | Probe 17 seconds between pulses |
+| `XRAY_STABILITY_SIZES` | `0 262144 1048576 4194304` | Probe 17 pulse size ladder in bytes (`0`=tiny); escalate to expose byte-threshold (volumetric) kills |
+| `XRAY_STABILITY_SECONDS` | `45` | Probe 17 overall wall-clock cap for the ladder |
+| `XRAY_STABILITY_INTERVAL` | `2` | Probe 17 pause between pulses |
 | `LOG_FILE` | *(empty)* | Optional log file path |
 | `LOG_QUIET` | `0` | Suppress stdout when `1` |
 

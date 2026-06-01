@@ -28,7 +28,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.2.10"
+readonly DETECT_BLOCKING_VERSION="0.3.0"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -129,6 +129,8 @@ while [ $# -gt 0 ]; do
     --no-egress-check) XRAY_EGRESS_CHECK=0; shift ;;
     --stability)    XRAY_STABILITY=1; XRAY_STABILITY_FORCE=1; shift ;;
     --no-stability) XRAY_STABILITY=0; shift ;;
+    --fleet)        XRAY_FLEET=1; XRAY_FLEET_FORCE=1; shift ;;
+    --no-fleet)     XRAY_FLEET=0; shift ;;
     --quiet|-q)    LOG_QUIET=1; shift ;;
     --json)        JSON_MODE=1; LOG_QUIET=1; shift ;;
     --version|-V)
@@ -160,6 +162,8 @@ while [ $# -gt 0 ]; do
       printf '  --no-egress-check   disable probe 16 (egress geo/reputation; avoids a 3rd-party IP-info call)\n'
       printf '  --no-stability      disable probe 17 (held-session RST detection; it runs by default)\n'
       printf '  --stability         force probe 17 even inside --watch/--from-file loops\n'
+      printf '  --no-fleet          disable probe 21 (it auto-enables on multi-outbound configs; N xray spawns)\n'
+      printf '  --fleet             force probe 21 even inside --watch/--from-file loops\n'
       exit 0
       ;;
     -*) die "unknown option: $1" ;;
@@ -508,22 +512,68 @@ XRAY_EGRESS_PROXY=""        # 1 / 0 — on a proxy blocklist
 XRAY_EGRESS_MOBILE=""       # 1 / 0 — mobile carrier IP
 XRAY_EGRESS_DNS_COUNTRY=""  # country of the DNS resolver seen through the tunnel (informational)
 
-# ---- probe 17: held-session stability (delayed-RST / kill-shaping) ----
+# ---- probe 17: held-session stability (delayed-RST / volumetric kill-shaping) ----
 # Short bursts (13/14) miss the censor tactic of letting the handshake through
-# then RST-ing the proven tunnel seconds later. Probe 17 holds the tunnel and
-# pulses small requests for a real-elapsed window, catching mid-session death.
-# Runs by default when probe 12 succeeds; --no-stability opts out; auto-skips
-# inside --watch/--from-file loops (slow), --stability forces it there.
+# then RST-ing the proven tunnel. Probe 17 pulses an ESCALATING SIZE LADDER
+# (tiny → 4 MB) and classifies each pulse by curl exit code: ok / slow-timeout
+# / killed-reset. A reset that appears only on the larger pulses is the
+# volumetric-shaping signature (small flows allowed, big flows dropped) — which
+# trace-only pulses can never reveal. Runs by default; --no-stability opts out;
+# auto-skips inside --watch/--from-file loops, --stability forces it there.
 XRAY_STABILITY="${XRAY_STABILITY:-1}"                      # 1 = run by default (--no-stability opts out)
 XRAY_STABILITY_FORCE="${XRAY_STABILITY_FORCE:-0}"         # 1 = run even inside --watch/--from-file loops
-XRAY_STABILITY_SECONDS="${XRAY_STABILITY_SECONDS:-20}"    # real-elapsed hold duration
-XRAY_STABILITY_INTERVAL="${XRAY_STABILITY_INTERVAL:-4}"  # seconds between pulses
-XRAY_STABILITY_STATUS=""    # ok, killed, unstable, skipped, disabled, curl-missing
+XRAY_STABILITY_SECONDS="${XRAY_STABILITY_SECONDS:-45}"    # overall wall-clock cap for the ladder
+XRAY_STABILITY_INTERVAL="${XRAY_STABILITY_INTERVAL:-2}"  # brief pause between pulses
+# Pulse size ladder (bytes; 0 = tiny trace request). Escalates to expose kills
+# that only trigger past a byte threshold.
+XRAY_STABILITY_SIZES="${XRAY_STABILITY_SIZES:-0 262144 1048576 4194304}"
+XRAY_STABILITY_STATUS=""    # ok, killed, slow, unstable, skipped, disabled, curl-missing
 XRAY_STABILITY_TOTAL=""     # pulses attempted
 XRAY_STABILITY_OK=""        # pulses that succeeded
-XRAY_STABILITY_FIRST_FAIL_S=""  # seconds into the hold when the first failure hit
-XRAY_STABILITY_RTT_MIN=""   # ms
-XRAY_STABILITY_RTT_MAX=""   # ms
+XRAY_STABILITY_KILLED=""    # pulses dropped by a reset-class error (the real kill signal)
+XRAY_STABILITY_SLOW=""      # pulses that timed out (slow, not killed)
+XRAY_STABILITY_KILL_BYTES="" # byte size of the first killed pulse
+XRAY_STABILITY_FIRST_FAIL_S=""  # seconds into the run when the first non-ok pulse hit
+XRAY_STABILITY_RTT_MIN=""   # ms (over ok pulses)
+XRAY_STABILITY_RTT_MAX=""   # ms (over ok pulses)
+XRAY_STABILITY_RESULTS=""   # "size|state|rtt ..." for JSON
+
+# ---- probe 18: config pre-flight lint (static, no network) ----
+# Validates the parsed config for common Reality/VLESS misconfigs BEFORE the
+# network probes, so an obvious typo surfaces in milliseconds instead of
+# masquerading as DPI. Findings name the protocol knob, never the secret value.
+XRAY_LINT_STATUS=""         # ok, warn, skipped
+XRAY_LINT_FINDINGS=""       # newline-joined short codes for JSON
+
+# ---- probe 19: clock skew (Reality auth is time-windowed) ----
+# A client clock off by minutes makes the Reality handshake fail in a way that
+# looks exactly like a fingerprint block. Compare local time to a server Date.
+XRAY_CLOCK_STATUS=""        # ok, skew, unknown, skipped
+XRAY_CLOCK_SKEW_S=""        # signed seconds (local - server)
+
+# ---- probe 20: active-probe resistance ----
+# Probe 15 checks the cover CERT; a real censor also checks the cover
+# BEHAVIOUR. Send a real HTTPS request to the server using the cover SNI and
+# compare the response to the genuine cover site fetched out-of-band. A real
+# Reality server relays unauth clients to dest → matching response; a fake one
+# returns an error / empty / mismatch. Output: match boolean + status codes.
+XRAY_ACTIVE_STATUS=""       # ok, exposed, mismatch, skipped, no-sni, curl-missing, no-baseline
+XRAY_ACTIVE_RELAY_CODE=""   # HTTP code seen via the server (unauth)
+XRAY_ACTIVE_REAL_CODE=""    # HTTP code from the genuine cover site
+XRAY_ACTIVE_MATCH=""        # 1 / 0
+
+# ---- probe 21: per-outbound fleet health matrix (auto on multi-outbound) ----
+# For balancer / multi-outbound configs, tunnel-test each outbound and print a
+# health table (tag | tunnel | RTT) — N xray spawns. Auto-enables when the JSON
+# config has >1 proxy outbound; silent for single-outbound / URL configs.
+# --no-fleet disables; --fleet forces it inside --watch/--from-file loops. The
+# table shows operator-defined tags only, never addresses or ports.
+XRAY_FLEET="${XRAY_FLEET:-1}"        # 1 = auto (self-gates to multi-outbound); 0 = off
+XRAY_FLEET_FORCE="${XRAY_FLEET_FORCE:-0}"  # 1 = run even inside --watch / --from-file loops
+XRAY_FLEET_STATUS=""        # ok, skipped, disabled, xray-missing, jq-missing, single, no-outbounds
+XRAY_FLEET_TOTAL=""         # outbounds tested
+XRAY_FLEET_OK=""            # outbounds whose tunnel reached egress
+XRAY_FLEET_RESULTS=""       # "tag|state|rtt ..." for JSON
 
 # ---------- colors (TTY-aware, suppressed when --quiet) ----------
 
@@ -2346,59 +2396,412 @@ probe_xray_stability() {
   fi
 
   local port="$XRAY_JSON_SOCKS_PORT"
-  local dur="$XRAY_STABILITY_SECONDS" iv="$XRAY_STABILITY_INTERVAL"
-  local total=0 okc=0 first_fail="" rtt rmin="" rmax="" t0 t1
-  local start now elapsed_ms
-  # Per-pulse budget must clear the handshake on each fresh connection.
-  local pulse_to
-  pulse_to=$(( ( ${XRAY_JSON_RTT_MS:-3000} + 999 ) / 1000 + 3 ))
+  local cap="$XRAY_STABILITY_SECONDS" iv="$XRAY_STABILITY_INTERVAL"
+  local total=0 okc=0 killc=0 slowc=0 first_fail="" kill_bytes=""
+  local rtt rmin="" rmax="" t0 t1 start now size url mt rc state hsz
+  # Each pulse is a fresh connection → its budget must clear the handshake
+  # (≈ probe-12 RTT) plus a download window that grows with the pulse size.
+  local hs
+  hs=$(( ( ${XRAY_JSON_RTT_MS:-3000} + 999 ) / 1000 ))
 
-  info "holding tunnel ~${dur}s (real elapsed), pulsing every ${iv}s"
+  info "pulse ladder: ${XRAY_STABILITY_SIZES} bytes (0 = tiny), ≤${cap}s total"
 
   start=$(_now_ms)
-  while : ; do
-    now=$(_now_ms); elapsed_ms=$(( now - start ))
-    [ "$elapsed_ms" -ge "$(( dur * 1000 ))" ] && break
-    total=$(( total + 1 ))
-    t0=$(_now_ms)
-    if curl -sS --max-time "$pulse_to" \
-         --socks5-hostname "127.0.0.1:$port" \
-         -o /dev/null https://cloudflare.com/cdn-cgi/trace 2>/dev/null; then
-      t1=$(_now_ms); rtt=$(( t1 - t0 ))
-      okc=$(( okc + 1 ))
-      [ -z "$rmin" ] && rmin="$rtt"; [ "$rtt" -lt "$rmin" ] && rmin="$rtt"
-      [ -z "$rmax" ] && rmax="$rtt"; [ "$rtt" -gt "$rmax" ] && rmax="$rtt"
-    else
-      now=$(_now_ms)
-      [ -z "$first_fail" ] && first_fail=$(( ( now - start ) / 1000 ))
-    fi
-    # Sleep only if time remains in the window.
+  for size in $XRAY_STABILITY_SIZES; do
+    case "$size" in ''|*[!0-9]*) continue ;; esac
     now=$(_now_ms)
-    [ "$(( now - start ))" -lt "$(( dur * 1000 ))" ] && sleep "$iv"
+    [ "$(( now - start ))" -ge "$(( cap * 1000 ))" ] && { info "  (time cap reached, stopping ladder)"; break; }
+    total=$(( total + 1 ))
+    if [ "$size" = "0" ]; then
+      url="https://cloudflare.com/cdn-cgi/trace"; mt=$(( hs + 8 ))
+    else
+      url="https://speed.cloudflare.com/__down?bytes=${size}"; mt=$(( hs + 8 + size / 131072 ))
+    fi
+    t0=$(_now_ms)
+    curl -sS --max-time "$mt" --socks5-hostname "127.0.0.1:$port" -o /dev/null "$url" 2>/dev/null
+    rc=$?
+    t1=$(_now_ms); rtt=$(( t1 - t0 ))
+    # curl exit codes: 0 ok; 28 timeout (slow, not killed); anything else
+    # (18/52/56/35/55/…) = the connection was reset / closed mid-stream = killed.
+    case "$rc" in
+      0)  state="ok"; okc=$(( okc + 1 ))
+          [ -z "$rmin" ] && rmin="$rtt"; [ "$rtt" -lt "$rmin" ] && rmin="$rtt"
+          [ -z "$rmax" ] && rmax="$rtt"; [ "$rtt" -gt "$rmax" ] && rmax="$rtt" ;;
+      28) state="slow"; slowc=$(( slowc + 1 )) ;;
+      *)  state="killed"; killc=$(( killc + 1 )); [ -z "$kill_bytes" ] && kill_bytes="$size" ;;
+    esac
+    if [ "$state" != "ok" ] && [ -z "$first_fail" ]; then
+      now=$(_now_ms); first_fail=$(( ( now - start ) / 1000 ))
+    fi
+    if [ "$size" = "0" ]; then hsz="tiny"; elif [ "$size" -ge 1048576 ]; then hsz="$(( size / 1048576 ))MB"; else hsz="$(( size / 1024 ))KB"; fi
+    info "  $(printf '%-5s' "$hsz") pulse: ${state}$([ "$state" = ok ] && echo " (${rtt} ms)")"
+    XRAY_STABILITY_RESULTS="${XRAY_STABILITY_RESULTS}${XRAY_STABILITY_RESULTS:+ }${size}|${state}|$([ "$state" = ok ] && echo "$rtt")"
+    sleep "$iv"
   done
 
   XRAY_STABILITY_TOTAL="$total"
   XRAY_STABILITY_OK="$okc"
+  XRAY_STABILITY_KILLED="$killc"
+  XRAY_STABILITY_SLOW="$slowc"
+  XRAY_STABILITY_KILL_BYTES="$kill_bytes"
   XRAY_STABILITY_FIRST_FAIL_S="$first_fail"
   XRAY_STABILITY_RTT_MIN="$rmin"
   XRAY_STABILITY_RTT_MAX="$rmax"
 
+  local kb_h=""
+  if [ -n "$kill_bytes" ]; then
+    if [ "$kill_bytes" = "0" ]; then kb_h="tiny"; elif [ "$kill_bytes" -ge 1048576 ]; then kb_h="$(( kill_bytes / 1048576 ))MB"; else kb_h="$(( kill_bytes / 1024 ))KB"; fi
+  fi
+
   if [ "$total" = "0" ]; then
-    warn "no pulses fit in the window (handshake slower than hold duration)"
+    warn "no pulses ran"
     XRAY_STABILITY_STATUS="unstable"
-  elif [ "$okc" = "$total" ]; then
-    ok "tunnel stable: ${okc}/${total} pulses over ~${dur}s (RTT ${rmin:-?}-${rmax:-?} ms)"
-    info "note: only catches kills within ~${dur}s — raise XRAY_STABILITY_SECONDS to probe for slower kill-shaping"
-    XRAY_STABILITY_STATUS="ok"
-  elif [ "$okc" -gt 0 ] && [ -n "$first_fail" ]; then
-    # Worked, then started failing → classic delayed kill.
-    fail "tunnel died mid-session: ${okc}/${total} pulses ok, first failure ~${first_fail}s in"
+  elif [ "$killc" -gt 0 ] && [ "$okc" -gt 0 ] && [ "$kill_bytes" != "0" ]; then
+    # Smaller pulses passed, a larger one was reset → volumetric kill-shaping.
+    fail "tunnel reset at the ${kb_h} pulse (smaller pulses passed) — volumetric kill-shaping"
     XRAY_STABILITY_STATUS="killed"
-    add_verdict "Tunnel passed the handshake then failed mid-session (~${first_fail}s in) — delayed RST / post-detection kill-shaping. The censor lets the handshake through, classifies the flow as a tunnel, then drops it. Short connection tests miss this; rotate endpoint/cover or shorten session reuse"
+    add_verdict "Tunnel survives small flows but is reset once a transfer reaches ~${kb_h} — volumetric kill-shaping. The censor allows the handshake and trivial traffic, then drops the connection past a byte threshold; trace-only probes never see it. Mitigation: rotate endpoint / cover SNI, add padding, or switch transport"
+  elif [ "$killc" -gt 0 ]; then
+    fail "tunnel reset mid-session (${killc}/${total} pulses killed, first at ${kb_h:-tiny})"
+    XRAY_STABILITY_STATUS="killed"
+    add_verdict "Tunnel connection was reset mid-session (not a timeout) — post-detection kill-shaping / RST injection. Short connection tests miss this; rotate endpoint/cover or change transport"
+  elif [ "$okc" = "$total" ]; then
+    ok "tunnel stable across all ${total} pulses up to the largest size (RTT ${rmin:-?}-${rmax:-?} ms)"
+    XRAY_STABILITY_STATUS="ok"
   else
-    warn "tunnel unstable: only ${okc}/${total} pulses succeeded"
-    XRAY_STABILITY_STATUS="unstable"
-    add_verdict "Tunnel intermittently fails (${okc}/${total} pulses) — flaky path, congested egress, or partial interference; not a clean block"
+    warn "tunnel slow: ${slowc}/${total} pulses timed out (no resets — degraded, not killed)"
+    XRAY_STABILITY_STATUS="slow"
+    add_verdict "Tunnel is slow — ${slowc}/${total} size-ladder pulses timed out but none were reset, so this is degraded throughput / congestion, not active kill-shaping. See probes 13/14 for capacity"
+  fi
+}
+
+# Read a single config field by key. For a --xray-config URL, $1 is a query
+# key; for --xray-config-json, $1 is the jq path under the first reality
+# outbound's settings. Echoes the value (empty if absent). Internal use only —
+# values are never printed by the lint probe, only their shape is reported.
+_xray_cfg_field() {
+  local urlkey="$1" jqpath="$2"
+  if [ -n "$XRAY_CONFIG" ]; then
+    local q=""
+    case "$XRAY_CONFIG" in *\?*) q=${XRAY_CONFIG#*\?}; q=${q%%#*} ;; esac
+    _qp "$q" "$urlkey"
+    return 0
+  fi
+  if [ -n "$XRAY_JSON_CONFIG" ] && [ -r "$XRAY_JSON_CONFIG" ] && command -v jq >/dev/null 2>&1; then
+    jq -r "$jqpath // empty" "$XRAY_JSON_CONFIG" 2>/dev/null | head -1
+  fi
+}
+
+# Probe 18 — config pre-flight lint (static, no network). Surfaces common
+# Reality/VLESS misconfigs that otherwise masquerade as DPI. Advisory: each
+# finding names the protocol knob, never the secret value.
+probe_xray_lint() {
+  if [ -z "$XRAY_CONFIG" ] && [ -z "$XRAY_JSON_CONFIG" ]; then
+    XRAY_LINT_STATUS="skipped"
+    return 0
+  fi
+
+  hdr "18. Config pre-flight (lint)"
+
+  local sec net flow pbk sid sni enc fp findings=""
+  if [ -n "$XRAY_CONFIG" ]; then
+    local q=""
+    case "$XRAY_CONFIG" in *\?*) q=${XRAY_CONFIG#*\?}; q=${q%%#*} ;; esac
+    sec=$(_qp "$q" security); net=$(_qp "$q" type); flow=$(_qp "$q" flow)
+    pbk=$(_qp "$q" pbk); sid=$(_qp "$q" sid); sni=$(_qp "$q" sni)
+    enc=$(_qp "$q" encryption); fp=$(_qp "$q" fp)
+    [ -z "$net" ] && net=tcp
+  else
+    sec=$(_xray_cfg_field security '.outbounds[0].streamSettings.security')
+    net=$(_xray_cfg_field type     '.outbounds[0].streamSettings.network')
+    flow=$(_xray_cfg_field flow    '.outbounds[0].settings.vnext[0].users[0].flow')
+    pbk=$(_xray_cfg_field pbk      '.outbounds[0].streamSettings.realitySettings.publicKey')
+    sid=$(_xray_cfg_field sid      '.outbounds[0].streamSettings.realitySettings.shortId')
+    sni=$(_xray_cfg_field sni      '.outbounds[0].streamSettings.realitySettings.serverName')
+    enc=$(_xray_cfg_field encryption '.outbounds[0].settings.vnext[0].users[0].encryption')
+    fp=$(_xray_cfg_field fp        '.outbounds[0].streamSettings.realitySettings.fingerprint')
+    [ -z "$net" ] && net=tcp
+  fi
+
+  # Join findings with a real newline (JSON emit splits on "\n").
+  _lint_add() {
+    warn "$1"
+    if [ -n "$findings" ]; then
+      findings="$findings
+$1"
+    else
+      findings="$1"
+    fi
+  }
+
+  # flow=vision requires TCP transport.
+  if [ -n "$flow" ] && [ "$net" != "tcp" ]; then
+    _lint_add "flow=$flow requires network=tcp, but network=$net — handshake will fail"
+  fi
+  if [ "$sec" = "reality" ]; then
+    [ -z "$pbk" ] && _lint_add "security=reality but publicKey (pbk) is missing"
+    if [ -n "$sid" ]; then
+      case "$sid" in
+        *[!0-9a-fA-F]*) _lint_add "shortId (sid) is not valid hex" ;;
+        *) [ "${#sid}" -gt 16 ] && _lint_add "shortId (sid) is longer than 16 hex chars (max 8 bytes)" ;;
+      esac
+    fi
+    if [ -z "$sni" ]; then
+      _lint_add "security=reality but serverName (sni) is empty"
+    else
+      case "$sni" in
+        *[!0-9.]*) : ;;  # has non-numeric/non-dot → a hostname, good
+        *) _lint_add "serverName (sni) looks like a bare IP — Reality cover must be a domain" ;;
+      esac
+    fi
+    [ -z "$fp" ] && _lint_add "no uTLS fingerprint (fp) set — a real-browser fp is recommended for Reality"
+  fi
+  # vless wants encryption=none.
+  if [ -n "$enc" ] && [ "$enc" != "none" ]; then
+    case "$XRAY_CONFIG$XRAY_JSON_CONFIG" in
+      vless*|*vless*) _lint_add "vless requires encryption=none, got encryption=$enc" ;;
+    esac
+  fi
+
+  XRAY_LINT_FINDINGS="$findings"
+  if [ -z "$findings" ]; then
+    ok "config shape sane — no obvious Reality/VLESS misconfig"
+    XRAY_LINT_STATUS="ok"
+  else
+    XRAY_LINT_STATUS="warn"
+    add_verdict "Config pre-flight found a likely misconfiguration (see probe 18) — fix it before blaming the network; these typos commonly masquerade as DPI/handshake failures"
+  fi
+}
+
+# Convert an HTTP Date header value to epoch seconds (GNU and BSD date).
+_epoch_from_httpdate() {
+  local s="$1"
+  if date -d "now" >/dev/null 2>&1; then
+    date -d "$s" +%s 2>/dev/null
+  else
+    TZ=UTC date -j -f "%a, %d %b %Y %H:%M:%S GMT" "$s" +%s 2>/dev/null
+  fi
+}
+
+# Probe 19 — clock skew. Reality authentication is time-windowed, so a client
+# clock off by minutes fails the handshake exactly like a fingerprint block.
+probe_clock_skew() {
+  if [ -z "$XRAY_CONFIG" ] && [ -z "$XRAY_JSON_CONFIG" ]; then
+    XRAY_CLOCK_STATUS="skipped"
+    return 0
+  fi
+
+  hdr "19. Clock skew (Reality auth is time-windowed)"
+
+  if ! check_cmd curl; then
+    warn "skipping — curl not available"
+    XRAY_CLOCK_STATUS="unknown"
+    return 0
+  fi
+
+  local hdrs server_date server_epoch local_epoch skew host
+  for host in "$BASELINE_DOMAIN" cloudflare.com www.google.com; do
+    hdrs=$(curl -sSI --max-time "$TIMEOUT" "https://$host/" 2>/dev/null)
+    server_date=$(printf '%s' "$hdrs" | grep -i '^date:' | head -1 | sed -E 's/^[Dd]ate:[[:space:]]*//' | tr -d '\r')
+    [ -n "$server_date" ] && break
+  done
+
+  if [ -z "$server_date" ]; then
+    warn "could not fetch a reference time (no HTTPS Date header reachable)"
+    XRAY_CLOCK_STATUS="unknown"
+    return 0
+  fi
+
+  server_epoch=$(_epoch_from_httpdate "$server_date")
+  local_epoch=$(date +%s)
+  case "$server_epoch" in
+    ''|*[!0-9]*) warn "could not parse reference time"; XRAY_CLOCK_STATUS="unknown"; return 0 ;;
+  esac
+
+  skew=$(( local_epoch - server_epoch ))
+  XRAY_CLOCK_SKEW_S="$skew"
+  local abs="$skew"; [ "$abs" -lt 0 ] && abs=$(( -abs ))
+
+  if [ "$abs" -le 60 ]; then
+    ok "clock within ${abs}s of network time — fine for Reality"
+    XRAY_CLOCK_STATUS="ok"
+  else
+    fail "local clock is ${skew}s off network time"
+    XRAY_CLOCK_STATUS="skew"
+    add_verdict "Local clock is ${skew}s off real time — Reality auth is time-windowed and will reject handshakes at this skew, which looks identical to a fingerprint block. Sync the clock (NTP) before diagnosing further"
+  fi
+}
+
+# Probe 20 — active-probe resistance. Probe 15 checks the cover cert; this
+# checks the cover BEHAVIOUR the way a censor does: make a real HTTPS request
+# to the server using the cover SNI and compare the response to the genuine
+# cover site. A real Reality server relays unauth clients to dest → matching
+# response; a fake one errors / mismatches. Output: match boolean + codes.
+probe_xray_active_probe() {
+  local sni
+  sni=$(_xray_cover_sni)
+  if [ -z "$sni" ]; then
+    XRAY_ACTIVE_STATUS="skipped"
+    return 0
+  fi
+
+  hdr "20. Active-probe resistance (cover behaviour)"
+  info "unauthenticated HTTP probe (what an active prober sends)"
+
+  if ! check_cmd curl; then
+    warn "skipping — curl not available"
+    XRAY_ACTIVE_STATUS="curl-missing"
+    return 0
+  fi
+
+  # Genuine cover response, out-of-band (the real site).
+  XRAY_ACTIVE_REAL_CODE=$(curl -sS --max-time "$TIMEOUT" -o /dev/null \
+    -w '%{http_code}' "https://$sni/" 2>/dev/null)
+  case "$XRAY_ACTIVE_REAL_CODE" in
+    ''|000) warn "genuine cover site unreachable from here — cannot baseline"; XRAY_ACTIVE_STATUS="no-baseline"; return 0 ;;
+  esac
+
+  # Same request, but forced to the VPN server IP with the cover SNI/Host.
+  # -k because a (broken) server may present a self-signed cert; we care about
+  # whether a coherent HTTP response comes back, not cert validity here.
+  XRAY_ACTIVE_RELAY_CODE=$(curl -sS -k --max-time "$TIMEOUT" -o /dev/null \
+    --resolve "$sni:443:$VPN_HOST" \
+    -w '%{http_code}' "https://$sni/" 2>/dev/null)
+  [ -z "$XRAY_ACTIVE_RELAY_CODE" ] && XRAY_ACTIVE_RELAY_CODE=000
+
+  info "cover behaviour: relay-code=${XRAY_ACTIVE_RELAY_CODE}, genuine-code=${XRAY_ACTIVE_REAL_CODE}"
+
+  if [ "$XRAY_ACTIVE_RELAY_CODE" = "$XRAY_ACTIVE_REAL_CODE" ]; then
+    XRAY_ACTIVE_MATCH=1
+    ok "server relays unauth probes to the genuine cover (responses match) → active-probe resistant"
+    XRAY_ACTIVE_STATUS="ok"
+  elif [ "$XRAY_ACTIVE_RELAY_CODE" = "000" ]; then
+    XRAY_ACTIVE_MATCH=0
+    fail "server returns no coherent HTTP to an unauth prober → not relaying to the cover"
+    XRAY_ACTIVE_STATUS="exposed"
+    add_verdict "Server fails active probing — an unauthenticated HTTPS request does not get relayed to the genuine cover site (no coherent response), so it does not behave like the site it impersonates. Combined with the cover-cert check (probe 15) this is a strong VPN fingerprint. Fix the Reality 'dest'/'serverNames' so unauth clients are proxied to the real cover"
+  else
+    XRAY_ACTIVE_MATCH=0
+    warn "server's unauth response differs from the genuine cover (relay=${XRAY_ACTIVE_RELAY_CODE} vs ${XRAY_ACTIVE_REAL_CODE})"
+    XRAY_ACTIVE_STATUS="mismatch"
+    add_verdict "Server's response to an unauthenticated prober differs from the genuine cover site — partial mimicry that a determined active prober can distinguish. Verify Reality 'dest' points at the exact cover host the client's serverName expects"
+  fi
+}
+
+# Tunnel-test one synthesized single-outbound config: launch xray, probe
+# cloudflare trace through its socks inbound, echo "ok|<rtt_ms>" or "fail".
+# Self-contained lifecycle (own pid + tempfiles) so the fleet loop can repeat.
+_fleet_test_one() {
+  local cfg_src="$1" tag="$2" socks_port pid log base patched rc trace rtt t0 t1 ready i
+  socks_port=$(_find_free_port) || { printf 'fail'; return 0; }
+  # xray-core picks its parser by extension, so the patched config needs .json.
+  base=$(mktemp -t detect_blocking.fleet.XXXXXX) || { printf 'fail'; return 0; }
+  patched="${base}.json"
+  if ! mv "$base" "$patched" 2>/dev/null; then rm -f "$base"; printf 'fail'; return 0; fi
+  if ! jq --arg t "$tag" --argjson p "$socks_port" '
+        .inbounds = [{ tag:"socks", listen:"127.0.0.1", port:$p, protocol:"socks", settings:{auth:"noauth", udp:true} }]
+        | .outbounds = ([ .outbounds[] | select(.tag == $t) ] + [ {protocol:"freedom", tag:"direct"} ])
+        | del(.routing) | del(.observatory)
+      ' "$cfg_src" > "$patched" 2>/dev/null; then
+    rm -f "$patched"; printf 'fail'; return 0
+  fi
+  log=$(mktemp -t detect_blocking.fleetlog.XXXXXX)
+  xray run -c "$patched" >"$log" 2>&1 &
+  pid=$!
+  ready=0
+  for i in $(seq 1 $(( TIMEOUT * 5 + 10 ))); do
+    nc -z 127.0.0.1 "$socks_port" 2>/dev/null && { ready=1; break; }
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.2
+  done
+  if [ "$ready" -eq 1 ]; then
+    t0=$(_now_ms)
+    trace=$(curl -sS --max-time "$(( ( ${XRAY_JSON_RTT_MS:-3000} + 999 ) / 1000 + TIMEOUT ))" \
+            --socks5-hostname "127.0.0.1:$socks_port" \
+            https://cloudflare.com/cdn-cgi/trace 2>/dev/null)
+    t1=$(_now_ms); rtt=$(( t1 - t0 ))
+    if printf '%s' "$trace" | grep -q '^h=cloudflare\.com'; then
+      rc="ok|$rtt"
+    else
+      rc="fail"
+    fi
+  else
+    rc="fail"
+  fi
+  kill "$pid" 2>/dev/null; for i in 1 2 3; do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done; kill -9 "$pid" 2>/dev/null
+  rm -f "$patched" "$log" 2>/dev/null
+  printf '%s' "$rc"
+}
+
+# Probe 21 — per-outbound fleet health matrix (opt-in --fleet). For a
+# multi-outbound JSON config, tunnel-test each proxy outbound and print a
+# health table keyed by the operator-defined tag (never address/port).
+probe_xray_fleet() {
+  if [ "$XRAY_FLEET" = "0" ]; then
+    XRAY_FLEET_STATUS="disabled"
+    return 0
+  fi
+  # Auto-detect: only multi-outbound JSON configs are worth fanning out. URL
+  # form / single-outbound / no-jq → stay silent (no header, no work).
+  if [ -z "$XRAY_JSON_CONFIG" ] || [ ! -r "$XRAY_JSON_CONFIG" ]; then
+    XRAY_FLEET_STATUS="skipped"
+    return 0
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    XRAY_FLEET_STATUS="jq-missing"
+    return 0
+  fi
+
+  local tags count
+  tags=$(jq -r '.outbounds // [] | map(select(.settings.vnext != null or .settings.servers != null)) | .[].tag // empty' "$XRAY_JSON_CONFIG" 2>/dev/null)
+  count=$(printf '%s\n' "$tags" | grep -c .)
+  if [ -z "$tags" ] || [ "$count" -le 1 ]; then
+    # Single-outbound (or none) — not a fleet; nothing to do, stay quiet.
+    XRAY_FLEET_STATUS="single"
+    return 0
+  fi
+
+  hdr "21. Per-outbound fleet health matrix"
+  info "auto-detected ${count} outbounds — testing each (one xray spawn each; this can take a while)"
+
+  if ! check_cmd xray; then warn "skipping — xray not in PATH"; XRAY_FLEET_STATUS="xray-missing"; return 0; fi
+
+  # Heavy (N spawns): auto-skip inside --watch / --from-file loops unless forced.
+  if [ "${XRAY_FLEET_FORCE:-0}" != "1" ] \
+     && { [ "${_WATCH_CHILD:-0}" = "1" ] || [ "${_BATCH_CHILD:-0}" = "1" ]; }; then
+    info "skipped in watch/batch loop (${count} xray spawns) — pass --fleet to force"
+    XRAY_FLEET_STATUS="skipped-loop"
+    return 0
+  fi
+
+  local tag n=0 okc=0 res rtt state
+  while IFS= read -r tag; do
+    [ -z "$tag" ] && continue
+    n=$(( n + 1 ))
+    res=$(_fleet_test_one "$XRAY_JSON_CONFIG" "$tag")
+    if [ "${res%%|*}" = "ok" ]; then
+      rtt="${res#*|}"; state="ok"; okc=$(( okc + 1 ))
+      info "  $(printf '%-12s' "$tag") [OK]   RTT ${rtt} ms"
+    else
+      rtt=""; state="fail"
+      info "  $(printf '%-12s' "$tag") [FAIL] tunnel unreachable"
+    fi
+    XRAY_FLEET_RESULTS="${XRAY_FLEET_RESULTS}${XRAY_FLEET_RESULTS:+ }${tag}|${state}|${rtt}"
+  done <<EOF
+$tags
+EOF
+
+  XRAY_FLEET_TOTAL="$count"
+  XRAY_FLEET_OK="$okc"
+  XRAY_FLEET_STATUS="ok"
+  if [ "$okc" = "$count" ]; then
+    ok "all ${count} outbounds healthy"
+  elif [ "$okc" = "0" ]; then
+    fail "0/${count} outbounds reachable — fleet-wide failure (check the shared config knobs: cover/serverName, keys, flow)"
+    add_verdict "Every outbound in the fleet fails the tunnel test — the problem is in the shared configuration (serverName/cover, keys, flow), not a single dead endpoint"
+  else
+    warn "${okc}/${count} outbounds healthy — partial fleet degradation"
+    add_verdict "${okc} of ${count} fleet outbounds pass — the rest are down; rotate or repair the failing endpoints (see the matrix above by tag)"
   fi
 }
 
@@ -2548,9 +2951,25 @@ _emit_json() {
     --arg xst_status        "$XRAY_STABILITY_STATUS" \
     --arg xst_total         "$XRAY_STABILITY_TOTAL" \
     --arg xst_ok            "$XRAY_STABILITY_OK" \
+    --arg xst_killed        "$XRAY_STABILITY_KILLED" \
+    --arg xst_slow          "$XRAY_STABILITY_SLOW" \
+    --arg xst_killbytes     "$XRAY_STABILITY_KILL_BYTES" \
+    --arg xst_results       "$XRAY_STABILITY_RESULTS" \
     --arg xst_firstfail     "$XRAY_STABILITY_FIRST_FAIL_S" \
     --arg xst_rttmin        "$XRAY_STABILITY_RTT_MIN" \
     --arg xst_rttmax        "$XRAY_STABILITY_RTT_MAX" \
+    --arg xl_status         "$XRAY_LINT_STATUS" \
+    --arg xl_findings       "$XRAY_LINT_FINDINGS" \
+    --arg xck_status        "$XRAY_CLOCK_STATUS" \
+    --arg xck_skew          "$XRAY_CLOCK_SKEW_S" \
+    --arg xap_status        "$XRAY_ACTIVE_STATUS" \
+    --arg xap_relay         "$XRAY_ACTIVE_RELAY_CODE" \
+    --arg xap_real          "$XRAY_ACTIVE_REAL_CODE" \
+    --arg xap_match         "$XRAY_ACTIVE_MATCH" \
+    --arg xf_status         "$XRAY_FLEET_STATUS" \
+    --arg xf_total          "$XRAY_FLEET_TOTAL" \
+    --arg xf_ok             "$XRAY_FLEET_OK" \
+    --arg xf_results        "$XRAY_FLEET_RESULTS" \
     --argjson verdicts      "$verdicts_json" '
     def words: split(" ") | map(select(length > 0));
     def opt(s): if s == "" then null else s end;
@@ -2688,9 +3107,44 @@ _emit_json() {
           status: opt($xst_status),
           pulses_total: (if $xst_total == "" then null else ($xst_total | tonumber? // null) end),
           pulses_ok: (if $xst_ok == "" then null else ($xst_ok | tonumber? // null) end),
+          pulses_killed: (if $xst_killed == "" then null else ($xst_killed | tonumber? // null) end),
+          pulses_slow: (if $xst_slow == "" then null else ($xst_slow | tonumber? // null) end),
+          kill_at_bytes: (if $xst_killbytes == "" then null else ($xst_killbytes | tonumber? // null) end),
           first_failure_seconds: (if $xst_firstfail == "" then null else ($xst_firstfail | tonumber? // null) end),
           rtt_min_ms: (if $xst_rttmin == "" then null else ($xst_rttmin | tonumber? // null) end),
-          rtt_max_ms: (if $xst_rttmax == "" then null else ($xst_rttmax | tonumber? // null) end)
+          rtt_max_ms: (if $xst_rttmax == "" then null else ($xst_rttmax | tonumber? // null) end),
+          per_pulse: (
+            if $xst_results == "" then []
+            else ($xst_results | split(" ") | map(select(length > 0) | split("|")
+                  | { bytes: (.[0] | tonumber? // null), state: .[1],
+                      rtt_ms: (if (.[2] // "") == "" then null else (.[2] | tonumber? // null) end) }))
+            end
+          )
+        },
+        xray_lint: {
+          status: opt($xl_status),
+          findings: (if $xl_findings == "" then [] else ($xl_findings | split("\n") | map(select(length > 0))) end)
+        },
+        xray_clock: {
+          status: opt($xck_status),
+          skew_seconds: (if $xck_skew == "" then null else ($xck_skew | tonumber? // null) end)
+        },
+        xray_active_probe: {
+          status: opt($xap_status),
+          relay_http_code: opt($xap_relay),
+          genuine_http_code: opt($xap_real),
+          matches_cover: tri_bool(($xap_match | tonumber? // -1))
+        },
+        xray_fleet: {
+          status: opt($xf_status),
+          outbounds_total: (if $xf_total == "" then null else ($xf_total | tonumber? // null) end),
+          outbounds_ok: (if $xf_ok == "" then null else ($xf_ok | tonumber? // null) end),
+          per_outbound: (
+            if $xf_results == "" then []
+            else ($xf_results | split(" ") | map(select(length > 0) | split("|")
+                  | { tag: .[0], state: .[1], rtt_ms: (.[2] | tonumber? // null) }))
+            end
+          )
         }
       },
       verdicts: $verdicts
@@ -2782,6 +3236,10 @@ _should_run openvpn && probe_openvpn
 _should_run control && probe_known_blocked
 _should_run ipv6    && probe_ipv6
 _should_run compare && probe_compare_matrix
+# Pre-flight (static / cheap) first: a config typo or clock skew should surface
+# before the slow network probes, not masquerade as DPI three screens down.
+{ _should_run xray || _should_run xrayjson; } && probe_xray_lint
+{ _should_run xray || _should_run xrayjson; } && probe_clock_skew
 _should_run xray    && probe_xray_protocol
 _should_run xrayjson && probe_xray_json
 _should_run xrayjson && probe_xray_throughput
@@ -2789,6 +3247,8 @@ _should_run xrayjson && probe_xray_speedtest
 { _should_run xray || _should_run xrayjson; } && probe_xray_cover
 _should_run xrayjson && probe_xray_egress
 _should_run xrayjson && probe_xray_stability
+{ _should_run xray || _should_run xrayjson; } && probe_xray_active_probe
+_should_run xrayjson && probe_xray_fleet
 
 # ---------- summary ----------
 

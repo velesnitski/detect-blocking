@@ -1,17 +1,35 @@
 # detect-blocking
 
 A single-file Bash diagnostic that classifies **what kind of network filtering**
-is preventing a VPN endpoint from working — DNS poisoning, IP blocks,
-SNI-based DPI, mid-handshake RST injection, silent drops, UDP/QUIC bans,
-OpenVPN signature blocks, authenticated end-to-end protocol tests (via
-optional `xray-knife` delegation), full-fidelity tunnel boot through your
-real `xray-core` config, and **data-plane throughput probing** that
-catches cover-SNI traffic shaping the handshake-only tests miss.
-Supported protocols: Reality / VLESS / VMess / Trojan / Shadowsocks-2022
-/ Hysteria2.
+is preventing a VPN endpoint from working — and, for Xray/Reality stacks, how
+healthy, stealthy and stable the tunnel actually is.
+
+At the transport layer it pins down DNS poisoning, IP blocks, SNI-based DPI,
+mid-handshake RST injection, silent drops, UDP/QUIC bans and OpenVPN signature
+blocks. For **Reality / VLESS / VMess / Trojan / Shadowsocks-2022 / Hysteria2**
+it goes further, across six dimensions:
+
+- **Reachability** — authenticated end-to-end test via `xray-knife`, plus a
+  full-fidelity boot of your real `xray-core` config (or one synthesized from
+  a share link) through a local SOCKS inbound.
+- **Performance** — single-stream shaping detection + a multi-stream,
+  multi-endpoint capacity estimate (defeats single-stream under-reporting).
+- **Stealth** — is the Reality cover real, or a self-signed/mismatched fake an
+  active prober flags instantly? Does the server *behave* like the cover site
+  under an unauthenticated probe?
+- **Integrity** — egress geo + datacenter/proxy reputation flags + DNS region.
+- **Stability** — an escalating size-ladder that catches **volumetric
+  kill-shaping** (small flows allowed, large flows reset).
+- **Correctness** — a static config linter and a clock-skew check that catch
+  the typos and time drift that otherwise masquerade as DPI.
+
+Plus a per-outbound **fleet matrix** that auto-enables on balancer configs and
+tells a single dead endpoint apart from a fleet-wide fault.
 
 Built for operators who need to answer one question fast: *"is my server
-blocked, and if so, by what mechanism?"*
+blocked, and if so, by what mechanism — and if not, why does it still feel
+broken?"* Every Xray verdict is designed to be **safe to share**: booleans,
+counts and status codes only, never a secret, cover domain, or egress IP.
 
 [![Test](https://github.com/velesnitski/detect-blocking/actions/workflows/test.yml/badge.svg)](https://github.com/velesnitski/detect-blocking/actions/workflows/test.yml)
 [![Release](https://img.shields.io/github/v/release/velesnitski/detect-blocking?sort=semver&color=blue)](https://github.com/velesnitski/detect-blocking/releases)
@@ -22,8 +40,9 @@ blocked, and if so, by what mechanism?"*
 
 ## What it does
 
-Runs a deterministic 13-stage probe chain from your local machine to a target
-endpoint and emits a clearly labelled verdict for each detected blocking type.
+Runs a deterministic probe chain (transport → protocol → stealth → integrity
+→ stability → correctness) from your local machine to a target endpoint and
+emits a clearly labelled verdict for each detected issue.
 
 | # | Probe | Detects |
 |---|-------|---------|

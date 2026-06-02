@@ -28,7 +28,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.5.9"
+readonly DETECT_BLOCKING_VERSION="0.6.0"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -640,6 +640,12 @@ XRAY_COVERTHR_BASE_BPS=""   # bytes/sec fetching the neutral baseline
 XRAY_DETECT_STATUS=""       # ok, skipped
 XRAY_DETECT_SCORE=""        # 0-100 (higher = more detectable)
 XRAY_DETECT_BAND=""         # low | moderate | high | critical
+
+# Passive structural signals folded into probe 26's score (set there): the
+# cover SNI served on a non-443 port, and the server IP not on the cover
+# domain's network (SNI↔IP ASN mismatch). FP-prone for censors at scale, real.
+XRAY_PASSIVE_PORT_STD=""    # 1 / 0 — cover served on the standard 443
+XRAY_PASSIVE_ASN_MATCH=""   # 1 / 0 / "" — server IP on the cover's network (or undetermined)
 
 # ---- baseline / diff mode (longitudinal regression detection) ----
 # --save-baseline FILE writes this run's share-safe JSON; --diff-baseline FILE
@@ -3272,14 +3278,17 @@ probe_xray_coverthrottle() {
   fi
 }
 
-# Probe 26 — detectability score. Folds the stealth signals (probes 15/20/24)
-# into one 0-100 fingerprintability score so a fleet can be triaged at a glance.
-# Higher = more detectable. Pure synthesis, no network.
+# Probe 26 — detectability score. THE FINAL SYNTHESIS: folds every detection
+# signal — ACTIVE probing (15 cover cert / 20 active-probe / 24 TLS parity) AND
+# PASSIVE structure (cover served on a non-443 port; server IP not on the cover
+# domain's network, i.e. SNI↔IP ASN mismatch) — into one 0-100 fingerprintability
+# score. Active tells weigh heaviest; passive tells are real but FP-prone for a
+# censor at scale, so they weigh less. Always runs last.
 probe_xray_detectability() {
   # Only meaningful when the stealth probes ran (a Reality config was present).
   case "$XRAY_COVER_STATUS" in ''|skipped) XRAY_DETECT_STATUS="skipped"; return 0 ;; esac
 
-  hdr "26. Detectability score (stealth synthesis)"
+  hdr "26. Detectability score (active + passive synthesis)"
 
   local score=0
 
@@ -3317,6 +3326,34 @@ probe_xray_detectability() {
   esac
   score=$(( score + tls_pts ))
 
+  # --- passive structure: non-443 port + SNI↔IP network (no active probe) ---
+  # Weighted low: real tells, but FP-prone for a censor at scale (legit CDN /
+  # domain fronting mismatches too), so they rarely block on them alone.
+  local port_pts=0 port_desc
+  if [ "$VPN_PORT_TCP" = "443" ]; then
+    XRAY_PASSIVE_PORT_STD=1; port_desc="standard (443)"
+  else
+    XRAY_PASSIVE_PORT_STD=0; port_pts=10; port_desc="non-standard (real cover sites use 443)"
+  fi
+  score=$(( score + port_pts ))
+
+  local sni_pts=0 sni_desc="not evaluated"
+  local sni="" srv_ip cov_ip srv_asn cov_asn
+  sni=$(_xray_cover_sni)
+  if [ -n "$sni" ] && check_cmd curl; then
+    srv_ip=$(_resolve_a_records "$VPN_HOST" 2>/dev/null | _first_word)
+    cov_ip=$(_resolve_a_records "$sni" 2>/dev/null | _first_word)
+    srv_asn=$(_asn_of "$srv_ip"); cov_asn=$(_asn_of "$cov_ip")
+    if [ -n "$srv_asn" ] && [ -n "$cov_asn" ]; then
+      if [ "$srv_asn" = "$cov_asn" ]; then
+        XRAY_PASSIVE_ASN_MATCH=1; sni_desc="server IP on the cover's network"
+      else
+        XRAY_PASSIVE_ASN_MATCH=0; sni_pts=10; sni_desc="server IP NOT on the cover's network (ASN mismatch)"
+      fi
+    fi
+  fi
+  score=$(( score + sni_pts ))
+
   [ "$score" -gt 100 ] && score=100
   XRAY_DETECT_SCORE="$score"
   if   [ "$score" -ge 70 ]; then XRAY_DETECT_BAND="critical"
@@ -3326,19 +3363,34 @@ probe_xray_detectability() {
   XRAY_DETECT_STATUS="ok"
 
   # Component breakdown — always shown, so the score is never a black box.
-  info "$(printf 'cover cert (15):   %-42s +%d' "$cover_desc" "$cover_pts")"
-  info "$(printf 'active-probe (20): %-42s +%d' "$active_desc" "$active_pts")"
-  info "$(printf 'TLS parity (24):   %-42s +%d' "$tls_desc" "$tls_pts")"
+  info "$(printf 'active · cover cert (15):   %-38s +%d' "$cover_desc" "$cover_pts")"
+  info "$(printf 'active · active-probe (20): %-38s +%d' "$active_desc" "$active_pts")"
+  info "$(printf 'active · TLS parity (24):   %-38s +%d' "$tls_desc" "$tls_pts")"
+  info "$(printf 'passive · port:             %-38s +%d' "$port_desc" "$port_pts")"
+  info "$(printf 'passive · SNI↔IP network:   %-38s +%d' "$sni_desc" "$sni_pts")"
   info "bands: 0-14 low · 15-39 moderate · 40-69 high · 70-100 critical"
 
   if [ "$score" -ge 40 ]; then
-    fail "detectability ${score}/100 (${XRAY_DETECT_BAND}) — an active prober would flag this server"
-    add_verdict "Detectability ${score}/100 (${XRAY_DETECT_BAND}) — the stealth signals (probes 15/20/24) combine into a strong fingerprint. Fix the cover relay (real 'dest'/'serverNames') to drop the score; see the individual probes for specifics"
+    fail "detectability ${score}/100 (${XRAY_DETECT_BAND}) — a censor would flag this server"
+    add_verdict "Detectability ${score}/100 (${XRAY_DETECT_BAND}) — active and/or passive signals combine into a strong fingerprint. Fix the cover relay (real 'dest'/'serverNames'), serve on 443, and pick a cover on a large shared CDN; see the breakdown for which signals fired"
   elif [ "$score" -ge 15 ]; then
     warn "detectability ${score}/100 (${XRAY_DETECT_BAND}) — partially fingerprintable; see the breakdown above"
+    add_verdict "Detectability ${score}/100 (${XRAY_DETECT_BAND}) — active probing may be clean, but passive structure (port / SNI↔IP) still leaves a fingerprint. These are FP-prone for a censor at scale, but a targeted check catches them: serve on 443 and choose a cover hosted on a large shared CDN"
   else
-    ok "detectability ${score}/100 (${XRAY_DETECT_BAND}) — every stealth check passed, blends in"
+    ok "detectability ${score}/100 (${XRAY_DETECT_BAND}) — every active and passive check passed, blends in"
   fi
+}
+
+# Echo the ASN ("AS<number>") of an IP, via ip-api (HTTP) then ipinfo (HTTPS).
+# Direct lookup (not through the tunnel) — used to compare networks.
+_asn_of() {
+  local ip="$1" a=""
+  [ -n "$ip" ] || return 0
+  a=$(curl -sS --max-time "$TIMEOUT" "http://ip-api.com/json/${ip}?fields=as" 2>/dev/null \
+      | sed -nE 's/.*"as":"(AS[0-9]+).*/\1/p' | head -1)
+  [ -z "$a" ] && a=$(curl -sS --max-time "$TIMEOUT" "https://ipinfo.io/${ip}/json" 2>/dev/null \
+      | sed -nE 's/.*"org":[[:space:]]*"(AS[0-9]+).*/\1/p' | head -1)
+  printf '%s' "$a"
 }
 
 probe_ipv6() {
@@ -3524,6 +3576,8 @@ _emit_json() {
     --arg xd_status         "$XRAY_DETECT_STATUS" \
     --arg xd_score          "$XRAY_DETECT_SCORE" \
     --arg xd_band           "$XRAY_DETECT_BAND" \
+    --arg xpf_port_std      "$XRAY_PASSIVE_PORT_STD" \
+    --arg xpf_asn_match     "$XRAY_PASSIVE_ASN_MATCH" \
     --argjson verdicts      "$verdicts_json" '
     def words: split(" ") | map(select(length > 0));
     def opt(s): if s == "" then null else s end;
@@ -3726,7 +3780,9 @@ _emit_json() {
         xray_detectability: {
           status: opt($xd_status),
           score: (if $xd_score == "" then null else ($xd_score | tonumber? // null) end),
-          band: opt($xd_band)
+          band: opt($xd_band),
+          port_standard: tri_bool(($xpf_port_std | tonumber? // -1)),
+          sni_ip_asn_match: tri_bool(($xpf_asn_match | tonumber? // -1))
         }
       },
       verdicts: $verdicts
@@ -3905,6 +3961,8 @@ _should_run xrayjson && probe_xray_bufferbloat
 { _should_run xray || _should_run xrayjson; } && probe_xray_mtu
 { _should_run xray || _should_run xrayjson; } && probe_xray_tls_parity
 { _should_run xray || _should_run xrayjson; } && probe_xray_coverthrottle
+# Detectability is the FINAL synthesis (active probes 15/20/24 + passive
+# port / SNI↔IP signals) — always run it last.
 { _should_run xray || _should_run xrayjson; } && probe_xray_detectability
 
 # ---------- summary ----------

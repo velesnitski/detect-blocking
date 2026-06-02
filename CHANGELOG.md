@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-06-02
+
+### Changed
+
+- **Probe 26 is now the single, final, comprehensive detectability score —
+  active + passive.** Previously it synthesized only the active-probe signals
+  (15 cover cert / 20 active-probe / 24 TLS parity); a server could score
+  0/100 yet still be trivially fingerprintable by **passive** structure. Probe
+  26 now also folds in two passive tells and always runs last:
+  - the cover SNI served on a **non-standard port** (real cover sites use 443) → +10;
+  - the server IP **not on the cover domain's network** (SNI↔IP ASN mismatch,
+    via a direct ASN cross-check) → +10.
+
+  Passive tells weigh less than active ones because they're false-positive-prone
+  for a censor at scale (legit CDN / domain-fronting traffic mismatches too) —
+  but they're real, and a targeted check catches them. The breakdown labels
+  each signal `active ·` / `passive ·` with its points. So a perfectly
+  active-cloaked server on a non-443 port whose IP isn't on the cover's network
+  now reads **20/100 (moderate)** with the specific tells, instead of a
+  misleading 0/100. JSON `xray_detectability` gains `port_standard` and
+  `sni_ip_asn_match`. New test `tests/test_detectability.sh`. Suite now 17.
+
 ## [0.5.9] - 2026-06-02
 
 ### Fixed

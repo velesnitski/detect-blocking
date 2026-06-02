@@ -28,7 +28,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.6.0"
+readonly DETECT_BLOCKING_VERSION="0.6.1"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -1356,7 +1356,7 @@ probe_tls_handshake() {
 
   if [ "$with_sni" -eq 0 ] && [ "$frag_sni" -gt 0 ]; then
     fail "fragmented TLS bypasses block → DPI does not reassemble TLS records"
-    add_verdict "DPI bypassable via TLS-record fragmentation (use small-record / split-SNI client)"
+    add_verdict "DPI bypassable via TLS-record fragmentation — run a client-side DPI-desync proxy (see recommendation)"
   elif [ "$with_sni" -eq 0 ] && [ "$no_sni" -gt 0 ]; then
     fail "DPI dies only when our SNI is sent → SNI-BASED BLOCKING"
     add_verdict "SNI-based DPI block – server name is in censor blacklist"
@@ -4018,7 +4018,7 @@ else
       *"IP route"*)               rec="rotate to a fresh IP / different /24" ;;
       *"Port 443"*)               rec="try TCP 8443, 2083, 2053 (Cloudflare-allowed ports)" ;;
       *"TLS DPI"*)                rec="switch to a non-TLS transport (Hysteria2, IKEv2, WG)" ;;
-      *"TLS-record fragmentation"*) rec="exploit naive DPI reassembly: enable record splitting in your client (e.g. byedpi, GreenTunnel, custom uTLS profile)" ;;
+      *"TLS-record fragmentation"*) rec="this block ignores fragmented ClientHellos — run a DPI-desync proxy: ByeDPI/ciadpi (desktop SOCKS), ByeDPIAndroid (Android), or zapret/GoodbyeDPI. Start with TLS-record split (--tlsrec/--split, what this probe confirmed); if a stricter DPI needs more, escalate to fake-packet+TTL (--fake --ttl) or --disorder" ;;
       *"RST injection"*)          rec="use uTLS-mimicked client, fragmentation, or non-TCP" ;;
       *"Silent packet"*)          rec="likely full IP block, rotate endpoint" ;;
       *"QUIC"*)                   rec="fall back to TCP-based transport for now" ;;

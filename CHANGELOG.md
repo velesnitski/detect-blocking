@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-06-02
+
+### Changed
+
+- **Sharpened the TLS-fragmentation bypass recommendation to name current
+  DPI-desync tools.** When probe 3 finds a block that's defeated by ClientHello
+  fragmentation, the recommendation now points at concrete, current tools —
+  **ByeDPI/ciadpi** (desktop SOCKS desync proxy), **ByeDPIAndroid** (Android),
+  and **zapret / GoodbyeDPI** — and maps the escalation: start with TLS-record
+  split (`--tlsrec`/`--split`, the method this probe confirms), and if a
+  stricter DPI needs more, move to fake-packet + TTL (`--fake --ttl`) or
+  `--disorder`. (No new probe / dependency — probe 3 already tests the
+  fragmentation method; this just makes the fix actionable with today's tools.)
+
 ## [0.6.0] - 2026-06-02
 
 ### Changed

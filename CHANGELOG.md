@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.6] - 2026-06-02
+
+### Fixed
+
+- **Probe 16 falls back to HTTPS when the HTTP IP-info lookup gets no data.**
+  `ip-api.com`'s free tier is HTTP-only (port 80). Many VPN egresses allow only
+  443 outbound, and the free tier is rate-limited (45 req/min per source IP),
+  so the lookup intermittently returned nothing and probe 16 hard-failed with
+  "egress IP-info lookup returned no data through the tunnel" — even though the
+  egress was healthy. It now falls back to an HTTPS source (Cloudflare's
+  `cdn-cgi/trace`, port 443, already used elsewhere) for at least the egress
+  country and reports `partial` with a clear explanation, instead of failing.
+  The datacenter/proxy reputation flags still need the HTTP endpoint (or a paid
+  HTTPS one via `XRAY_EGRESS_INFO_URL`). Validated against a config where the
+  HTTP lookup was forced to fail → "egress geo via HTTPS fallback: country=…".
+
 ## [0.5.5] - 2026-06-02
 
 ### Fixed

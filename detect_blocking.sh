@@ -28,7 +28,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.5.5"
+readonly DETECT_BLOCKING_VERSION="0.5.6"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -526,7 +526,7 @@ XRAY_COVER_CN_MATCH=""      # 1 / 0 / "" (cert CN/SAN covers the configured serv
 XRAY_EGRESS_CHECK="${XRAY_EGRESS_CHECK:-1}"                 # 1 = run (--no-egress-check opts out)
 XRAY_EGRESS_INFO_URL="${XRAY_EGRESS_INFO_URL:-http://ip-api.com/json/?fields=status,countryCode,hosting,proxy,mobile}"
 XRAY_EGRESS_DNS_URL="${XRAY_EGRESS_DNS_URL:-http://edns.ip-api.com/json}"
-XRAY_EGRESS_STATUS=""       # ok, skipped, disabled, curl-missing, no-data
+XRAY_EGRESS_STATUS=""       # ok, partial (geo via HTTPS, no flags), skipped, disabled, curl-missing, no-data
 XRAY_EGRESS_COUNTRY=""      # ISO country code seen at the egress
 XRAY_EGRESS_HOSTING=""      # 1 / 0 — datacenter / hosting IP
 XRAY_EGRESS_PROXY=""        # 1 / 0 — on a proxy blocklist
@@ -2423,7 +2423,23 @@ probe_xray_egress() {
               "$XRAY_EGRESS_INFO_URL" 2>/dev/null)
 
   if [ -z "$info_json" ] || ! printf '%s' "$info_json" | grep -q '"countryCode"'; then
-    fail "egress IP-info lookup returned no data through the tunnel"
+    # ip-api's free tier is HTTP-only (port 80). Many VPN egresses allow only
+    # 443 outbound, so the lookup returns nothing — but the egress is fine.
+    # Fall back to an HTTPS source (Cloudflare's trace, port 443, already used
+    # elsewhere) for at least the country; the reputation flags need the HTTP
+    # endpoint (or a paid HTTPS one via XRAY_EGRESS_INFO_URL).
+    local cc
+    cc=$(curl -sS --max-time "$maxt" --socks5-hostname "127.0.0.1:$port" \
+         https://cloudflare.com/cdn-cgi/trace 2>/dev/null \
+         | sed -nE 's/^loc=([A-Za-z]{2}).*/\1/p' | head -1)
+    if [ -n "$cc" ]; then
+      XRAY_EGRESS_COUNTRY="$cc"
+      warn "egress geo via HTTPS fallback: country=${cc} — reputation flags unavailable"
+      info "the HTTP ip-api lookup got no data (egress likely blocks outbound port 80, or ip-api rate-limited); point XRAY_EGRESS_INFO_URL at an HTTPS IP-info service for hosting/proxy flags"
+      XRAY_EGRESS_STATUS="partial"
+      return 0
+    fi
+    fail "egress IP-info lookup returned no data through the tunnel (HTTP and HTTPS fallback both failed)"
     XRAY_EGRESS_STATUS="no-data"
     return 0
   fi

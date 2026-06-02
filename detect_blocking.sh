@@ -28,7 +28,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.6.3"
+readonly DETECT_BLOCKING_VERSION="0.7.0"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -647,6 +647,8 @@ XRAY_DETECT_BAND=""         # low | moderate | high | critical
 XRAY_PASSIVE_PORT_STD=""    # 1 / 0 — cover served on the standard 443
 XRAY_PASSIVE_ASN_MATCH=""   # 1 / 0 / "" — server IP on the cover's network (or undetermined)
 XRAY_PASSIVE_FP_STRONG=""   # 1 / 0 — both passive tells co-occur (the Reality structural signature)
+XRAY_PASSIVE_SNI_RESOLVES="" # 1 / 0 / "" — cover SNI publicly resolves (a non-resolving SNI is a tell)
+XRAY_PASSIVE_SNI_KEYWORD=""  # 1 / 0 — cover SNI contains a circumvention/antagonistic keyword (cleartext)
 
 # ---- baseline / diff mode (longitudinal regression detection) ----
 # --save-baseline FILE writes this run's share-safe JSON; --diff-baseline FILE
@@ -794,6 +796,19 @@ _resolve_aaaa_records() {
     nslookup -type=AAAA "$host" 2>/dev/null \
       | awk '/^Name:/{found=1} found && /^Address:/{print $2}' | _ipv6_lines
   fi
+}
+
+# True (0) ONLY if DNS authoritatively says the name does not exist (NXDOMAIN),
+# as opposed to a transient SERVFAIL / timeout / unreachable-resolver / geo-DNS
+# miss — so a from-here lookup hiccup isn't misread as a self-cooked SNI. Needs
+# dig (to read the response code); without it we can't confirm, so return false
+# (don't flag) — the conservative, low-false-positive choice.
+_dns_nxdomain() {
+  local host="$1" st=""
+  check_cmd dig || return 1
+  st=$(dig +time="$TIMEOUT" +tries=1 "$host" A 2>/dev/null \
+        | awk -F'status: ' '/->>HEADER<<-/{split($2,a,","); print a[1]; exit}')
+  [ "$st" = "NXDOMAIN" ]
 }
 
 # Platform-aware TCP connect probe. macOS nc honours `-G` (connect timeout)
@@ -997,6 +1012,18 @@ _target_https_url() {
   fi
 }
 
+# The SNI a generic TLS/HTTPS probe should present. For a Reality config the
+# client sends the cover serverName, not VPN_HOST (often a bare IP) — and a
+# Reality server is DESIGNED to drop handshakes whose SNI isn't a configured
+# serverName. Using VPN_HOST there makes the generic probes (3-5) misread
+# Reality's selective drop as a censor block. Falls back to VPN_HOST for
+# non-Reality targets, so their behaviour is unchanged.
+_effective_tls_sni() {
+  local s
+  s=$(_xray_cover_sni 2>/dev/null)
+  if [ -n "$s" ] && [ "$s" != "$VPN_HOST" ]; then printf '%s' "$s"; else printf '%s' "$VPN_HOST"; fi
+}
+
 # Extract the first value of query-string key $2 from query string $1.
 # Keys in share links are plain alnum, so no regex escaping is needed.
 _qp() {
@@ -1042,7 +1069,7 @@ _synthesize_xray_json_from_url() {
   case "$port" in ''|*[!0-9]*) port=443 ;; esac
   [ -n "$uuid" ] && [ -n "$host" ] || return 1
 
-  local net sec sni fp pbk sid spx flow alpn path hosthdr svc hdr enc insec
+  local net sec sni fp pbk sid spx flow alpn path hosthdr svc hdr enc insec mode
   net=$(_qp "$query" type);        [ -z "$net" ] && net=tcp
   sec=$(_qp "$query" security);    [ -z "$sec" ] && sec=none
   sni=$(_qp "$query" sni)
@@ -1056,6 +1083,7 @@ _synthesize_xray_json_from_url() {
   hosthdr=$(_urldecode "$(_qp "$query" host)")
   svc=$(_urldecode "$(_qp "$query" serviceName)")
   hdr=$(_qp "$query" headerType)
+  mode=$(_qp "$query" mode)        # xhttp transport mode (auto / packet-up / stream-up)
   enc=$(_qp "$query" encryption); [ -z "$enc" ] && enc=none
   # allowInsecure: clients spell it allowInsecure= or insecure=; values 1/true.
   # Carrying it lets us faithfully probe skip-verify WS/TLS configs (which would
@@ -1076,7 +1104,7 @@ _synthesize_xray_json_from_url() {
       --arg net "$net" --arg sec "$sec" --arg sni "$sni" --arg fp "$fp" \
       --arg pbk "$pbk" --arg sid "$sid" --arg spx "$spx" --arg alpn "$alpn" \
       --arg path "$path" --arg hosthdr "$hosthdr" --arg svc "$svc" --arg hdr "$hdr" \
-      --arg insec "$insec" '
+      --arg insec "$insec" --arg mode "$mode" '
       def nz(s): if s == "" then null else s end;
       def prune: with_entries(select(.value != null));
       def secSettings:
@@ -1092,6 +1120,9 @@ _synthesize_xray_json_from_url() {
         if $net == "ws" then
           { wsSettings: ({ path:(if $path=="" then "/" else $path end),
                            headers:(if $hosthdr=="" then null else {Host:$hosthdr} end) } | prune) }
+        elif ($net == "xhttp" or $net == "splithttp") then
+          { xhttpSettings: ({ path:(if $path=="" then "/" else $path end),
+                              host:nz($hosthdr), mode:nz($mode) } | prune) }
         elif $net == "grpc" then
           { grpcSettings: { serviceName:(if $svc=="" then "" else $svc end) } }
         elif $net == "tcp" then
@@ -1351,6 +1382,30 @@ probe_tls_handshake() {
   TLS_NO_SNI_OK=$([ "$no_sni" -gt 0 ] && echo 1 || echo 0)
   TLS_FAKE_SNI_OK=$([ "$fake_sni" -gt 0 ] && echo 1 || echo 0)
 
+  # Reality: the SNI the client actually sends is the cover serverName, not
+  # VPN_HOST (often a bare IP). A Reality server is DESIGNED to drop handshakes
+  # whose SNI isn't a configured serverName — so the IP / no-SNI / innocent-SNI
+  # failures above are Reality working, NOT a censor. Judge the block on the
+  # real serverName and skip the generic DPI verdicts (which would misread that
+  # selective drop as DPI).
+  local reality_sni
+  reality_sni=$(_xray_cover_sni 2>/dev/null)
+  if [ -n "$reality_sni" ] && [ "$reality_sni" != "$VPN_HOST" ]; then
+    local real_sni
+    real_sni=$(echo Q | openssl s_client -connect "$RESOLVED_IP:$VPN_PORT_TCP" \
+      -servername "$reality_sni" -brief 2>&1 \
+      | grep -cE 'Protocol version|Verification' || true)
+    info "TLS with Reality serverName:       $([ "$real_sni" -gt 0 ] && echo OK || echo FAIL)"
+    TLS_PROPER_SNI_OK=$([ "$real_sni" -gt 0 ] && echo 1 || echo 0)
+    if [ "$real_sni" -gt 0 ]; then
+      ok "Reality serverName handshake completes → TLS layer not blocked (the IP / no-SNI / innocent-SNI failures above are the Reality server dropping non-matching SNIs by design, not a censor)"
+    else
+      warn "even the Reality serverName handshake fails → either a block, or a server that refuses unauthenticated TLS probes (some do)"
+      add_verdict "Reality serverName TLS probe failed — inconclusive: a censor block OR a server that refuses bare unauthenticated TLS. Cross-check probe 11 (xray-knife): if it tunnels, the transport is NOT blocked"
+    fi
+    return
+  fi
+
   # If proper-SNI handshake failed, probe TLS-record fragmentation as a
   # bypass test. `-max_send_frag 64` splits the ClientHello across many
   # tiny TLS records — DPIs that don't reassemble records can be evaded.
@@ -1390,18 +1445,24 @@ probe_request_filter() {
   hdr "4. Request-header / TLS-fingerprint filtering"
   [ "$TCP_OK" -ne 1 ] && { warn "skipping – TCP unreachable"; return; }
 
-  local curl_default curl_chrome curl_impersonate="" http2_opt="" target_url impersonate_cmd
-  target_url=$(_target_https_url)
+  local curl_default curl_chrome curl_impersonate="" http2_opt="" target_url impersonate_cmd eff_host eff_url_host
+  # Reality configs: present the cover serverName as SNI/host, not the bare-IP
+  # VPN_HOST (which a Reality server drops by design) — otherwise this probe
+  # false-warns "HTTPS layer entirely cut". Identical to VPN_HOST for
+  # non-Reality targets, so their behaviour is unchanged.
+  eff_host=$(_effective_tls_sni)
+  eff_url_host="$eff_host"; case "$eff_url_host" in *:*:*) eff_url_host="[$eff_url_host]" ;; esac
+  if [ "$VPN_PORT_TCP" = "443" ]; then target_url="https://$eff_url_host/"; else target_url="https://$eff_url_host:$VPN_PORT_TCP/"; fi
   curl --version 2>/dev/null | grep -qiE 'HTTP2|HTTP/2' && http2_opt="--http2"
 
   curl_default=$(curl -sk --max-time "$TIMEOUT" \
-    --resolve "$VPN_HOST:$VPN_PORT_TCP:$RESOLVED_IP" \
+    --resolve "$eff_host:$VPN_PORT_TCP:$RESOLVED_IP" \
     -o /dev/null -w '%{http_code}' "$target_url" 2>/dev/null)
   [ -n "$curl_default" ] || curl_default="000"
 
   # shellcheck disable=SC2086
   curl_chrome=$(curl -sk --max-time "$TIMEOUT" $http2_opt \
-    --resolve "$VPN_HOST:$VPN_PORT_TCP:$RESOLVED_IP" \
+    --resolve "$eff_host:$VPN_PORT_TCP:$RESOLVED_IP" \
     -H 'user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36' \
     -o /dev/null -w '%{http_code}' "$target_url" 2>/dev/null)
   [ -n "$curl_chrome" ] || curl_chrome="000"
@@ -1416,7 +1477,7 @@ probe_request_filter() {
   # ClientHello (ciphers, extensions, curve order, signature algorithms).
   if impersonate_cmd=$(_find_curl_impersonate); then
     curl_impersonate=$("$impersonate_cmd" -sk --max-time "$TIMEOUT" \
-      --resolve "$VPN_HOST:$VPN_PORT_TCP:$RESOLVED_IP" \
+      --resolve "$eff_host:$VPN_PORT_TCP:$RESOLVED_IP" \
       -o /dev/null -w '%{http_code}' "$target_url" 2>/dev/null)
     [ -n "$curl_impersonate" ] || curl_impersonate="000"
     info "Impersonate Chrome: HTTP $curl_impersonate  ($impersonate_cmd)"
@@ -1457,12 +1518,16 @@ probe_rst_injection() {
   hdr "5. Mid-handshake RST detection"
   [ "$TCP_OK" -ne 1 ] && { warn "skipping – TCP unreachable"; return; }
 
-  local rc=0 elapsed hs_ok=0
+  local rc=0 elapsed hs_ok=0 rst_sni
   RST_TMP_OUT=$(_mktmp tls)
   RST_TMP_TIME=$(_mktmp time)
 
+  # Use the Reality serverName when present (see _effective_tls_sni): a bare-IP
+  # SNI is dropped by a Reality server by design, which would otherwise look
+  # like a DPI-injected RST.
+  rst_sni=$(_effective_tls_sni)
   { time -p openssl s_client -connect "$RESOLVED_IP:$VPN_PORT_TCP" \
-       -servername "$VPN_HOST" -brief </dev/null >"$RST_TMP_OUT" 2>&1
+       -servername "$rst_sni" -brief </dev/null >"$RST_TMP_OUT" 2>&1
     rc=$?
   } 2>"$RST_TMP_TIME"
 
@@ -2372,18 +2437,28 @@ probe_xray_cover() {
   fi
   [ "$verify" = "0" ] && XRAY_COVER_CHAIN_VALID=1 || XRAY_COVER_CHAIN_VALID=0
 
-  # CN/SAN covers the configured serverName? Compare case-insensitively,
-  # accepting a wildcard parent (*.example.com vs host.example.com). Booleans
-  # only — neither the cert CN nor the SNI is emitted.
-  local cn lc_cn lc_sni parent
+  # Does the cert cover the configured serverName? Modern certs carry the names
+  # in the SAN, not the CN — a cert with CN=example.com and SAN *.example.com
+  # legitimately covers host.example.com, but a CN-only check would call that a
+  # mismatch (the false "auth fails fleet-wide" a wildcard-SAN report exposed).
+  # So check the full SAN list (one-level wildcard logic) and fall back to the
+  # CN. Compare case-insensitively. Booleans only — no cert names are emitted.
+  local cn lc_cn lc_sni parent sans
   cn=$(printf '%s' "$subject" | sed -nE 's/.*CN ?= ?([^,/]+).*/\1/p' | head -1)
   lc_cn=$(printf '%s' "$cn"  | tr '[:upper:]' '[:lower:]')
   lc_sni=$(printf '%s' "$sni" | tr '[:upper:]' '[:lower:]')
   parent="${lc_sni#*.}"
+  # SAN DNS names from the leaf cert (the s_client output carries its PEM),
+  # lower-cased and space-joined so a glob membership test stays bash-3.2 safe.
+  sans=$(printf '%s' "$out" | openssl x509 -noout -ext subjectAltName 2>/dev/null \
+         | tr '[:upper:]' '[:lower:]' | tr ',' '\n' | sed -nE 's/.*dns:([^ ]+).*/\1/p' | tr '\n' ' ')
+  XRAY_COVER_CN_MATCH=0
   if [ -n "$lc_cn" ] && { [ "$lc_cn" = "$lc_sni" ] || [ "$lc_cn" = "*.$parent" ]; }; then
     XRAY_COVER_CN_MATCH=1
   else
-    XRAY_COVER_CN_MATCH=0
+    case " $sans " in
+      *" $lc_sni "*|*" *.$parent "*) XRAY_COVER_CN_MATCH=1 ;;
+    esac
   fi
 
   info "cover cert: self-signed=${XRAY_COVER_SELFSIGNED}, chain-valid=${XRAY_COVER_CHAIN_VALID}, CN-matches-serverName=${XRAY_COVER_CN_MATCH}"
@@ -3316,6 +3391,28 @@ probe_xray_detectability() {
 
   local score=0
 
+  # Resolve the cover SNI ONCE, up front. A non-resolving (self-cooked) SNI is
+  # both a passive tell AND the single reason probes 20/24 and the SNI↔IP check
+  # can't baseline — so every line that reads "not evaluated" can name the cause
+  # instead of looking like the tool gave up.
+  local sni sni_resolves="" nxnote=""
+  sni=$(_xray_cover_sni)
+  if [ -n "$sni" ]; then
+    case "$sni" in
+      *[!0-9.]*)  # a hostname (a bare-IP serverName is its own probe-18 lint)
+        if [ -n "$(_resolve_a_records "$sni" 2>/dev/null | _first_word)" ] \
+           || [ -n "$(_resolve_aaaa_records "$sni" 2>/dev/null | _first_word)" ]; then
+          sni_resolves=1
+        elif _dns_nxdomain "$sni"; then
+          sni_resolves=0   # authoritative NXDOMAIN — a real tell, not a hiccup
+        fi
+        # else: lookup inconclusive (SERVFAIL/timeout/no dig) → leave "" (don't flag)
+        ;;
+    esac
+  fi
+  XRAY_PASSIVE_SNI_RESOLVES="$sni_resolves"
+  [ "$sni_resolves" = "0" ] && nxnote=" — cover SNI is NXDOMAIN"
+
   # Each input is scored AND described, so the total is explainable even at 0.
   # --- cover certificate (probe 15) ---
   local cover_pts=0 cover_desc=""
@@ -3334,19 +3431,21 @@ probe_xray_detectability() {
   # --- active-probe behaviour (probe 20) ---
   local active_pts=0 active_desc
   case "$XRAY_ACTIVE_STATUS" in
-    ok)        active_desc="relays unauth probes to the real cover" ;;
-    exposed)   active_pts=25; active_desc="no coherent HTTP to an unauth prober" ;;
-    mismatch)  active_pts=15; active_desc="unauth response differs from cover" ;;
-    *)         active_desc="not evaluated (${XRAY_ACTIVE_STATUS:-skipped})" ;;
+    ok)          active_desc="relays unauth probes to the real cover" ;;
+    exposed)     active_pts=25; active_desc="no coherent HTTP to an unauth prober" ;;
+    mismatch)    active_pts=15; active_desc="unauth response differs from cover" ;;
+    no-baseline) active_desc="not evaluated${nxnote:- (no genuine cover to baseline)}" ;;
+    *)           active_desc="not evaluated (${XRAY_ACTIVE_STATUS:-skipped})" ;;
   esac
   score=$(( score + active_pts ))
 
   # --- TLS-negotiation parity (probe 24) ---
   local tls_pts=0 tls_desc
   case "$XRAY_TLSPAR_STATUS" in
-    ok)        tls_desc="version+ALPN+cipher match cover" ;;
-    mismatch)  tls_pts=15; tls_desc="negotiation differs from cover" ;;
-    *)         tls_desc="not evaluated (${XRAY_TLSPAR_STATUS:-skipped})" ;;
+    ok)          tls_desc="version+ALPN+cipher match cover" ;;
+    mismatch)    tls_pts=15; tls_desc="negotiation differs from cover" ;;
+    unreachable) tls_desc="not evaluated${nxnote:- (cover unreachable)}" ;;
+    *)           tls_desc="not evaluated (${XRAY_TLSPAR_STATUS:-skipped})" ;;
   esac
   score=$(( score + tls_pts ))
 
@@ -3361,10 +3460,9 @@ probe_xray_detectability() {
   fi
   score=$(( score + port_pts ))
 
-  local sni_pts=0 sni_desc="not evaluated"
-  local sni="" srv_ip cov_ips srv_asn cov_asn on_net=""
-  sni=$(_xray_cover_sni)
-  if [ -n "$sni" ] && check_cmd curl; then
+  local sni_pts=0 sni_desc="not evaluated" srv_ip cov_ips srv_asn cov_asn on_net=""
+  [ "$sni_resolves" = "0" ] && sni_desc="not evaluated${nxnote} (see SNI quality)"
+  if [ -n "$sni" ] && [ "$sni_resolves" != "0" ] && check_cmd curl; then
     srv_ip=$(_resolve_a_records "$VPN_HOST" 2>/dev/null | _first_word)
     cov_ips=$(_resolve_a_records "$sni" 2>/dev/null | _join_words)
     # (1) DNS membership — no external API, so it survives ASN-lookup rate
@@ -3389,6 +3487,39 @@ probe_xray_detectability() {
     esac
   fi
   score=$(( score + sni_pts ))
+
+  # --- cover-SNI quality (cheap, low-FP; a perfect cert can't fix these) ---
+  # A Reality cover should be a real, popular third-party domain so the cleartext
+  # SNI a censor sees looks innocuous and high-value. Two tells a valid cert
+  # cannot mask — and this is also WHY probes 20/24 go "not evaluated" on a
+  # self-cooked cover: there's no genuine site to baseline against.
+  #   (a) the SNI does not publicly resolve (NXDOMAIN) → not a site you hide
+  #       behind; a censor resolving the cleartext SNI learns that instantly;
+  #   (b) the SNI carries a circumvention/antagonistic keyword → sent in
+  #       cleartext in every ClientHello, so a keyword-matching DPI flags it.
+  local sniq_pts=0 sniq_desc="real-looking" sni_lc=""
+  XRAY_PASSIVE_SNI_KEYWORD=0
+  if [ -n "$sni" ]; then
+    # (a) non-resolving cover SNI — only a confirmed NXDOMAIN (computed up top),
+    #     never a transient/geo-DNS miss. A soft tell: it only bites a censor
+    #     that actively resolves SNIs, unlike the keyword below which a passive
+    #     blocklist matches directly.
+    if [ "$sni_resolves" = "0" ]; then
+      sniq_pts=$(( sniq_pts + 10 ))
+      sniq_desc="NXDOMAIN (self-cooked SNI — soft tell)"
+    fi
+    # (b) circumvention/antagonistic keyword in the cleartext SNI.
+    sni_lc=$(printf '%s' "$sni" | tr '[:upper:]' '[:lower:]')
+    case "$sni_lc" in
+      *vpn*|*proxy*|*xray*|*v2ray*|*reality*|*shadowsock*|*trojan*|*wireguard*|*outline*|*censor*|*roskomnadzor*|*-rkn*|*rkn-*|*unblock*|*bypass*)
+        XRAY_PASSIVE_SNI_KEYWORD=1; sniq_pts=$(( sniq_pts + 10 ))
+        case "$sniq_desc" in
+          real-looking) sniq_desc="contains a circumvention keyword (cleartext SNI)" ;;
+          *)            sniq_desc="$sniq_desc + circumvention keyword" ;;
+        esac ;;
+    esac
+  fi
+  score=$(( score + sniq_pts ))
 
   # --- passive conjunction: the Reality structural signature ---
   # Either passive tell alone is FP-prone (legit services use 8443; domain
@@ -3420,6 +3551,7 @@ probe_xray_detectability() {
   info "$(printf 'active · TLS parity (24):   %-38s +%d' "$tls_desc" "$tls_pts")"
   info "$(printf 'passive · port:             %-38s +%d' "$port_desc" "$port_pts")"
   info "$(printf 'passive · SNI↔IP network:   %-38s +%d' "$sni_desc" "$sni_pts")"
+  info "$(printf 'passive · SNI quality:      %-38s +%d' "$sniq_desc" "$sniq_pts")"
   info "$(printf 'passive · conjunction:      %-38s +%d' "$conj_desc" "$conj_pts")"
   info "bands: 0-14 low · 15-39 moderate · 40-69 high · 70-100 critical"
 
@@ -3439,6 +3571,19 @@ probe_xray_detectability() {
   if [ "${XRAY_PASSIVE_FP_STRONG:-0}" = "1" ]; then
     warn "passive Reality/Xray fingerprint: borrowed SNI (cover lives on another network) + non-standard port"
     add_verdict "Passive Reality/Xray fingerprint detected: the server presents an SNI for a domain hosted on a different network AND serves it on a non-standard port. Each tell alone is FP-prone, but the conjunction is a recognized structural signature of VLESS-Reality that a passive censor can match with low FP — no active probe needed, even though every active check here passed. To blend in, serve on 443 and choose a cover domain hosted on the same network as the server (or a large shared CDN)"
+  fi
+
+  # Name a weak cover SNI: the serverName is sent in cleartext in every
+  # ClientHello, so a valid cert can't hide a self-cooked or keyword-bearing
+  # name — and it's also why the active baselines (20/24) couldn't evaluate.
+  if [ "${XRAY_PASSIVE_SNI_KEYWORD:-0}" = "1" ] || [ "${XRAY_PASSIVE_SNI_RESOLVES:-1}" = "0" ]; then
+    warn "cover SNI quality: $sniq_desc — the cleartext serverName is the weak link, not the cert"
+    if [ "${XRAY_PASSIVE_SNI_KEYWORD:-0}" = "1" ]; then
+      add_verdict "Reality cover SNI carries a circumvention/antagonistic keyword, sent in cleartext in every ClientHello — a passive SNI-blocklist DPI (the cheap, default method, e.g. RKN) matches and blocks it on sight, no DNS lookup or active probe needed. A valid cert can't hide it. This is the severe one. Use a real, popular third-party domain that looks innocuous as the Reality cover"
+    fi
+    if [ "${XRAY_PASSIVE_SNI_RESOLVES:-1}" = "0" ]; then
+      add_verdict "Reality cover SNI is NXDOMAIN (it doesn't publicly resolve) — a softer tell: it only bites a censor that actively resolves the SNIs it sees (not the cheap default), but it does mean the cover isn't a real site you blend into, and it's why the active-probe/TLS-parity baselines went 'not evaluated' (no genuine cover to compare against). Prefer a real, resolving cover domain"
+    fi
   fi
 }
 
@@ -3640,6 +3785,8 @@ _emit_json() {
     --arg xpf_port_std      "$XRAY_PASSIVE_PORT_STD" \
     --arg xpf_asn_match     "$XRAY_PASSIVE_ASN_MATCH" \
     --arg xpf_fp_strong     "$XRAY_PASSIVE_FP_STRONG" \
+    --arg xpf_sni_resolves  "$XRAY_PASSIVE_SNI_RESOLVES" \
+    --arg xpf_sni_keyword   "$XRAY_PASSIVE_SNI_KEYWORD" \
     --argjson verdicts      "$verdicts_json" '
     def words: split(" ") | map(select(length > 0));
     def opt(s): if s == "" then null else s end;
@@ -3845,7 +3992,9 @@ _emit_json() {
           band: opt($xd_band),
           port_standard: tri_bool(($xpf_port_std | tonumber? // -1)),
           sni_ip_asn_match: tri_bool(($xpf_asn_match | tonumber? // -1)),
-          passive_fingerprint_strong: tri_bool(($xpf_fp_strong | tonumber? // -1))
+          passive_fingerprint_strong: tri_bool(($xpf_fp_strong | tonumber? // -1)),
+          sni_resolves: tri_bool(($xpf_sni_resolves | tonumber? // -1)),
+          sni_keyword: tri_bool(($xpf_sni_keyword | tonumber? // -1))
         }
       },
       verdicts: $verdicts

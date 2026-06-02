@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-06-02
+
+Four fixes surfaced by testing a real VLESS-Reality + XHTTP share-link, where
+the tool both over-alarmed (phantom DPI) and under-alarmed (missed the real
+risk) on a perfectly healthy config.
+
+### Fixed
+
+- **Probes 3-5 no longer cry "TLS DPI / RST injection / HTTPS cut" against a
+  Reality server.** They probed the wrong SNI — the bare-IP `VPN_HOST` (or
+  no-SNI / an innocent SNI) — never the configured Reality serverName. A Reality
+  server is *designed* to drop handshakes whose SNI isn't a configured
+  serverName, so those drops were misread as a censor block (and propagated to
+  the verdict + recommendation). New `_effective_tls_sni` helper: probes 3-5 now
+  present the Reality serverName, and probe 3 judges the block on *that*
+  handshake and skips the generic DPI verdicts for Reality configs. Behaviour is
+  unchanged for non-Reality targets.
+- **Probe 15 matches the cert's SAN, not just its CN.** A cover cert with
+  `CN=example.com` and SAN `*.example.com` legitimately covers a subdomain
+  serverName, but the CN-only check called that a mismatch and escalated to a
+  false "authentication fails fleet-wide" verdict. It now parses the leaf cert's
+  Subject Alternative Names (with one-level wildcard logic) before deciding.
+
+### Added
+
+- **Probe 26 scores cover-SNI quality** — two tells a valid cert cannot mask,
+  because the serverName is sent in cleartext in every ClientHello:
+  - the cover SNI **carries a circumvention/antagonistic keyword** (vpn, proxy,
+    xray, reality, … or a censor's name) → a passive SNI-blocklist DPI (the
+    cheap, default method) matches and blocks it on sight, no lookup needed
+    (+10). This is the **severe** one.
+  - the cover SNI is **NXDOMAIN** (doesn't publicly resolve) → not a real site
+    you blend into (+10). A **soft** tell: it only bites a censor that *actively*
+    resolves SNIs, not the passive default. It's *also* why the active-probe (20)
+    and TLS-parity (24) baselines report "not evaluated" — there's no genuine
+    cover to compare against, which the breakdown now says explicitly instead of
+    leaving a silent gap. Only a DNS-**confirmed** NXDOMAIN flags it — a transient
+    SERVFAIL / timeout / geo-DNS miss from the run vantage does **not** (no FP).
+
+  Both get a dedicated named verdict. JSON `xray_detectability` gains
+  `sni_resolves` and `sni_keyword`. New test `tests/test_sni_quality.sh`.
+- **XHTTP transport in the URL→JSON synthesis.** `type=xhttp` (and the legacy
+  `splithttp`) now emit `xhttpSettings` (`path` / `host` / `mode`), so probe 12
+  can probe XHTTP share-links end-to-end instead of failing while xray-knife
+  (probe 11) succeeds.
+
 ## [0.6.3] - 2026-06-02
 
 ### Added

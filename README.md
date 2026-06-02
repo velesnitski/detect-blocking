@@ -49,7 +49,7 @@ emits a clearly labelled verdict for each detected issue.
 | 0 | Environment | Whether a VPN is currently active (results then describe the VPN exit path, not the local ISP) |
 | 1 | DNS resolution | DNS sinkhole / system-DNS failure / **DoH integrity canary** + **multi-DoH cross-check** (Cloudflare/Google/Quad9) / **DoT canary** / CDN-anycast divergence |
 | 2 | TCP reachability | Full IP block vs port-specific (443 dead but 80 alive) |
-| 3 | TLS handshake | SNI-based DPI (proper SNI dies, no-SNI works); auto-runs **64-byte record-fragmentation probe** when SNI is blocked |
+| 3 | TLS handshake | SNI-based DPI (proper SNI dies, no-SNI works); auto-runs **64-byte record-fragmentation probe** when SNI is blocked. For a Reality config it probes the **cover serverName** (not the bare-IP host) and judges the block on that — so Reality's by-design drop of non-matching SNIs isn't misread as DPI |
 | 4 | UA / TLS-fp filtering | User-Agent filtering; **real JA3 via `curl-impersonate`** when installed |
 | 5 | Mid-handshake RST | Active DPI reset (<1s) vs silent drop (full timeout) |
 | 6 | UDP protocols | IKEv2 (valid IKE\_SA\_INIT probe) + QUIC/HTTP3 over UDP 443 |
@@ -72,7 +72,7 @@ emits a clearly labelled verdict for each detected issue.
 | 23 | Path MTU to server (auto) | DF-bit `ping` sweep finds the path MTU; a clamp below 1500 fragments the Reality ClientHello and can cause intermittent handshake failures that mimic DPI |
 | 24 | TLS-negotiation parity (auto) | Does the server negotiate the same TLS version / ALPN / cipher as the genuine cover? Stealth depth-3 (15 cert → 20 HTTP → 24 negotiation); a fake/wrong-`dest` server diverges |
 | 25 | Cover-SNI region-throttle (auto) | Is the cover domain itself shaped in-region (which the tunnel silently inherits)? Direct fetch vs a neutral baseline; when the cover root is too small, cross-checks the tunnel throughput (which carries the cover SNI) |
-| 26 | Detectability score (synthesis, always last) | Folds **active** stealth (15/20/24) **and passive** structure (non-443 port, SNI↔IP mismatch, and their conjunction = the VLESS-Reality structural signature) into one 0-100 score + band. Catches a server that defeats every active probe but is still passively fingerprintable |
+| 26 | Detectability score (synthesis, always last) | Folds **active** stealth (15/20/24) **and passive** structure (non-443 port, SNI↔IP mismatch + conjunction = the VLESS-Reality signature, and **cover-SNI quality**: a cleartext SNI that is NXDOMAIN or carries a circumvention keyword) into one 0-100 score + band. Catches a server that defeats every active probe but is still passively fingerprintable, and names *why* the active baselines couldn't run |
 
 The verdict ends with a list of detected blocks plus an actionable
 recommendation for each (rotate IP, switch to Reality, use uTLS, etc).
@@ -294,7 +294,8 @@ no routing logic. Probe 12 spawns `xray run` against your **actual
 > synthesizes a minimal config from it — one proxy outbound + a freedom
 > direct, single socks inbound — so a single `--xray-config URL` runs
 > probes 11, 12 **and** 13 together. Supports `vless://` / `trojan://`
-> with reality / tls over tcp / ws / grpc. The synthesized file holds live
+> with reality / tls (incl. `allowInsecure`/`insecure`) over tcp / ws / grpc /
+> xhttp (xhttp carries `path`/`host`/`mode`). The synthesized file holds live
 > credentials, is written `0600`, and is removed by the EXIT trap. For
 > `vmess://` (base64), `ss://`, `hysteria*` or `tuic://`, or for any
 > chained / balancer / fragment setup, pass a real `--xray-config-json`.
@@ -558,7 +559,10 @@ cover domain, the raw egress IP, or the provider name.
 configured `serverName` and inspects the cert. A genuine Reality server
 relays such clients to the **real** cover site, so they see a CA-valid cert
 for that name. A self-signed or mismatched cert means the cover is fake and
-an active prober flags the server instantly:
+an active prober flags the server instantly. The match is checked against the
+cert's full **SAN** list with wildcard logic (so `CN=example.com` + SAN
+`*.example.com` correctly covers a `host.example.com` serverName, not a false
+mismatch):
 
 ```
 == 15. Reality cover authenticity ==
@@ -730,7 +734,15 @@ the **passive** structure a censor can read off the wire without probing at all:
 - the server IP **not on the cover domain's network** (SNI↔IP mismatch — decided
   by DNS membership first, then an ASN cross-check so large CDNs don't false-positive);
 - the **conjunction** of those two — a *borrowed SNI on a non-standard port* is a
-  recognized VLESS-Reality structural signature.
+  recognized VLESS-Reality structural signature;
+- **cover-SNI quality** — the serverName is sent in cleartext in every
+  ClientHello, so a valid cert can't hide it: an SNI that **doesn't publicly
+  resolve** (NXDOMAIN — a self-cooked name, not a real site you hide behind) or
+  that carries a **circumvention/antagonistic keyword** (vpn, proxy, xray, a
+  censor's name…) is exactly what a censor resolves to nothing or keyword-matches.
+  A non-resolving cover is *also* why the active baselines (20/24) report "not
+  evaluated" — there's no genuine cover site to compare against, and the score
+  now says so instead of leaving a silent gap.
 
 Active tells weigh heaviest. Each passive tell alone is FP-prone (legit services
 use 8443; domain fronting legitimately mismatches ASN), so they weigh less — but

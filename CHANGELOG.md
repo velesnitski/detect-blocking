@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-06-02
+
+### Changed
+
+The two edge-case follow-ups from the v0.5.3 audit:
+
+- **Probe 12 reports "no proxy outbound" instead of a misleading network
+  error.** A config with an empty (or freedom-only) `outbounds` array used to
+  launch xray, get no route, and report "tunnel did not reach Cloudflare" — as
+  if the network were at fault. It now pre-checks (via jq) for at least one
+  proxy outbound (`vnext` / `servers`) and fails fast with *"config has no
+  proxy outbound — nothing to tunnel through"* (status `no-outbound`).
+
+- **`--diff-baseline` notes a version drift.** A baseline saved by an older
+  build is missing the probe blocks added since, so those probes show as
+  `none -> X` on the first diff after an upgrade. The diff now prints
+  *"baseline is from vX (now vY) — probes added since will appear as changes,
+  not regressions"* so that isn't misread as a real regression.
+
 ## [0.5.3] - 2026-06-02
 
 ### Fixed

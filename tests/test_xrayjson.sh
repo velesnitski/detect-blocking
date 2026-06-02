@@ -27,6 +27,7 @@ status=$(printf '%s' "$out" | jq -r '.probes.xray_full_config.status')
 #   - xray-missing (no binary)
 #   - jq-missing  (no jq — impossible, we'd have skipped above)
 #   - no-port / xray-bind-failed / ok / failed (xray IS installed)
+#   - no-outbound (xray installed + this freedom-only config has no proxy out)
 # All non-"no-config" statuses are valid here; we just assert the probe ran.
 tmp_cfg=$(mktemp -t detect_blocking_xrayjson_test.XXXXXX)
 cat > "$tmp_cfg" << 'EOF'
@@ -53,7 +54,7 @@ rm -f "$tmp_cfg"
 
 status=$(printf '%s' "$out" | jq -r '.probes.xray_full_config.status')
 case "$status" in
-  ok|failed|xray-missing|xray-bind-failed|no-port|jq-missing|config-malformed)
+  ok|failed|xray-missing|xray-bind-failed|no-port|jq-missing|config-malformed|no-outbound)
     : ;;
   *) fail "unexpected xray_full_config.status: '$status'" ;;
 esac

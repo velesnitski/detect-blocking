@@ -28,7 +28,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.5.3"
+readonly DETECT_BLOCKING_VERSION="0.5.4"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -469,7 +469,7 @@ XRAY_FAIL_KIND=""        # on failure: timeout | reset | other (drives verdict)
 XRAY_RETRY_USED=0        # 1 if the slow-handshake auto-retry ran
 
 # --xray-config-json (probe 12) state vars
-XRAY_JSON_STATUS=""      # ok, failed, xray-missing, jq-missing, config-missing,
+XRAY_JSON_STATUS=""      # ok, failed, xray-missing, jq-missing, no-outbound, config-missing,
                          # config-malformed, no-port, xray-bind-failed, no-config
 XRAY_JSON_SOCKS_PORT=""  # actual port the patched config binds (random high)
 XRAY_JSON_EGRESS_IP=""   # ip= line from cloudflare trace
@@ -1896,6 +1896,19 @@ probe_xray_json() {
     XRAY_JSON_STATUS="jq-missing"
     return 0
   fi
+
+  # Pre-check: a config with no proxy outbound (vnext / servers) can't tunnel
+  # anything — without this it launches xray, gets no route, and reports the
+  # misleading "tunnel did not reach Cloudflare". Catch it with a clear message.
+  local _n_out
+  _n_out=$(jq '[.outbounds // [] | .[] | select(.settings.vnext != null or .settings.servers != null)] | length' "$XRAY_JSON_CONFIG" 2>/dev/null)
+  case "$_n_out" in
+    ''|0)
+      fail "config has no proxy outbound (vless/vmess/trojan/ss) — nothing to tunnel through"
+      info "check the config: an empty or freedom-only 'outbounds' can't carry a tunnel"
+      XRAY_JSON_STATUS="no-outbound"
+      return 0 ;;
+  esac
 
   # 1) Reserve a free local port — avoid clashing with a running client
   #    sitting on 10808 / 10809.
@@ -3638,6 +3651,16 @@ _emit_baseline_diff() {
   ts=$(printf '%s' "$base" | jq -r '.timestamp // "unknown"' 2>/dev/null)
 
   hdr "Baseline diff (vs ${ts})"
+
+  # Version-drift note: a baseline from an older build is missing the probe
+  # blocks added since, so those probes will show up as "none -> X" changes on
+  # the first diff after an upgrade. Flag it so that isn't read as a regression.
+  local _bver _cver
+  _bver=$(printf '%s' "$base" | jq -r '.version // "?"' 2>/dev/null)
+  _cver=$(printf '%s' "$cur"  | jq -r '.version // "?"' 2>/dev/null)
+  if [ "$_bver" != "$_cver" ] && [ "$_bver" != "?" ]; then
+    info "baseline is from v${_bver} (now v${_cver}) — probes added since will appear as changes, not regressions"
+  fi
 
   changes=$(jq -rn --argjson b "$base" --argjson c "$cur" '
     def sig: {

@@ -21,14 +21,20 @@
 #   ./detect_blocking.sh www.example.com    # CLI override of VPN_HOST
 #   VPN_HOST=h.example.com ./detect_blocking.sh
 #   ./detect_blocking.sh --log-file /tmp/d.log --quiet
+#   ./detect_blocking.sh --xray-config 'vless://…' --reveal   # show real values
 #   CONFIG_FILE=/path/to/file ./detect_blocking.sh
+#
+# --reveal prints the real offending values (cover serverName, egress IP/org,
+# the flagged SNI) to the TERMINAL so you know exactly what to change. It is
+# never logged, never in --json, never committed — and NOT safe to paste/share.
+# Default output stays share-safe (booleans / country / codes only).
 #
 # Precedence: CLI arg > env var > config file > built-in default.
 # See detect_blocking.conf.example for all knobs (including STRICT_OPENVPN_VERDICT).
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.7.1"
+readonly DETECT_BLOCKING_VERSION="0.7.2"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -89,6 +95,11 @@ LOG_QUIET="${LOG_QUIET:-0}"
 ONLY_PROBES="${ONLY_PROBES:-}"
 SKIP_PROBES="${SKIP_PROBES:-}"
 JSON_MODE="${JSON_MODE:-0}"
+# --reveal: print the real offending values (cover SNI, egress IP/org, matched
+# keyword) to the TERMINAL so an operator knows exactly what to change. OFF by
+# default so normal output stays share-safe; reveal output is never logged,
+# never in --json, and (obviously) never committed. NOT safe to paste/share.
+REVEAL="${REVEAL:-0}"
 WATCH_INTERVAL="${WATCH_INTERVAL:-}"
 BATCH_FILE="${BATCH_FILE:-}"
 PCAP_FILE="${PCAP_FILE:-}"
@@ -136,6 +147,7 @@ while [ $# -gt 0 ]; do
     --save-baseline=*) SAVE_BASELINE="${1#--save-baseline=}"; shift ;;
     --diff-baseline)   DIFF_BASELINE="${2:-}"; shift 2 ;;
     --diff-baseline=*) DIFF_BASELINE="${1#--diff-baseline=}"; shift ;;
+    --reveal)      REVEAL=1; shift ;;
     --quiet|-q)    LOG_QUIET=1; shift ;;
     --json)        JSON_MODE=1; LOG_QUIET=1; shift ;;
     --version|-V)
@@ -143,7 +155,7 @@ while [ $# -gt 0 ]; do
       exit 0
       ;;
     --help|-h)
-      sed -n '2,27p' "$0"
+      sed -n '2,33p' "$0"
       printf '\nversion: %s\n' "$DETECT_BLOCKING_VERSION"
       printf '\nProbe names (for --only / --skip): env, dns, tcp, tls, ua, rst, udp, openvpn, control, ipv6, compare, xray, xrayjson\n'
       printf '\nFlags:\n'
@@ -699,6 +711,18 @@ hdr()  { [ "$LOG_QUIET" = "1" ] || printf "\n${BLU}== %s ==${RST}\n" "$1"; _log_
 
 declare -a VERDICTS=()
 add_verdict() { VERDICTS+=("$1"); _log_line VERDICT "$1"; }
+
+# Operator-only detail (the real cover SNI / egress IP / matched keyword). Goes
+# to the TERMINAL ONLY when --reveal is set: it deliberately does NOT call
+# _log_line (so it's never in the log file) and is suppressed under --json /
+# --quiet (so JSON and piped output stay share-safe). Everything else the tool
+# prints remains booleans / codes / country only — this is the one opt-in escape
+# hatch, and its output is not safe to paste or share.
+reveal() {
+  [ "${REVEAL:-0}" = "1" ] || return 0
+  [ "$LOG_QUIET" = "1" ] && return 0
+  printf "          ${DIM}↳ reveal:${RST} %s\n" "$1"
+}
 
 # ---------- platform-aware helpers ----------
 
@@ -2462,6 +2486,7 @@ probe_xray_cover() {
   fi
 
   info "cover cert: self-signed=${XRAY_COVER_SELFSIGNED}, chain-valid=${XRAY_COVER_CHAIN_VALID}, CN-matches-serverName=${XRAY_COVER_CN_MATCH}"
+  reveal "serverName = \"$sni\" | cert subject = ${subject:-?}"
 
   if [ "$XRAY_COVER_SELFSIGNED" = "1" ]; then
     fail "cover certificate is self-signed → fake cover, trivially fingerprinted"
@@ -2599,6 +2624,12 @@ probe_xray_egress() {
   # Report what each source said (booleans/class only — never the IP or org).
   info "ip-api:  country=${XRAY_EGRESS_COUNTRY:-?}, hosting=${XRAY_EGRESS_HOSTING:-n/a}, proxy=${XRAY_EGRESS_PROXY:-n/a}, mobile=${XRAY_EGRESS_MOBILE:-n/a}"
   info "2nd src: ASN/org looks like a hosting provider = ${XRAY_EGRESS_ASN_HOSTING:-n/a}"
+  # --reveal: the operator-only specifics the share-safe lines deliberately omit.
+  if [ "${REVEAL:-0}" = "1" ]; then
+    local eg_ip
+    eg_ip=$(printf '%s' "$info_json" | sed -nE 's/.*"query":"([^"]*)".*/\1/p' | head -1)
+    reveal "egress IP = ${eg_ip:-?} | org = ${org:-?} | country = ${XRAY_EGRESS_COUNTRY:-?}"
+  fi
 
   XRAY_EGRESS_STATUS="ok"
   local flagged=0
@@ -3523,6 +3554,8 @@ probe_xray_detectability() {
           *)            sniq_desc="$sniq_desc + circumvention keyword" ;;
         esac ;;
     esac
+    # --reveal: show the operator the actual offending serverName (terminal only).
+    [ "$sniq_pts" -gt 0 ] && reveal "cover serverName = \"$sni\" — the cleartext SNI flagged above; replace with a real, popular, resolving third-party domain"
   fi
   score=$(( score + sniq_pts ))
 

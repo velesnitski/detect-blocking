@@ -842,6 +842,10 @@ Options:
       --xray-config-json FILE Full-config end-to-end (xray-core + SOCKS5; covers
                               fragment, dialerProxy, noises, chained outbounds).
       --json              Emit machine-readable JSON; implies --quiet. Requires jq.
+      --reveal            Print the real offending values (cover serverName,
+                          flagged SNI, egress IP / org) to the TERMINAL. Off by
+                          default; terminal-only — never logged, never in --json,
+                          never committed. NOT safe to paste / share.
 
 Probe names: env, dns, tcp, tls, ua, rst, udp, openvpn, control, ipv6, compare, xray, xrayjson
 

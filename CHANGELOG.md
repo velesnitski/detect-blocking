@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-06-02
+
+### Added
+
+- **`--reveal` — opt-in operator detail.** By default every line the tool prints
+  is share-safe (booleans / country / codes only — never the cover domain,
+  serverName, egress IP, or org), so output can be pasted into a ticket. But the
+  operator running it on their *own* config often needs the specifics ("*which*
+  SNI is the problem?"). `--reveal` prints them to the **terminal**: the cover
+  `serverName` (probe 15/26), the flagged cleartext SNI (probe 26), and the
+  egress IP / org / country (probe 16). It is deliberately **terminal-only** —
+  never written to the log file, never in `--json` (suppressed under
+  `--quiet`/`--json`), and obviously never committed. Its output is **not** safe
+  to paste or share. New test `tests/test_reveal.sh` locks all three invariants
+  (shown with the flag, absent without it, absent from JSON).
+
 ## [0.7.1] - 2026-06-02
 
 ### Changed

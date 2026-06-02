@@ -28,7 +28,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.5.8"
+readonly DETECT_BLOCKING_VERSION="0.5.9"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -502,7 +502,7 @@ XRAY_SPEEDTEST_MAX_BYTES="${XRAY_SPEEDTEST_MAX_BYTES:-52428800}"  # ~50 MB total
 XRAY_SPEEDTEST_SECONDS="${XRAY_SPEEDTEST_SECONDS:-5}"       # download window AFTER handshake (per stream)
 # Endpoints as space-separated name|url|mode triples. mode=cf → append
 # ?bytes=N (Cloudflare); mode=range → cap bytes with an HTTP Range header.
-XRAY_SPEEDTEST_URLS="${XRAY_SPEEDTEST_URLS:-cloudflare|https://speed.cloudflare.com/__down|cf hetzner|https://speed.hetzner.de/100MB.bin|range ovh|https://proof.ovh.net/files/100Mb.dat|range}"
+XRAY_SPEEDTEST_URLS="${XRAY_SPEEDTEST_URLS:-cloudflare|https://speed.cloudflare.com/__down|cf datapacket|https://lon.download.datapacket.com/100mb.bin|range ovh|https://proof.ovh.net/files/100Mb.dat|range}"
 XRAY_SPEEDTEST_STATUS=""    # ok, skipped, disabled, curl-missing, no-result
 XRAY_SPEEDTEST_BEST_BPS=""  # best aggregate bytes/sec across endpoints
 XRAY_SPEEDTEST_BEST_NAME="" # endpoint name that produced the best aggregate

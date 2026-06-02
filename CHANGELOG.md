@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.9] - 2026-06-02
+
+### Fixed
+
+- **Probe 14: replaced the dead Hetzner speed endpoint.** `speed.hetzner.de`
+  no longer resolves (DNS NXDOMAIN), so the Hetzner stream reported "no data"
+  on every run — pure noise (the best-of-N result was unaffected, but it
+  looked like a failure). Swapped it for DataPacket
+  (`lon.download.datapacket.com/100mb.bin`, HTTPS + Range, a provider-diverse
+  CDN). The default pool is now Cloudflare / DataPacket / OVH, all verified
+  reachable with Range support. Override anytime with `XRAY_SPEEDTEST_URLS`.
+
 ## [0.5.8] - 2026-06-02
 
 ### Changed

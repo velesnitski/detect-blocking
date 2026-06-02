@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-06-02
+
+### Fixed
+
+- **Probe 25 no longer reports a misleading latency artifact as throughput.**
+  When the cover root served just over the old 50 KB minimum, the direct
+  fetch's `speed_download` was dominated by connection-setup latency, not
+  bandwidth — producing nonsense like "cover 70 KB/s vs baseline 4685 KB/s,
+  not throttled" (a 67× gap that looks contradictory because the 70 KB/s isn't
+  a real bandwidth figure). The probe is now **tunnel-primary**: the tunnel
+  already presents the cover SNI in bulk, so probe 13/14's throughput is the
+  reliable cover-SNI throughput and is used first. The direct cover fetch is
+  only a fallback when there's no tunnel, and is trusted only at ≥ 1 MB of
+  payload (below which `speed_download` is latency, not bandwidth). Result: a
+  real, trustworthy number ("the tunnel carries it at N Mbps") instead of a
+  confusing small-transfer artifact.
+
 ## [0.5.1] - 2026-06-01
 
 ### Changed

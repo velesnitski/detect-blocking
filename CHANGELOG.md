@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.8] - 2026-06-02
+
+### Changed
+
+- **Probe 16 cross-checks egress reputation across multiple sources and
+  softens the verdict.** Previously a single source (`ip-api`) decided
+  "clean," but its `hosting` flag is demonstrably incomplete — it classifies
+  real datacenter IPs (e.g. Microsoft's) as `hosting:false`. Probe 16 now also
+  derives the egress **ASN/org** from a pool of free HTTPS sources
+  (`ipinfo.io` → `ipwho.is` → `ifconfig.co`, first responder wins, so one
+  being rate-limited doesn't blank the check) and applies a hosting-provider
+  heuristic. The verdict combines both signals:
+  - flagged by ip-api **or** the ASN heuristic → datacenter/proxy;
+  - **discrepancy** (ip-api clean, but the ASN is a known host) →
+    *"ip-api didn't flag it, but its ASN/org is a known hosting provider →
+    treat as datacenter"* (catches the Microsoft-style misses);
+  - both clean → *"not flagged by ip-api or by the ASN/org heuristic — looks
+    clean (2 sources; still a heuristic, not proof of residential)."*
+  Wording now attributes the source instead of claiming a definitive
+  "reputation clean." JSON `xray_egress` adds `asn_hosting`. Output stays
+  share-safe (booleans / country / class only — never the IP or the org name).
+
 ## [0.5.7] - 2026-06-02
 
 ### Changed

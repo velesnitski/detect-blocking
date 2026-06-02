@@ -2,9 +2,11 @@
 #
 # tests/test_detectability.sh — probe 26 is the FINAL synthesis: it folds the
 # active stealth signals (15/20/24) AND the passive structure (non-443 port,
-# SNI↔IP ASN mismatch) into one 0-100 score, and runs last. Checks gating,
-# schema, that it's the last xray probe, and that a non-443 port lifts the
-# score (passive tell folded in).
+# SNI↔IP mismatch + their conjunction = the Reality structural signature) into
+# one 0-100 score, and runs last. Checks gating, schema, that it's the last
+# xray probe, and that a non-443 port lifts the score (passive tell folded in).
+# (The conjunction can't fire deterministically offline — it needs real ASN
+# resolution that 127.0.0.1 lacks — so only its schema presence is asserted.)
 
 set -u
 
@@ -22,8 +24,9 @@ out=$(VPN_HOST=www.example.com TIMEOUT=2 \
   || fail "detectability should skip without a reality config"
 printf '%s' "$out" | jq -e '
   .probes.xray_detectability
-  | has("score") and has("band") and has("port_standard") and has("sni_ip_asn_match")
-' >/dev/null || fail "detectability schema missing keys (incl. folded passive fields)"
+  | has("score") and has("band") and has("port_standard")
+    and has("sni_ip_asn_match") and has("passive_fingerprint_strong")
+' >/dev/null || fail "detectability schema missing keys (incl. folded passive + conjunction)"
 # No separate passive-fingerprint probe block should exist anymore.
 [ "$(printf '%s' "$out" | jq -r '.probes | has("xray_passive_fingerprint")')" = "false" ] \
   || fail "xray_passive_fingerprint should be folded into xray_detectability"
@@ -42,4 +45,4 @@ out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config "$URL" --only xray --json 2>/dev/nu
 score=$(printf '%s' "$out" | jq -r '.probes.xray_detectability.score')
 [ "${score:-0}" -ge 10 ] || fail "non-443 port should add >=10 to the score, got '$score'"
 
-echo "PASS: probe 26 is last, folds active + passive signals, schema intact"
+echo "PASS: probe 26 is last, folds active + passive (+conjunction) signals, schema intact"

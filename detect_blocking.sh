@@ -28,7 +28,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.6.1"
+readonly DETECT_BLOCKING_VERSION="0.6.2"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -646,6 +646,7 @@ XRAY_DETECT_BAND=""         # low | moderate | high | critical
 # domain's network (SNI↔IP ASN mismatch). FP-prone for censors at scale, real.
 XRAY_PASSIVE_PORT_STD=""    # 1 / 0 — cover served on the standard 443
 XRAY_PASSIVE_ASN_MATCH=""   # 1 / 0 / "" — server IP on the cover's network (or undetermined)
+XRAY_PASSIVE_FP_STRONG=""   # 1 / 0 — both passive tells co-occur (the Reality structural signature)
 
 # ---- baseline / diff mode (longitudinal regression detection) ----
 # --save-baseline FILE writes this run's share-safe JSON; --diff-baseline FILE
@@ -3281,9 +3282,12 @@ probe_xray_coverthrottle() {
 # Probe 26 — detectability score. THE FINAL SYNTHESIS: folds every detection
 # signal — ACTIVE probing (15 cover cert / 20 active-probe / 24 TLS parity) AND
 # PASSIVE structure (cover served on a non-443 port; server IP not on the cover
-# domain's network, i.e. SNI↔IP ASN mismatch) — into one 0-100 fingerprintability
+# domain's network, i.e. SNI↔IP mismatch) — into one 0-100 fingerprintability
 # score. Active tells weigh heaviest; passive tells are real but FP-prone for a
-# censor at scale, so they weigh less. Always runs last.
+# censor at scale, so they weigh less individually — but when BOTH passive tells
+# co-occur (the VLESS-Reality structural signature) the conjunction is bumped and
+# named explicitly, since together it's low-FP even against a perfectly
+# active-cloaked server. Always runs last.
 probe_xray_detectability() {
   # Only meaningful when the stealth probes ran (a Reality config was present).
   case "$XRAY_COVER_STATUS" in ''|skipped) XRAY_DETECT_STATUS="skipped"; return 0 ;; esac
@@ -3338,21 +3342,49 @@ probe_xray_detectability() {
   score=$(( score + port_pts ))
 
   local sni_pts=0 sni_desc="not evaluated"
-  local sni="" srv_ip cov_ip srv_asn cov_asn
+  local sni="" srv_ip cov_ips srv_asn cov_asn on_net=""
   sni=$(_xray_cover_sni)
   if [ -n "$sni" ] && check_cmd curl; then
     srv_ip=$(_resolve_a_records "$VPN_HOST" 2>/dev/null | _first_word)
-    cov_ip=$(_resolve_a_records "$sni" 2>/dev/null | _first_word)
-    srv_asn=$(_asn_of "$srv_ip"); cov_asn=$(_asn_of "$cov_ip")
-    if [ -n "$srv_asn" ] && [ -n "$cov_asn" ]; then
-      if [ "$srv_asn" = "$cov_asn" ]; then
-        XRAY_PASSIVE_ASN_MATCH=1; sni_desc="server IP on the cover's network"
-      else
-        XRAY_PASSIVE_ASN_MATCH=0; sni_pts=10; sni_desc="server IP NOT on the cover's network (ASN mismatch)"
+    cov_ips=$(_resolve_a_records "$sni" 2>/dev/null | _join_words)
+    # (1) DNS membership — no external API, so it survives ASN-lookup rate
+    #     limits: if the cover domain actually resolves to THIS server IP, the
+    #     server legitimately fronts it → definitively on-network.
+    if [ -n "$srv_ip" ] && [ -n "$cov_ips" ]; then
+      case " $cov_ips " in *" $srv_ip "*) on_net=1 ;; esac
+    fi
+    # (2) Else decide by ASN — covers the large-CDN case where the exact edge IP
+    #     differs but the network is the same (so a DNS miss alone would FP).
+    #     ASN undetermined → leave unknown (don't flag; avoids FP under rate limits).
+    if [ -z "$on_net" ] && [ -n "$srv_ip" ]; then
+      srv_asn=$(_asn_of "$srv_ip")
+      cov_asn=$(_asn_of "$(printf '%s' "$cov_ips" | _first_word)")
+      if [ -n "$srv_asn" ] && [ -n "$cov_asn" ]; then
+        if [ "$srv_asn" = "$cov_asn" ]; then on_net=1; else on_net=0; fi
       fi
     fi
+    case "$on_net" in
+      1) XRAY_PASSIVE_ASN_MATCH=1; sni_desc="server IP on the cover's network" ;;
+      0) XRAY_PASSIVE_ASN_MATCH=0; sni_pts=10; sni_desc="server IP NOT on the cover's network (SNI↔IP mismatch)" ;;
+    esac
   fi
   score=$(( score + sni_pts ))
+
+  # --- passive conjunction: the Reality structural signature ---
+  # Either passive tell alone is FP-prone (legit services use 8443; domain
+  # fronting legitimately mismatches ASN). TOGETHER — presenting an SNI for a
+  # domain that lives on a different network AND serving it on a non-standard
+  # port — is a recognized VLESS-Reality fingerprint a passive censor can match
+  # with low FP, even against a server that defeats every active probe. Bump it
+  # modestly and, more importantly, name it.
+  local conj_pts=0 conj_desc="no"
+  if [ "${XRAY_PASSIVE_PORT_STD:-1}" = "0" ] && [ "${XRAY_PASSIVE_ASN_MATCH:-1}" = "0" ]; then
+    XRAY_PASSIVE_FP_STRONG=1; conj_pts=10
+    conj_desc="yes — borrowed SNI on a non-standard port"
+  else
+    XRAY_PASSIVE_FP_STRONG=0
+  fi
+  score=$(( score + conj_pts ))
 
   [ "$score" -gt 100 ] && score=100
   XRAY_DETECT_SCORE="$score"
@@ -3368,6 +3400,7 @@ probe_xray_detectability() {
   info "$(printf 'active · TLS parity (24):   %-38s +%d' "$tls_desc" "$tls_pts")"
   info "$(printf 'passive · port:             %-38s +%d' "$port_desc" "$port_pts")"
   info "$(printf 'passive · SNI↔IP network:   %-38s +%d' "$sni_desc" "$sni_pts")"
+  info "$(printf 'passive · conjunction:      %-38s +%d' "$conj_desc" "$conj_pts")"
   info "bands: 0-14 low · 15-39 moderate · 40-69 high · 70-100 critical"
 
   if [ "$score" -ge 40 ]; then
@@ -3378,6 +3411,14 @@ probe_xray_detectability() {
     add_verdict "Detectability ${score}/100 (${XRAY_DETECT_BAND}) — active probing may be clean, but passive structure (port / SNI↔IP) still leaves a fingerprint. These are FP-prone for a censor at scale, but a targeted check catches them: serve on 443 and choose a cover hosted on a large shared CDN"
   else
     ok "detectability ${score}/100 (${XRAY_DETECT_BAND}) — every active and passive check passed, blends in"
+  fi
+
+  # Name it: when both passive tells co-occur, the output should say plainly
+  # what the structure is — even at a "moderate" score the conjunction is a
+  # recognized VLESS-Reality signature, not two unrelated nitpicks.
+  if [ "${XRAY_PASSIVE_FP_STRONG:-0}" = "1" ]; then
+    warn "passive Reality/Xray fingerprint: borrowed SNI (cover lives on another network) + non-standard port"
+    add_verdict "Passive Reality/Xray fingerprint detected: the server presents an SNI for a domain hosted on a different network AND serves it on a non-standard port. Each tell alone is FP-prone, but the conjunction is a recognized structural signature of VLESS-Reality that a passive censor can match with low FP — no active probe needed, even though every active check here passed. To blend in, serve on 443 and choose a cover domain hosted on the same network as the server (or a large shared CDN)"
   fi
 }
 
@@ -3578,6 +3619,7 @@ _emit_json() {
     --arg xd_band           "$XRAY_DETECT_BAND" \
     --arg xpf_port_std      "$XRAY_PASSIVE_PORT_STD" \
     --arg xpf_asn_match     "$XRAY_PASSIVE_ASN_MATCH" \
+    --arg xpf_fp_strong     "$XRAY_PASSIVE_FP_STRONG" \
     --argjson verdicts      "$verdicts_json" '
     def words: split(" ") | map(select(length > 0));
     def opt(s): if s == "" then null else s end;
@@ -3782,7 +3824,8 @@ _emit_json() {
           score: (if $xd_score == "" then null else ($xd_score | tonumber? // null) end),
           band: opt($xd_band),
           port_standard: tri_bool(($xpf_port_std | tonumber? // -1)),
-          sni_ip_asn_match: tri_bool(($xpf_asn_match | tonumber? // -1))
+          sni_ip_asn_match: tri_bool(($xpf_asn_match | tonumber? // -1)),
+          passive_fingerprint_strong: tri_bool(($xpf_fp_strong | tonumber? // -1))
         }
       },
       verdicts: $verdicts
@@ -4003,8 +4046,10 @@ else
   done
 
   _recs=()
+  _seen_recs=""   # de-dupe: distinct verdicts often map to the same fix
   for v in "${VERDICTS[@]}"; do
     case "$v" in
+      *"Detectability "*|*"Passive Reality/Xray fingerprint"*) rec="stealth/fingerprint finding, not a live block — make the server blend in: serve the cover SNI on 443, point Reality 'dest'/'serverNames' at a real CA-valid cover, and choose a cover hosted on the server's own network (or a large shared CDN)" ;;
       *"SNI"*)                    rec="try Reality / domain fronting / ECH-enabled client" ;;
       *"System DNS failure"*)     rec="use DoH inside the VPN client and check router/provider DNS" ;;
       *"DNS sinkhole"*)           rec="use DoH inside the VPN client, not system resolver" ;;
@@ -4047,7 +4092,12 @@ else
       *"intermittently fails"*)   rec="treat as a flaky path / congested egress, not a hard block; re-test from another vantage" ;;
       *) rec="" ;;
     esac
-    [ -n "$rec" ] && _recs+=("$rec")
+    if [ -n "$rec" ]; then
+      case "$_seen_recs" in
+        *"<$rec>"*) ;;                                   # already recommended
+        *) _recs+=("$rec"); _seen_recs="$_seen_recs<$rec>" ;;
+      esac
+    fi
   done
   if [ "${#_recs[@]}" -gt 0 ]; then
     [ "$LOG_QUIET" = "1" ] || printf '\n%s\n' "${YEL}Recommendation:${RST}"

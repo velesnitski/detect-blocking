@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-06-02
+
+### Added
+
+- **Probe 26 now recognizes the passive Reality *conjunction* — and names it.**
+  A perfectly active-cloaked Reality server (authentic cover cert, relays
+  unauth probes, TLS parity — 0/100 on every active probe) was still scored
+  only by its two independent passive tells (non-443 port +10, SNI↔IP mismatch
+  +10 = 20/100), each of which is FP-prone alone. But their **conjunction** —
+  presenting an SNI for a domain that lives on a *different network* **and**
+  serving it on a *non-standard port* — is a recognized VLESS-Reality
+  structural signature a passive censor can match with low FP. Probe 26 now
+  detects the conjunction (+10), and emits a dedicated, named verdict:
+  *"Passive Reality/Xray fingerprint detected …"*. So such a server reads as a
+  **30/100 named Reality fingerprint** instead of a misleading low score.
+  JSON `xray_detectability` gains `passive_fingerprint_strong`.
+
+### Changed
+
+- **Hardened the SNI↔IP network check against ASN-lookup rate limits.** It now
+  decides on-network by **DNS membership first** (does the cover domain actually
+  resolve to this server IP? — needs no external API), falling back to the ASN
+  cross-check only for the large-CDN case (exact edge IP differs, same network).
+  When neither can be established it stays silent rather than guessing — so the
+  tell survives ip-api rate limiting and large CDNs don't false-positive.
+
+### Fixed
+
+- **Recommendations are de-duplicated, and detectability findings get the right
+  fix.** Distinct verdicts that map to the same recommendation no longer print
+  it twice. The broad `*SNI*` recommendation rule was also catching the new
+  detectability verdicts (they mention "SNI"), wrongly advising an
+  already-Reality server to "try Reality"; detectability/fingerprint findings
+  now map to the correct fix — serve the cover on 443 and pick a cover on the
+  server's own network or a large shared CDN.
+
 ## [0.6.1] - 2026-06-02
 
 ### Changed

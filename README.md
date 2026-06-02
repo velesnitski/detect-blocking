@@ -60,7 +60,7 @@ emits a clearly labelled verdict for each detected issue.
 | 11 | Xray protocol (opt-in) | Authenticated end-to-end test via `xray-knife` (v10 + legacy auto-detect); works for Reality / VLESS / VMess / Trojan / Shadowsocks-2022 / Hysteria2 |
 | 12 | Xray full-config (opt-in) | Spawns `xray-core` with your real config (`--xray-config-json FILE`, or synthesized from a `--xray-config URL`), exercises chained outbounds / balancers / fragment dialers end-to-end through a local SOCKS inbound; reports egress IP + colo + RTT. Auto-retries once at 4× `TIMEOUT` on a slow (timeout) handshake |
 | 13 | Tunnel throughput (auto with 12) | Pulls 10 MB from Cloudflare's speed-test backend through the same SOCKS tunnel; banded thresholds catch **cover-SNI traffic shaping** (RKN/TSPU/CN-style) that handshake-only probes miss |
-| 14 | Tunnel capacity (auto with 12) | N parallel streams × several CDN backends (Cloudflare / Hetzner / OVH) through the tunnel; reports the **best aggregate Mbps** — a real-speedtest-style estimate that defeats the single-stream under-reporting of probe 13. Runs by default; `--no-speedtest` to skip, auto-skipped in `--watch`/`--from-file` loops |
+| 14 | Tunnel capacity (auto with 12) | N parallel streams × several CDN backends (Cloudflare / DataPacket / OVH) through the tunnel; reports the **best aggregate Mbps** — a real-speedtest-style estimate that defeats the single-stream under-reporting of probe 13. Runs by default; `--no-speedtest` to skip, auto-skipped in `--watch`/`--from-file` loops |
 | 15 | Reality cover authenticity (auto) | Plain-TLS probe like a censor's active prober: is the presented cert a CA-valid cover, or **self-signed/mismatched** (fake cover, trivially fingerprinted)? Booleans only — never prints the cover domain |
 | 16 | Egress integrity (auto with 12) | Through the tunnel: egress geo + **datacenter/proxy/mobile flags** (is the exit IP already on "this is a VPN" lists?) + DNS-resolver region. Country + flags only, never the IP. `--no-egress-check` to skip the 3rd-party lookup |
 | 17 | Held-session stability (auto with 12) | Holds the tunnel ~20s with periodic pulses to catch **delayed mid-session RST / kill-shaping** that short bursts (13/14) miss. `--no-stability` to skip; auto-skipped in `--watch`/`--from-file` loops |
@@ -72,7 +72,7 @@ emits a clearly labelled verdict for each detected issue.
 | 23 | Path MTU to server (auto) | DF-bit `ping` sweep finds the path MTU; a clamp below 1500 fragments the Reality ClientHello and can cause intermittent handshake failures that mimic DPI |
 | 24 | TLS-negotiation parity (auto) | Does the server negotiate the same TLS version / ALPN / cipher as the genuine cover? Stealth depth-3 (15 cert → 20 HTTP → 24 negotiation); a fake/wrong-`dest` server diverges |
 | 25 | Cover-SNI region-throttle (auto) | Is the cover domain itself shaped in-region (which the tunnel silently inherits)? Direct fetch vs a neutral baseline; when the cover root is too small, cross-checks the tunnel throughput (which carries the cover SNI) |
-| 26 | Detectability score (synthesis) | Folds the stealth signals (15/20/24) into one 0-100 fingerprintability score + band for at-a-glance fleet triage |
+| 26 | Detectability score (synthesis, always last) | Folds **active** stealth (15/20/24) **and passive** structure (non-443 port, SNI↔IP mismatch, and their conjunction = the VLESS-Reality structural signature) into one 0-100 score + band. Catches a server that defeats every active probe but is still passively fingerprintable |
 
 The verdict ends with a list of detected blocks plus an actionable
 recommendation for each (rotate IP, switch to Reality, use uTLS, etc).
@@ -476,9 +476,9 @@ Mbps. That's not a bug — it's why every real speedtest (Ookla, fast.com)
 opens many parallel connections.
 
 Probe 14 does the same: **N parallel streams (default 4) against several
-public CDN backends** (Cloudflare, Hetzner, OVH), through the probe-12
+public CDN backends** (Cloudflare, DataPacket, OVH), through the probe-12
 tunnel, and reports the **best aggregate** as the usable-bandwidth
-estimate. Multiple endpoints mean one slow/blocked path can't skew the
+estimate. Multiple endpoints mean one slow/blocked/dead path can't skew the
 result; the per-stream timeout is derived from probe 12's measured
 handshake RTT so streams clear the Reality handshake before the download
 window opens.
@@ -486,10 +486,10 @@ window opens.
 ```
 == 14. Xray tunnel capacity (multi-stream / multi-endpoint) ==
           4 parallel streams × 3 endpoint(s), ≤50 MB total, 12s/stream (~5s handshake + 5s window)
-            cloudflare: 2.0 MB/s (17.3 Mbps)
-            hetzner: no data (endpoint unreachable through tunnel)
-            ovh: 2.0 MB/s (16.6 Mbps)
-  [OK]    best capacity: 2.0 MB/s (17.3 Mbps) via cloudflare (4 streams)
+            cloudflare: 9.0 MB/s (75.8 Mbps)
+            datapacket: 8.1 MB/s (68.0 Mbps)
+            ovh: 7.4 MB/s (62.1 Mbps)
+  [OK]    best capacity: 9.0 MB/s (75.8 Mbps) via cloudflare (4 streams)
           note: 4 MB/stream is small for a fast link — raise XRAY_SPEEDTEST_MAX_BYTES for a fuller reading (this is a floor)
 ```
 
@@ -518,7 +518,7 @@ XRAY_SPEEDTEST_STREAMS=8        # parallel streams per endpoint (default 4)
 XRAY_SPEEDTEST_MAX_BYTES=...    # total download budget in bytes (default ~50 MB)
 XRAY_SPEEDTEST_SECONDS=10       # download window per stream, after handshake (default 5)
 # Endpoints: space-separated name|url|mode triples. mode=cf → ?bytes=N, mode=range → HTTP Range.
-XRAY_SPEEDTEST_URLS='cloudflare|https://speed.cloudflare.com/__down|cf hetzner|https://speed.hetzner.de/100MB.bin|range'
+XRAY_SPEEDTEST_URLS='cloudflare|https://speed.cloudflare.com/__down|cf datapacket|https://lon.download.datapacket.com/100mb.bin|range'
 ```
 
 JSON output:
@@ -717,17 +717,41 @@ bulk): a healthy tunnel proves the SNI isn't throttled at this vantage, a
 collapsed one on clean transport flags it. Note it only detects a throttle
 *where it's enforced* — run from the affected region, not a clean vantage.
 
-**Probe 26 — detectability score** folds the three stealth probes into one
-number, because a censor sees one server, not three findings:
+**Probe 26 — detectability score (active + passive synthesis)** is the final
+probe and folds *every* detection signal into one 0-100 number, because a censor
+sees one server, not a list of findings. It weighs the **active** stealth probes
+(15 cover cert / 20 active-probe resistance / 24 TLS-negotiation parity) *and*
+the **passive** structure a censor can read off the wire without probing at all:
+
+- the cover SNI served on a **non-standard port** (real cover sites use 443);
+- the server IP **not on the cover domain's network** (SNI↔IP mismatch — decided
+  by DNS membership first, then an ASN cross-check so large CDNs don't false-positive);
+- the **conjunction** of those two — a *borrowed SNI on a non-standard port* is a
+  recognized VLESS-Reality structural signature.
+
+Active tells weigh heaviest. Each passive tell alone is FP-prone (legit services
+use 8443; domain fronting legitimately mismatches ASN), so they weigh less — but
+when both co-occur the conjunction is bumped and the finding is **named**,
+because together it's low-FP even against a server that defeats every active
+probe. So a perfectly active-cloaked Reality server (0/100 on active probing)
+that still serves a borrowed SNI on a non-standard port no longer reads as a
+clean bill — it's flagged and named:
 
 ```
-== 26. Detectability score (stealth synthesis) ==
-          signals: cover cert self-signed (15); no coherent HTTP to unauth prober (20); TLS negotiation ≠ cover (24)
-  [FAIL]  detectability 80/100 (critical) — an active prober would flag this server
+== 26. Detectability score (active + passive synthesis) ==
+          active · cover cert (15):   authentic, matches serverName          +0
+          active · active-probe (20): relays unauth probes to the real cover +0
+          active · TLS parity (24):   version+ALPN+cipher match cover        +0
+          passive · port:             non-standard (real cover sites use 443) +10
+          passive · SNI↔IP network:   server IP NOT on the cover's network (SNI↔IP mismatch) +10
+          passive · conjunction:      yes — borrowed SNI on a non-standard port +10
+          bands: 0-14 low · 15-39 moderate · 40-69 high · 70-100 critical
+  [WARN]  detectability 30/100 (moderate) — partially fingerprintable; see the breakdown above
+  [WARN]  passive Reality/Xray fingerprint: borrowed SNI (cover lives on another network) + non-standard port
 ```
 
-Weighted so a self-signed cover (critical) outranks a wrong-`dest` server
-(high) outranks a clean relay (low) — at-a-glance triage across a fleet.
+The breakdown is always printed, so the score is never a black box — every
+signal that did (and didn't) fire is shown with its points.
 
 #### Baseline / diff — turn the suite into a regression detector
 
@@ -756,7 +780,8 @@ run-to-run jitter won't trip it, and a changed server/egress IP is reported as
 dependency.
 
 JSON adds `probes.xray_cover_throttle` (cover vs baseline bytes/sec) and
-`probes.xray_detectability` (score + band).
+`probes.xray_detectability` (`score`, `band`, `port_standard`,
+`sni_ip_asn_match`, `passive_fingerprint_strong`).
 
 ---
 
@@ -850,7 +875,7 @@ Top-level keys: `schema_version`, `version`, `timestamp` (ISO-8601 UTC),
 | `XRAY_SPEEDTEST_STREAMS` | `4` | Probe 14 parallel streams per endpoint |
 | `XRAY_SPEEDTEST_MAX_BYTES` | `52428800` | Probe 14 total download budget (~50 MB); raise for a fuller capacity reading |
 | `XRAY_SPEEDTEST_SECONDS` | `5` | Probe 14 download window per stream, after the handshake |
-| `XRAY_SPEEDTEST_URLS` | CF / Hetzner / OVH | Probe 14 endpoints — space-separated `name\|url\|mode` triples (`mode`=`cf`\|`range`) |
+| `XRAY_SPEEDTEST_URLS` | CF / DataPacket / OVH | Probe 14 endpoints — space-separated `name\|url\|mode` triples (`mode`=`cf`\|`range`) |
 | `XRAY_EGRESS_CHECK` | `1` | Probe 16 on/off (set `0`, or `--no-egress-check`, to skip the 3rd-party IP-info call) |
 | `XRAY_EGRESS_INFO_URL` | `ip-api.com/json` | Probe 16 IP-info endpoint (point at your own to avoid the public service) |
 | `XRAY_STABILITY` | `1` | Probe 17 on/off (set `0`, or `--no-stability`, to disable) |

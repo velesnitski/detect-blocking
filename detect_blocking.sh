@@ -28,7 +28,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.5.2"
+readonly DETECT_BLOCKING_VERSION="0.5.3"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -206,13 +206,19 @@ if [ -n "$XRAY_CONFIG" ]; then
   if [ -z "${VPN_HOST:-}" ]; then
     case "$XRAY_CONFIG" in
       vless://*|trojan://*|ss://*|hysteria://*|hysteria2://*|tuic://*)
-        _derived_host=$(printf '%s' "$XRAY_CONFIG" \
-          | sed -nE 's|^[a-z0-9]+://[^@]+@([^:?#/]+).*|\1|p')
-        # Also derive the URL's port if present — aligns transport probes
-        # (2 / 3 / 5) with the same destination instead of leaving them
-        # on the 443 default. Critical for non-standard-port deployments.
-        _derived_port=$(printf '%s' "$XRAY_CONFIG" \
-          | sed -nE 's|^[a-z0-9]+://[^@]+@[^:?#/]+:([0-9]+).*|\1|p')
+        # Authority = after '@', before '?', '#' or '/'. Split host:port with
+        # IPv6-literal awareness ([addr]:port) so a v6 host isn't mangled to
+        # "[2001". (The old [^:?#/]+ regex stopped at the first colon.)
+        _auth=${XRAY_CONFIG#*://}; _auth=${_auth#*@}; _auth=${_auth%%[?#/]*}
+        case "$_auth" in
+          \[*\]*)  # IPv6 literal: [addr] or [addr]:port
+            _derived_host=${_auth#\[}; _derived_host=${_derived_host%%\]*}
+            case "$_auth" in *\]:*) _derived_port=${_auth##*\]:} ;; *) _derived_port="" ;; esac ;;
+          *:*)     _derived_host=${_auth%%:*}; _derived_port=${_auth##*:} ;;
+          *)       _derived_host=$_auth; _derived_port="" ;;
+        esac
+        case "$_derived_port" in *[!0-9]*) _derived_port="" ;; esac
+        unset _auth
         if [ -n "$_derived_host" ]; then
           VPN_HOST="$_derived_host"
           if [ -n "$_derived_port" ] && [ -z "${VPN_PORT_TCP:-}" ]; then
@@ -377,6 +383,13 @@ _should_run() {
 VPN_HOST="${VPN_HOST:-www.example.com}"
 VPN_PORT_TCP="${VPN_PORT_TCP:-443}"
 VPN_PORT_UDP="${VPN_PORT_UDP:-443}"
+
+# IPv6-literal endpoints: parsing now handles them, probes that pass host+port
+# separately (nc) or split on the last colon (openssl) work, and URL-building
+# brackets them — but full support is best-effort, so flag it once up front.
+case "$VPN_HOST" in
+  *:*:*) printf '%s\n' "note: IPv6-literal endpoint (${VPN_HOST}) — probe support is best-effort; if a probe misbehaves, pass a hostname or use --xray-config-json" >&2 ;;
+esac
 IKEV2_HOST="${IKEV2_HOST:-$VPN_HOST}"
 OPENVPN_HOST="${OPENVPN_HOST:-$VPN_HOST}"
 OPENVPN_PORT_UDP="${OPENVPN_PORT_UDP:-1194}"
@@ -736,6 +749,11 @@ _resolve_a_records() {
     printf '%s\n' "$host"
     return
   fi
+  # Same for an IPv6 literal (>=2 colons, hex/colon only) — nc and openssl
+  # accept it directly, so hand it through instead of failing to "resolve" it.
+  case "$host" in
+    *:*:*) case "$host" in *[!0-9A-Fa-f:]*) ;; *) printf '%s\n' "$host"; return ;; esac ;;
+  esac
   if check_cmd dig; then
     dig +short +time="$TIMEOUT" +tries=1 "$host" A 2>/dev/null | _ipv4_lines
   elif check_cmd host; then
@@ -961,10 +979,13 @@ _summarize_xray_url() {
 }
 
 _target_https_url() {
+  # Bracket an IPv6 literal so the URL is valid (https://[2001:db8::1]/).
+  local h="$VPN_HOST"
+  case "$h" in *:*:*) h="[$h]" ;; esac
   if [ "$VPN_PORT_TCP" = "443" ]; then
-    printf 'https://%s/' "$VPN_HOST"
+    printf 'https://%s/' "$h"
   else
-    printf 'https://%s:%s/' "$VPN_HOST" "$VPN_PORT_TCP"
+    printf 'https://%s:%s/' "$h" "$VPN_PORT_TCP"
   fi
 }
 
@@ -1001,10 +1022,15 @@ _synthesize_xray_json_from_url() {
   rest=${url#*://}; rest=${rest%%#*}      # drop scheme + fragment
   uuid=${rest%%@*}
   after=${rest#*@}
-  hostport=${after%%\?*}
+  hostport=${after%%\?*}; hostport=${hostport%%/*}
   query=""; case "$after" in *\?*) query=${after#*\?} ;; esac
-  host=${hostport%%:*}
-  port=${hostport##*:}
+  # IPv6-literal aware host:port split ([addr]:port).
+  case "$hostport" in
+    \[*\]*)  host=${hostport#\[}; host=${host%%\]*}
+             case "$hostport" in *\]:*) port=${hostport##*\]:} ;; *) port="" ;; esac ;;
+    *:*)     host=${hostport%%:*}; port=${hostport##*:} ;;
+    *)       host=$hostport; port="" ;;
+  esac
   case "$port" in ''|*[!0-9]*) port=443 ;; esac
   [ -n "$uuid" ] && [ -n "$host" ] || return 1
 

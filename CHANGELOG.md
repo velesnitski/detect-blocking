@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-06-02
+
+### Fixed
+
+- **IPv6-literal endpoints no longer mangled.** Found by edge-case testing: a
+  `vless://uuid@[2001:db8::1]:443?…` URL parsed the host as `[2001` (the
+  `[^:?#/]+` regex stopped at the first colon), and the `${hostport%%:*}`
+  split in the URL→JSON synthesizer had the same bug. Both now use
+  bracket-aware `[addr]:port` parsing. A bare IPv6 literal as `VPN_HOST` also
+  short-circuits DNS the way an IPv4 literal already did (so it's *probed*
+  instead of reported "Domain unresolvable" — `nc`/`openssl` accept v6
+  directly), and `_target_https_url` brackets v6 hosts so curl URLs are valid
+  (`https://[2001:db8::1]/`). A one-line note flags that full v6-literal
+  support is best-effort (some probes still assume v4); pass a hostname or
+  `--xray-config-json` if a probe misbehaves.
+
+  New test `tests/test_ipv6_literal.sh` (host/port parsing + DNS
+  short-circuit, using RFC 3849 documentation addresses). Suite now 15;
+  shellcheck clean.
+
 ## [0.5.2] - 2026-06-02
 
 ### Fixed

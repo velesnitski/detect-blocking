@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.7] - 2026-06-02
+
+### Changed
+
+- **Probe 26 (detectability) now shows a per-component breakdown.** A bare
+  "detectability 0/100 (low) — blends in" gave no insight into *what* was
+  evaluated. It now prints each input (cover cert / active-probe / TLS parity)
+  with its state and point contribution, plus the band legend — so the score
+  is explainable at any value:
+
+  ```
+  cover cert (15):   authentic, matches serverName              +0
+  active-probe (20): relays unauth probes to the real cover     +0
+  TLS parity (24):   version+ALPN+cipher match cover            +0
+  bands: 0-14 low · 15-39 moderate · 40-69 high · 70-100 critical
+  [OK]  detectability 0/100 (low) — every stealth check passed, blends in
+  ```
+
+  Scoring is unchanged; this is display-only (the components are already in
+  the JSON under `xray_cover` / `xray_active_probe` / `xray_tls_parity`).
+
 ## [0.5.6] - 2026-06-02
 
 ### Fixed

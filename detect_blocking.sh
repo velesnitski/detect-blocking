@@ -28,7 +28,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.5.6"
+readonly DETECT_BLOCKING_VERSION="0.5.7"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -3230,20 +3230,41 @@ probe_xray_detectability() {
 
   hdr "26. Detectability score (stealth synthesis)"
 
-  local score=0 reasons=""
-  _det_add() { score=$(( score + $1 )); reasons="${reasons}${reasons:+; }$2"; }
+  local score=0
 
-  # Self-signed / fake cover is the single loudest tell.
-  [ "${XRAY_COVER_SELFSIGNED:-0}" = "1" ] && _det_add 40 "cover cert self-signed (15)"
-  [ "${XRAY_COVER_CHAIN_VALID:-1}" = "0" ] && [ "${XRAY_COVER_SELFSIGNED:-0}" != "1" ] && _det_add 15 "cover cert not CA-valid (15)"
-  [ "${XRAY_COVER_CN_MATCH:-1}" = "0" ] && _det_add 10 "cover CN ≠ serverName (15)"
-  # Active-probe behaviour: not relaying to the real cover.
+  # Each input is scored AND described, so the total is explainable even at 0.
+  # --- cover certificate (probe 15) ---
+  local cover_pts=0 cover_desc=""
+  if [ "${XRAY_COVER_SELFSIGNED:-0}" = "1" ]; then
+    cover_pts=40; cover_desc="self-signed"
+  elif [ "${XRAY_COVER_CHAIN_VALID:-1}" = "0" ]; then
+    cover_pts=15; cover_desc="not CA-valid"
+  fi
+  if [ "${XRAY_COVER_CN_MATCH:-1}" = "0" ]; then
+    cover_pts=$(( cover_pts + 10 ))
+    cover_desc="${cover_desc:+$cover_desc + }CN≠serverName"
+  fi
+  [ -z "$cover_desc" ] && cover_desc="authentic, matches serverName"
+  score=$(( score + cover_pts ))
+
+  # --- active-probe behaviour (probe 20) ---
+  local active_pts=0 active_desc
   case "$XRAY_ACTIVE_STATUS" in
-    exposed)  _det_add 25 "no coherent HTTP to unauth prober (20)" ;;
-    mismatch) _det_add 15 "unauth response ≠ cover (20)" ;;
+    ok)        active_desc="relays unauth probes to the real cover" ;;
+    exposed)   active_pts=25; active_desc="no coherent HTTP to an unauth prober" ;;
+    mismatch)  active_pts=15; active_desc="unauth response differs from cover" ;;
+    *)         active_desc="not evaluated (${XRAY_ACTIVE_STATUS:-skipped})" ;;
   esac
-  # TLS-negotiation divergence from the cover.
-  [ "$XRAY_TLSPAR_STATUS" = "mismatch" ] && _det_add 15 "TLS negotiation ≠ cover (24)"
+  score=$(( score + active_pts ))
+
+  # --- TLS-negotiation parity (probe 24) ---
+  local tls_pts=0 tls_desc
+  case "$XRAY_TLSPAR_STATUS" in
+    ok)        tls_desc="version+ALPN+cipher match cover" ;;
+    mismatch)  tls_pts=15; tls_desc="negotiation differs from cover" ;;
+    *)         tls_desc="not evaluated (${XRAY_TLSPAR_STATUS:-skipped})" ;;
+  esac
+  score=$(( score + tls_pts ))
 
   [ "$score" -gt 100 ] && score=100
   XRAY_DETECT_SCORE="$score"
@@ -3253,14 +3274,19 @@ probe_xray_detectability() {
   else XRAY_DETECT_BAND="low"; fi
   XRAY_DETECT_STATUS="ok"
 
-  [ -n "$reasons" ] && info "signals: ${reasons}"
+  # Component breakdown — always shown, so the score is never a black box.
+  info "$(printf 'cover cert (15):   %-42s +%d' "$cover_desc" "$cover_pts")"
+  info "$(printf 'active-probe (20): %-42s +%d' "$active_desc" "$active_pts")"
+  info "$(printf 'TLS parity (24):   %-42s +%d' "$tls_desc" "$tls_pts")"
+  info "bands: 0-14 low · 15-39 moderate · 40-69 high · 70-100 critical"
+
   if [ "$score" -ge 40 ]; then
     fail "detectability ${score}/100 (${XRAY_DETECT_BAND}) — an active prober would flag this server"
     add_verdict "Detectability ${score}/100 (${XRAY_DETECT_BAND}) — the stealth signals (probes 15/20/24) combine into a strong fingerprint. Fix the cover relay (real 'dest'/'serverNames') to drop the score; see the individual probes for specifics"
   elif [ "$score" -ge 15 ]; then
-    warn "detectability ${score}/100 (${XRAY_DETECT_BAND})"
+    warn "detectability ${score}/100 (${XRAY_DETECT_BAND}) — partially fingerprintable; see the breakdown above"
   else
-    ok "detectability ${score}/100 (${XRAY_DETECT_BAND}) — blends in"
+    ok "detectability ${score}/100 (${XRAY_DETECT_BAND}) — every stealth check passed, blends in"
   fi
 }
 

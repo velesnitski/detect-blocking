@@ -28,7 +28,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.7.0"
+readonly DETECT_BLOCKING_VERSION="0.7.1"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -3430,11 +3430,16 @@ probe_xray_detectability() {
 
   # --- active-probe behaviour (probe 20) ---
   local active_pts=0 active_desc
+  # "couldn't baseline" (no-baseline) is scored as a small UNVERIFIED risk, not
+  # +0: an unconfirmed stealth dimension is an open risk, not a clean pass. It's
+  # weighted well below a confirmed tell (absence of evidence ≠ evidence of bad),
+  # and applies ONLY to a cover/server-side failure — a missing local tool stays
+  # +0 (our limitation, not the server's risk).
   case "$XRAY_ACTIVE_STATUS" in
     ok)          active_desc="relays unauth probes to the real cover" ;;
     exposed)     active_pts=25; active_desc="no coherent HTTP to an unauth prober" ;;
     mismatch)    active_pts=15; active_desc="unauth response differs from cover" ;;
-    no-baseline) active_desc="not evaluated${nxnote:- (no genuine cover to baseline)}" ;;
+    no-baseline) active_pts=5;  active_desc="UNVERIFIED${nxnote:- (no genuine cover to baseline)}" ;;
     *)           active_desc="not evaluated (${XRAY_ACTIVE_STATUS:-skipped})" ;;
   esac
   score=$(( score + active_pts ))
@@ -3444,7 +3449,7 @@ probe_xray_detectability() {
   case "$XRAY_TLSPAR_STATUS" in
     ok)          tls_desc="version+ALPN+cipher match cover" ;;
     mismatch)    tls_pts=15; tls_desc="negotiation differs from cover" ;;
-    unreachable) tls_desc="not evaluated${nxnote:- (cover unreachable)}" ;;
+    unreachable) tls_pts=5;  tls_desc="UNVERIFIED${nxnote:- (cover unreachable)}" ;;
     *)           tls_desc="not evaluated (${XRAY_TLSPAR_STATUS:-skipped})" ;;
   esac
   score=$(( score + tls_pts ))

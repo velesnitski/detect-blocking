@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-06-02
+
+### Changed
+
+- **An unverifiable stealth dimension now counts as risk, not a clean pass.**
+  When probe 20 (active-probe resistance) or 24 (TLS parity) can't baseline
+  against the genuine cover, probe 26 used to score it `+0` — i.e. treat
+  "couldn't check" as "verified clean," which understates risk. It now adds a
+  modest **UNVERIFIED +5** each, because an unconfirmed stealth property is an
+  open risk. Guards against false inflation: it's weighted well below a
+  *confirmed* tell (25/15 — absence of evidence ≠ evidence of bad), and applies
+  **only** to a cover/server-side baseline failure (`no-baseline` / `unreachable`)
+  — a missing local tool (openssl/curl) stays `+0`, since that's the tool's
+  limitation, not the server's risk. So a Reality server with an NXDOMAIN cover
+  reads ~30/100 (cover quality + the two unverified dimensions) instead of a
+  misleading low score.
+
 ## [0.7.0] - 2026-06-02
 
 Four fixes surfaced by testing a real VLESS-Reality + XHTTP share-link, where

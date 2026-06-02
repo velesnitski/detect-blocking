@@ -28,7 +28,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.6.2"
+readonly DETECT_BLOCKING_VERSION="0.6.3"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -1042,7 +1042,7 @@ _synthesize_xray_json_from_url() {
   case "$port" in ''|*[!0-9]*) port=443 ;; esac
   [ -n "$uuid" ] && [ -n "$host" ] || return 1
 
-  local net sec sni fp pbk sid spx flow alpn path hosthdr svc hdr enc
+  local net sec sni fp pbk sid spx flow alpn path hosthdr svc hdr enc insec
   net=$(_qp "$query" type);        [ -z "$net" ] && net=tcp
   sec=$(_qp "$query" security);    [ -z "$sec" ] && sec=none
   sni=$(_qp "$query" sni)
@@ -1057,6 +1057,12 @@ _synthesize_xray_json_from_url() {
   svc=$(_urldecode "$(_qp "$query" serviceName)")
   hdr=$(_qp "$query" headerType)
   enc=$(_qp "$query" encryption); [ -z "$enc" ] && enc=none
+  # allowInsecure: clients spell it allowInsecure= or insecure=; values 1/true.
+  # Carrying it lets us faithfully probe skip-verify WS/TLS configs (which would
+  # otherwise fail the handshake on their invalid cert) — and it's a tell in its
+  # own right: a config that needs it is masking a cert that won't validate.
+  insec=$(_qp "$query" allowInsecure); [ -z "$insec" ] && insec=$(_qp "$query" insecure)
+  case "$insec" in 1|true|TRUE|True) insec=1 ;; *) insec="" ;; esac
 
   # Single temp file — no .json extension needed: probe 12 reads this via jq
   # and writes its own patched .json that xray-core actually loads, so this
@@ -1069,7 +1075,8 @@ _synthesize_xray_json_from_url() {
       --arg uuid "$uuid" --arg enc "$enc" --arg flow "$flow" \
       --arg net "$net" --arg sec "$sec" --arg sni "$sni" --arg fp "$fp" \
       --arg pbk "$pbk" --arg sid "$sid" --arg spx "$spx" --arg alpn "$alpn" \
-      --arg path "$path" --arg hosthdr "$hosthdr" --arg svc "$svc" --arg hdr "$hdr" '
+      --arg path "$path" --arg hosthdr "$hosthdr" --arg svc "$svc" --arg hdr "$hdr" \
+      --arg insec "$insec" '
       def nz(s): if s == "" then null else s end;
       def prune: with_entries(select(.value != null));
       def secSettings:
@@ -1078,7 +1085,8 @@ _synthesize_xray_json_from_url() {
                                 publicKey:nz($pbk), shortId:nz($sid), spiderX:nz($spx) } | prune) }
         elif $sec == "tls" then
           { tlsSettings: ({ serverName:nz($sni), fingerprint:nz($fp),
-                            alpn:(if $alpn=="" then null else ($alpn|split(",")) end) } | prune) }
+                            alpn:(if $alpn=="" then null else ($alpn|split(",")) end),
+                            allowInsecure:(if $insec=="1" then true else null end) } | prune) }
         else {} end;
       def transportSettings:
         if $net == "ws" then
@@ -2679,13 +2687,14 @@ probe_xray_lint() {
 
   hdr "18. Config pre-flight (lint)"
 
-  local sec net flow pbk sid sni enc fp findings=""
+  local sec net flow pbk sid sni enc fp insec findings=""
   if [ -n "$XRAY_CONFIG" ]; then
     local q=""
     case "$XRAY_CONFIG" in *\?*) q=${XRAY_CONFIG#*\?}; q=${q%%#*} ;; esac
     sec=$(_qp "$q" security); net=$(_qp "$q" type); flow=$(_qp "$q" flow)
     pbk=$(_qp "$q" pbk); sid=$(_qp "$q" sid); sni=$(_qp "$q" sni)
     enc=$(_qp "$q" encryption); fp=$(_qp "$q" fp)
+    insec=$(_qp "$q" allowInsecure); [ -z "$insec" ] && insec=$(_qp "$q" insecure)
     [ -z "$net" ] && net=tcp
   else
     sec=$(_xray_cfg_field security '.outbounds[0].streamSettings.security')
@@ -2696,8 +2705,10 @@ probe_xray_lint() {
     sni=$(_xray_cfg_field sni      '.outbounds[0].streamSettings.realitySettings.serverName')
     enc=$(_xray_cfg_field encryption '.outbounds[0].settings.vnext[0].users[0].encryption')
     fp=$(_xray_cfg_field fp        '.outbounds[0].streamSettings.realitySettings.fingerprint')
+    insec=$(_xray_cfg_field allowInsecure '.outbounds[0].streamSettings.tlsSettings.allowInsecure')
     [ -z "$net" ] && net=tcp
   fi
+  case "$insec" in 1|true|TRUE|True) insec=1 ;; *) insec="" ;; esac
 
   # Join findings with a real newline (JSON emit splits on "\n").
   _lint_add() {
@@ -2737,6 +2748,15 @@ $1"
     case "$XRAY_CONFIG$XRAY_JSON_CONFIG" in
       vless*|*vless*) _lint_add "vless requires encryption=none, got encryption=$enc" ;;
     esac
+  fi
+  # allowInsecure / insecure=true — a static red flag that needs no network, so
+  # it fires even against an unreachable node: the client accepts ANY server
+  # cert, which (a) masks a cover cert that won't validate for the SNI — itself
+  # a strong active-probe fingerprint — and (b) is MITM-able. Reality needs no
+  # client-side cert at all; if you must use plain TLS, use a real domain whose
+  # cert is genuinely valid so allowInsecure can be dropped.
+  if [ "$insec" = "1" ]; then
+    _lint_add "allowInsecure=true — client skips cert validation; it's masking an invalid/self-signed cert (a strong active-probe tell) and is MITM-able. Use a real valid-cert domain, or Reality (no client cert needed)"
   fi
 
   XRAY_LINT_FINDINGS="$findings"

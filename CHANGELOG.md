@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-06-02
+
+### Added
+
+- **`allowInsecure` / `insecure=true` handling for skip-verify WS/TLS configs.**
+  Some VLESS configs (e.g. sing-box `"tls": { "insecure": true }`, exported as
+  a `vless://…&allowInsecure=1` share-link) tell the client to accept *any*
+  server cert. Two changes:
+  - the URL→JSON synthesis now **carries `allowInsecure` into `tlsSettings`**
+    (both `allowInsecure=` and `insecure=` spellings), so such a config can be
+    probed end-to-end instead of failing the handshake on its invalid cert;
+  - the config lint (probe 18, static — so it **fires even against an
+    unreachable node**) now **flags `allowInsecure=true` as a detectability
+    tell**: the client is masking a cert that won't validate for the SNI (a
+    strong active-probe fingerprint) and the path is MITM-able. The fix is a
+    real valid-cert domain, or Reality (which needs no client-side cert).
+
+  New test `tests/test_allow_insecure.sh`. Suite now 18.
+
 ## [0.6.2] - 2026-06-02
 
 ### Added

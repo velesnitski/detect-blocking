@@ -64,7 +64,7 @@ emits a clearly labelled verdict for each detected issue.
 | 15 | Reality cover authenticity (auto) | Plain-TLS probe like a censor's active prober: is the presented cert a CA-valid cover, or **self-signed/mismatched** (fake cover, trivially fingerprinted)? Booleans only — never prints the cover domain |
 | 16 | Egress integrity (auto with 12) | Through the tunnel: egress geo + **datacenter/proxy/mobile flags** (is the exit IP already on "this is a VPN" lists?) + DNS-resolver region. Country + flags only, never the IP. `--no-egress-check` to skip the 3rd-party lookup |
 | 17 | Held-session stability (auto with 12) | Holds the tunnel ~20s with periodic pulses to catch **delayed mid-session RST / kill-shaping** that short bursts (13/14) miss. `--no-stability` to skip; auto-skipped in `--watch`/`--from-file` loops |
-| 18 | Config pre-flight lint (auto) | Static validation of the URL/JSON for common Reality/VLESS misconfigs (`flow`/`network` mismatch, bad `shortId`, bare-IP SNI, missing `pbk`, …) — so a typo doesn't masquerade as DPI. Names the knob, never the secret |
+| 18 | Config pre-flight lint (auto) | Static validation of the URL/JSON for common Reality/VLESS misconfigs (`flow`/`network` mismatch, bad `shortId`, bare-IP SNI, missing `pbk`, `allowInsecure=true` masking an invalid cert, …) — so a typo doesn't masquerade as DPI, and stealth red flags surface even against an unreachable node. Names the knob, never the secret |
 | 19 | Clock skew (auto) | Reality auth is time-windowed; a client clock off by minutes fails the handshake like a block. Compares local time to a server `Date` header, warns past ±60s |
 | 20 | Active-probe resistance (auto) | Probe 15 checks the cover *cert*; this checks the cover *behaviour* — does an unauthenticated HTTPS request get relayed to the genuine cover site (real Reality) or return garbage (fake)? |
 | 21 | Per-outbound fleet matrix (auto on multi-outbound) | Tunnel-tests **each outbound** of a balancer/multi-outbound config and prints a health table by tag; tells a single dead endpoint apart from a fleet-wide config fault. Auto-enables when the JSON has >1 outbound; `--no-fleet` to disable |
@@ -615,11 +615,14 @@ states, `kill_at_bytes`, RTT range).
 **Probe 18 — config pre-flight lint** is static and instant, and catches the
 misconfigs that otherwise masquerade as DPI: `flow=xtls-rprx-vision` without
 `network=tcp`, a non-hex or over-long `shortId`, a bare-IP `serverName`, a
-missing `publicKey`, vless `encryption≠none`, no uTLS fingerprint. Each
-finding names the protocol knob, never the secret value. This is the cheapest,
-highest-leverage probe — half the "is it DPI?" scares this tool was built to
-diagnose turn out to be a typo (its findings also surface in the consolidated
-verdict block).
+missing `publicKey`, vless `encryption≠none`, no uTLS fingerprint. It also flags
+`allowInsecure=true` (a.k.a. `"insecure": true`) — the client accepts any cert,
+which masks a cover cert that won't validate for the SNI (a strong active-probe
+tell) and is MITM-able; because the check is static it fires **even against an
+unreachable node**. Each finding names the protocol knob, never the secret
+value. This is the cheapest, highest-leverage probe — half the "is it DPI?"
+scares this tool was built to diagnose turn out to be a typo (its findings also
+surface in the consolidated verdict block).
 
 **Probe 19 — clock skew** checks a failure mode nobody thinks to: Reality
 authentication is time-windowed, so a client clock off by minutes makes the

@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-06-02
+
+### Fixed
+
+- **Probe 12 neutralizes device-specific log paths so mobile-exported configs
+  boot.** A config exported from an iOS / Android client bakes an app-sandbox
+  path into `log.access` (e.g.
+  `/private/var/mobile/Containers/Shared/AppGroup/…/Xray/logs/access.log`).
+  That directory doesn't exist on the test machine, so xray-core fails to
+  initialize its access logger and never starts — probe 12 reported
+  `xray-bind-failed` and every tunnel-dependent probe (13/14/16/17/22) silently
+  skipped, even though the server itself was perfectly healthy. When patching
+  the config probe 12 now also resets `.log` to `{ loglevel: "warning" }`
+  (dropping the file paths; xray logs to stderr, which the probe already
+  captures), so a config pulled straight off a phone tests end-to-end. New
+  test `tests/test_log_path_neutralize.sh`. Suite now 16.
+
 ## [0.5.4] - 2026-06-02
 
 ### Changed

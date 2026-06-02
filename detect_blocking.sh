@@ -28,7 +28,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.5.4"
+readonly DETECT_BLOCKING_VERSION="0.5.5"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -1949,6 +1949,11 @@ probe_xray_json() {
              settings: { auth: "noauth", udp: true }
            }]
          else . end)
+       # Neutralise device-specific log file paths. Mobile clients (iOS /
+       # Android) bake an app-sandbox path into .log.access/.error that does
+       # not exist on this machine, so xray-core fails to open its logger and
+       # never starts. Drop the paths; let it log to stderr (which we capture).
+       | .log = { loglevel: "warning" }
      ' "$XRAY_JSON_CONFIG" > "$XRAY_JSON_PATCHED_PATH" 2>/dev/null; then
     fail "jq failed to patch config (malformed json?)"
     XRAY_JSON_STATUS="config-malformed"

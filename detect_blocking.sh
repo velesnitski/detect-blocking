@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.7.4"
+readonly DETECT_BLOCKING_VERSION="0.7.5"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -489,6 +489,7 @@ STRICT_OPENVPN_VERDICT="${STRICT_OPENVPN_VERDICT:-0}"
 RESOLVED_IP=""
 RESOLVED_SOURCE=""
 TCP_OK=0
+TARGET_ICMP_OK=""   # 1/0/"" — did the target answer ICMP when TCP 80+443 both failed
 OPENVPN_UDP_OK=0
 OPENVPN_TCP_OK=0
 DOH_INTEGRITY_STATE=""   # one of: "", ok, unreachable, compromised
@@ -809,6 +810,20 @@ _sets_intersect() {
   for ip in $left; do
     case " $right " in *" $ip "*) return 0 ;; esac
   done
+  return 1
+}
+
+# Bounded ICMP liveness — true (0) if the host answers one ping within ~2s.
+# Portable: Linux uses -W <seconds> for the reply timeout; macOS's -W is in
+# milliseconds and instead takes -t <seconds> as a whole-run timeout. Try the
+# Linux form first (on macOS its short ms-wait just fails and we fall through to
+# -t). A "no reply" is only ever false — ICMP may be filtered — so callers must
+# weigh it as a hint, not proof of a down host.
+_host_pings() {
+  local ip="$1"
+  [ -n "$ip" ] || return 1
+  ping -c 1 -W 2 "$ip" >/dev/null 2>&1 && return 0
+  ping -c 1 -t 2 "$ip" >/dev/null 2>&1 && return 0
   return 1
 }
 
@@ -1438,7 +1453,20 @@ probe_tcp_reachability() {
       warn "but TCP 80 to same IP works → PORT-SPECIFIC block on 443"
       add_verdict "Port 443 blocked, port 80 open → port-specific filtering"
     else
-      add_verdict "IP route blocked entirely (TCP 80 and 443 both fail)"
+      # Both TCP ports dead. Don't assert censorship here: whether this is an
+      # IP-level block or a downed / null-routed server depends on the vantage,
+      # which the recommendation weighs against the control-site result (probe
+      # 8). ICMP narrows it further — a host that pings but refuses TCP is up
+      # and filtered; total silence means it's unreachable.
+      if _host_pings "$RESOLVED_IP"; then
+        TARGET_ICMP_OK=1
+        warn "TCP 80 + 443 both fail, but the host answers ICMP → up but TCP-filtered"
+        add_verdict "Target host responds to ICMP but TCP 80/443 are filtered — the host is up; a targeted port/route block, or the service isn't listening"
+      else
+        TARGET_ICMP_OK=0
+        warn "TCP 80 + 443 fail and no ICMP reply → host unreachable (down, null-routed, or route blocked)"
+        add_verdict "Target host is unreachable — no TCP (80/443) and no ICMP reply"
+      fi
     fi
   fi
 }
@@ -3782,6 +3810,7 @@ _emit_json() {
     --argjson tcp_baseline  "${TCP_BASELINE_OK:-0}" \
     --arg tcp_baseline_ip   "$TCP_BASELINE_IP" \
     --argjson tcp_target    "${TCP_OK:-0}" \
+    --arg tcp_target_icmp   "$TARGET_ICMP_OK" \
     --argjson tls_proper    "${TLS_PROPER_SNI_OK:-0}" \
     --argjson tls_no_sni    "${TLS_NO_SNI_OK:-0}" \
     --argjson tls_fake      "${TLS_FAKE_SNI_OK:-0}" \
@@ -3925,7 +3954,8 @@ _emit_json() {
         tcp: {
           baseline_reachable: bool_int($tcp_baseline),
           baseline_ip: opt($tcp_baseline_ip),
-          target_reachable: bool_int($tcp_target)
+          target_reachable: bool_int($tcp_target),
+          target_icmp_ok: tri_bool(($tcp_target_icmp | tonumber? // -1))
         },
         tls: {
           proper_sni_ok: bool_int($tls_proper),
@@ -4344,7 +4374,19 @@ else
       *"Domain unresolvable"*)    rec="verify the hostname and test from another resolver/network" ;;
       *"Network connectivity"*)   rec="check local internet/VPN state before interpreting target probes" ;;
       *"Target TCP reachability"*) rec="fix DNS first, then rerun transport probes" ;;
-      *"IP route"*)               rec="rotate to a fresh IP / different /24" ;;
+      *"Target host responds to ICMP"*) rec="the host is up but TCP-filtered — test from another vantage: filtered only here means a targeted block (rotate port/IP); filtered everywhere means the service isn't running" ;;
+      *"Target host is unreachable"*)
+        # Vantage-aware: a dark host on a CLEAN vantage (all control sites
+        # reachable, probe 8) is far more likely down / null-routed than
+        # censored — so don't tell the user to rotate their IP for a server
+        # that's simply offline.
+        if [ "${CONTROL_TOTAL:-0}" -gt 0 ] && [ "${CONTROL_PASS:-0}" -eq "${CONTROL_TOTAL:-0}" ]; then
+          rec="control sites are all reachable, so this isn't broad censorship from here — the server is most likely DOWN / null-routed; verify it's up or get a current IP (rotating your own IP won't help). Only if you're testing from inside the censored region is an IP block likely — retest from a clean vantage"
+        elif [ "${CONTROL_TOTAL:-0}" -gt 0 ]; then
+          rec="you're on a filtered network (some control sites blocked) and the target is dark too — possibly an IP-level block; rotate to a fresh IP / different /24 and retest from a clean vantage to rule out the node simply being down"
+        else
+          rec="verify the node is up and reachable from another vantage — if it answers elsewhere, your path to it is blocked (rotate IP / try another network); if it answers nowhere, the server is down"
+        fi ;;
       *"Port 443"*)               rec="try TCP 8443, 2083, 2053 (Cloudflare-allowed ports)" ;;
       *"TLS DPI"*)                rec="switch to a non-TLS transport (Hysteria2, IKEv2, WG)" ;;
       *"TLS-record fragmentation"*) rec="this block ignores fragmented ClientHellos — run a DPI-desync proxy: ByeDPI/ciadpi (desktop SOCKS), ByeDPIAndroid (Android), or zapret/GoodbyeDPI. Start with TLS-record split (--tlsrec/--split, what this probe confirmed); if a stricter DPI needs more, escalate to fake-packet+TTL (--fake --ttl) or --disorder" ;;

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.5] - 2026-06-03
+
+### Changed
+
+- **"IP route blocked" no longer overclaims censorship for a host that's just
+  down.** When the target's TCP 80+443 both fail, probe 2 used to assert *"IP
+  route blocked entirely"* and recommend *"rotate to a fresh IP"* — wrong for a
+  server that's simply offline, and useless advice (rotating *your* IP can't fix
+  a downed server). It's now **vantage-aware**:
+  - an **ICMP liveness** check splits "up but TCP-filtered" (host pings) from
+    "unreachable" (no TCP, no ICMP), each with its own verdict;
+  - the recommendation cross-references the **control sites** (probe 8): on a
+    **clean vantage** (all control sites reachable → not broad censorship) an
+    unreachable host reads as *"most likely DOWN / null-routed — verify it's up;
+    rotating your own IP won't help"*; only on a **filtered vantage** is an
+    IP-level block suggested.
+
+  JSON `probes.tcp` gains `target_icmp_ok`. New test
+  `tests/test_ip_route_vantage.sh`.
+
 ## [0.7.4] - 2026-06-03
 
 ### Added

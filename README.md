@@ -48,7 +48,7 @@ emits a clearly labelled verdict for each detected issue.
 |---|-------|---------|
 | 0 | Environment | Whether a VPN is currently active (results then describe the VPN exit path, not the local ISP) |
 | 1 | DNS resolution | DNS sinkhole / system-DNS failure / **DoH integrity canary** + **multi-DoH cross-check** (Cloudflare/Google/Quad9) / **DoT canary** / CDN-anycast divergence |
-| 2 | TCP reachability | Full IP block vs port-specific (443 dead but 80 alive) |
+| 2 | TCP reachability | Port-specific (443 dead, 80 alive) vs host unreachable; an unreachable host is split by ICMP (up-but-filtered vs dark) and framed by vantage — a dark host with control sites reachable reads as "server likely down", not "rotate your IP" |
 | 3 | TLS handshake | SNI-based DPI (proper SNI dies, no-SNI works); auto-runs **64-byte record-fragmentation probe** when SNI is blocked. For a Reality config it probes the **cover serverName** (not the bare-IP host) and judges the block on that — so Reality's by-design drop of non-matching SNIs isn't misread as DPI |
 | 4 | UA / TLS-fp filtering | User-Agent filtering; **real JA3 via `curl-impersonate`** when installed |
 | 5 | Mid-handshake RST | Active DPI reset (<1s) vs silent drop (full timeout) |

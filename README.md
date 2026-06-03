@@ -839,8 +839,12 @@ Options:
       --port-survey       Scan curated list of common VPN/proxy alt ports.
       --xray-config URL       End-to-end Xray-protocol test (xray-knife).
                               vless://, vmess://, trojan://, ss://, hysteria2:// URLs.
-      --xray-config-json FILE Full-config end-to-end (xray-core + SOCKS5; covers
+      --xray-config-json SRC  Full-config end-to-end (xray-core + SOCKS5; covers
                               fragment, dialerProxy, noises, chained outbounds).
+                              SRC is a file path, INLINE JSON ('{…}'), or '-'
+                              (stdin). Single-quote inline JSON, or pipe it with
+                              a quoted heredoc — --xray-config-json - <<'EOF' …
+                              EOF — to dodge shell-quoting of { } " entirely.
       --json              Emit machine-readable JSON; implies --quiet. Requires jq.
       --reveal            Print the real offending values (cover serverName,
                           flagged SNI, egress IP / org) to the TERMINAL. Off by

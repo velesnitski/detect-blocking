@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-06-03
+
+### Added
+
+- **`--xray-config-json` now accepts inline JSON and stdin, not just a file.**
+  The value may be a file path (unchanged), **inline JSON** (`'{…}'`), or **`-`**
+  (read from stdin). JSON is full of shell-hostile symbols (`{ } " :` spaces), so
+  the robust ways to pass it are to single-quote inline JSON, or — cleanest — a
+  quoted heredoc over stdin: `--xray-config-json - <<'EOF' … EOF` (the quoted
+  delimiter stops the shell touching `$`/backticks/quotes inside). Inline/stdin
+  JSON is written to a `0600` temp file that the EXIT trap removes (it holds live
+  credentials), so every downstream reader still sees a normal path. Invalid JSON
+  or empty stdin fail fast (exit 1) with a quoting hint. New test
+  `tests/test_inline_json.sh`.
+
 ## [0.7.2] - 2026-06-02
 
 ### Added

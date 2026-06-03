@@ -22,7 +22,13 @@
 #   VPN_HOST=h.example.com ./detect_blocking.sh
 #   ./detect_blocking.sh --log-file /tmp/d.log --quiet
 #   ./detect_blocking.sh --xray-config 'vless://…' --reveal   # show real values
+#   ./detect_blocking.sh --xray-config-json '{"outbounds":[…]}'   # inline JSON
+#   ./detect_blocking.sh --xray-config-json - <<'EOF'  …json…  EOF   # via stdin
 #   CONFIG_FILE=/path/to/file ./detect_blocking.sh
+#
+# --xray-config-json takes a file path, INLINE JSON ('{…}'), or '-' (stdin).
+# JSON is full of shell-special symbols ({ } " space) — single-quote inline
+# JSON, or pipe it with a quoted heredoc (<<'EOF') to avoid quoting entirely.
 #
 # --reveal prints the real offending values (cover serverName, egress IP/org,
 # the flagged SNI) to the TERMINAL so you know exactly what to change. It is
@@ -34,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.7.2"
+readonly DETECT_BLOCKING_VERSION="0.7.3"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -111,6 +117,7 @@ XRAY_CONFIG="${XRAY_CONFIG:-}"
 XRAY_JSON_CONFIG="${XRAY_JSON_CONFIG:-}"
 XRAY_JSON_XRAY_PID=""
 XRAY_JSON_PATCHED_PATH=""
+XRAY_INLINE_JSON_PATH=""   # temp file for inline/stdin --xray-config-json (EXIT-cleaned)
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -155,7 +162,7 @@ while [ $# -gt 0 ]; do
       exit 0
       ;;
     --help|-h)
-      sed -n '2,33p' "$0"
+      sed -n '2,39p' "$0"
       printf '\nversion: %s\n' "$DETECT_BLOCKING_VERSION"
       printf '\nProbe names (for --only / --skip): env, dns, tcp, tls, ua, rst, udp, openvpn, control, ipv6, compare, xray, xrayjson\n'
       printf '\nFlags:\n'
@@ -246,6 +253,36 @@ if [ -n "$XRAY_CONFIG" ]; then
         printf '%s\n' "note: vmess:// URL provided without positional host — host is inside base64 JSON, pass it explicitly to align probes 0-10" >&2
         ;;
     esac
+  fi
+fi
+
+# --xray-config-json accepts a file path, INLINE JSON ('{...}'), or '-' (stdin).
+# JSON is full of shell-hostile symbols — { } " space : — so inline must be
+# single-quoted, and the cleanest symbol-proof way is a quoted heredoc over
+# stdin:  --xray-config-json - <<'EOF' … EOF  (the quoted 'EOF' stops the shell
+# touching $ / backticks / quotes inside). Inline & stdin JSON is written to a
+# 0600 temp file (EXIT-cleaned) so every downstream reader still sees a path.
+if [ -n "${XRAY_JSON_CONFIG:-}" ] && [ ! -f "$XRAY_JSON_CONFIG" ]; then
+  _raw=""
+  if [ "$XRAY_JSON_CONFIG" = "-" ]; then
+    _raw=$(cat)                                   # read JSON from stdin
+  else
+    case "$XRAY_JSON_CONFIG" in *"{"*) _raw="$XRAY_JSON_CONFIG" ;; esac
+  fi
+  if [ -n "$_raw" ]; then
+    XRAY_INLINE_JSON_PATH=$(mktemp -t detect_blocking.inlinecfg.XXXXXX) \
+      || { printf 'error: could not create a temp file for inline JSON\n' >&2; exit 1; }
+    chmod 600 "$XRAY_INLINE_JSON_PATH" 2>/dev/null || true
+    printf '%s' "$_raw" > "$XRAY_INLINE_JSON_PATH"
+    if command -v jq >/dev/null 2>&1 && ! jq empty "$XRAY_INLINE_JSON_PATH" >/dev/null 2>&1; then
+      rm -f "$XRAY_INLINE_JSON_PATH"; XRAY_INLINE_JSON_PATH=""
+      printf 'error: --xray-config-json received invalid JSON.\n' >&2
+      printf "       Single-quote inline JSON, or pipe it:  --xray-config-json - <<'EOF' … EOF\n" >&2
+      exit 1
+    fi
+    XRAY_JSON_CONFIG="$XRAY_INLINE_JSON_PATH"
+  elif [ "$XRAY_JSON_CONFIG" = "-" ]; then
+    printf 'error: --xray-config-json - got empty stdin\n' >&2; exit 1
   fi
 fi
 
@@ -4130,6 +4167,8 @@ _cleanup() {
   [ -n "$XRAY_JSON_PATCHED_PATH" ] && rm -f "$XRAY_JSON_PATCHED_PATH" 2>/dev/null
   # Synthesized-from-URL config holds live credentials — remove it too.
   [ -n "$XRAY_JSON_SYNTH_PATH" ] && rm -f "$XRAY_JSON_SYNTH_PATH" 2>/dev/null
+  # Inline / stdin JSON we wrote to a temp file holds live credentials — remove it.
+  [ -n "$XRAY_INLINE_JSON_PATH" ] && rm -f "$XRAY_INLINE_JSON_PATH" 2>/dev/null
 }
 trap _cleanup EXIT
 

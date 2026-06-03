@@ -845,6 +845,10 @@ Options:
                               (stdin). Single-quote inline JSON, or pipe it with
                               a quoted heredoc — --xray-config-json - <<'EOF' …
                               EOF — to dodge shell-quoting of { } " entirely.
+                              A non-Xray config (e.g. sing-box, which uses
+                              type/server/route) is detected and reported as
+                              such; the Xray-protocol probes are skipped while
+                              transport probes still run against its server.
       --json              Emit machine-readable JSON; implies --quiet. Requires jq.
       --reveal            Print the real offending values (cover serverName,
                           flagged SNI, egress IP / org) to the TERMINAL. Off by

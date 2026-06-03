@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-06-03
+
+### Added
+
+- **Detect a non-Xray JSON config (e.g. sing-box) and say so plainly.** Passing
+  a sing-box config to `--xray-config-json` used to silently mis-parse (its
+  outbounds use `type`/`server`/`route`, not Xray's
+  `protocol`/`settings.vnext`/`streamSettings`). The tool now detects this up
+  front (no outbound has a `protocol` field, plus sing-box markers) and reports
+  *"this is not an Xray-core config (looks like sing-box) — Xray-protocol probes
+  skipped"* with a verdict, instead of producing confusing output. It still
+  derives the server from the sing-box shape (`server`/`server_port`) so the
+  transport probes (0-10) run against it; only the Xray-protocol/stealth probes
+  (11-26) are skipped. New test `tests/test_nonxray_config.sh`.
+
 ## [0.7.3] - 2026-06-03
 
 ### Added

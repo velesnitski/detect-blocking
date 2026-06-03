@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.7.3"
+readonly DETECT_BLOCKING_VERSION="0.7.4"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -118,6 +118,7 @@ XRAY_JSON_CONFIG="${XRAY_JSON_CONFIG:-}"
 XRAY_JSON_XRAY_PID=""
 XRAY_JSON_PATCHED_PATH=""
 XRAY_INLINE_JSON_PATH=""   # temp file for inline/stdin --xray-config-json (EXIT-cleaned)
+XRAY_JSON_FORMAT=""        # set to "sing-box"/"non-Xray" if the JSON isn't an Xray-core config
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -286,6 +287,25 @@ if [ -n "${XRAY_JSON_CONFIG:-}" ] && [ ! -f "$XRAY_JSON_CONFIG" ]; then
   fi
 fi
 
+# Is --xray-config-json actually an Xray-core config? Xray outbounds carry a
+# "protocol" field; sing-box (and other clients) use "type"/"server"/"route".
+# Detect a non-Xray config up front so we can say so plainly and skip the
+# Xray-protocol probes (11-26) — which would mis-parse it — instead of failing
+# confusingly. (Transport probes 0-10 still run against the server below.)
+if [ -n "${XRAY_JSON_CONFIG:-}" ] && [ -r "$XRAY_JSON_CONFIG" ] && command -v jq >/dev/null 2>&1; then
+  _xouts=$(jq -r '[.outbounds // [] | .[] | select(.protocol != null)] | length' "$XRAY_JSON_CONFIG" 2>/dev/null)
+  _alouts=$(jq -r '(.outbounds // []) | length' "$XRAY_JSON_CONFIG" 2>/dev/null)
+  if [ "${_xouts:-0}" = "0" ] && [ "${_alouts:-0}" != "0" ]; then
+    if jq -e '(.outbounds[0].type != null) or (.route != null) or ((.inbounds // []) | map(.type // "") | any(. == "tun" or . == "mixed"))' \
+         "$XRAY_JSON_CONFIG" >/dev/null 2>&1; then
+      XRAY_JSON_FORMAT="sing-box"
+    else
+      XRAY_JSON_FORMAT="non-Xray"
+    fi
+  fi
+  unset _xouts _alouts
+fi
+
 # Auto-derive VPN_HOST from --xray-config-json when no positional was given.
 # Walks the JSON outbounds for the first vless/vmess/trojan/shadowsocks entry
 # and uses its destination address. Keeps probes 0-10 aligned with the same
@@ -318,6 +338,11 @@ if [ -n "${XRAY_JSON_CONFIG:-}" ] && [ -z "${VPN_HOST:-}" ] && [ -r "$XRAY_JSON_
       | first
       | (.settings.servers // [])[0].port // empty
     ' "$XRAY_JSON_CONFIG" 2>/dev/null)
+  fi
+  # Sing-box / non-Xray shape: the outbound carries top-level server/server_port.
+  if [ -z "$_derived_host" ] && [ -n "${XRAY_JSON_FORMAT:-}" ]; then
+    _derived_host=$(jq -r '.outbounds // [] | map(select(.server != null)) | first | .server // empty' "$XRAY_JSON_CONFIG" 2>/dev/null)
+    _derived_port=$(jq -r '.outbounds // [] | map(select(.server != null)) | first | .server_port // empty' "$XRAY_JSON_CONFIG" 2>/dev/null)
   fi
   if [ -n "$_derived_host" ]; then
     VPN_HOST="$_derived_host"
@@ -4233,6 +4258,19 @@ _should_run openvpn && probe_openvpn
 _should_run control && probe_known_blocked
 _should_run ipv6    && probe_ipv6
 _should_run compare && probe_compare_matrix
+
+# A non-Xray JSON config (e.g. sing-box) can't be parsed by the Xray-protocol
+# probes — say so plainly once and skip them. Transport probes (0-10) above
+# already ran against the server derived from it.
+if [ -n "${XRAY_JSON_FORMAT:-}" ]; then
+  hdr "Xray-protocol probes (11-26)"
+  warn "this is not an Xray-core config (looks like ${XRAY_JSON_FORMAT}) — Xray-protocol probes skipped"
+  info "its outbounds use 'type' / 'server' / 'route' (${XRAY_JSON_FORMAT}), not Xray's 'protocol' / 'settings.vnext' / 'streamSettings'"
+  info "transport probes (0-10) above ran against its server; to test the tunnel itself, convert the config to Xray-core JSON"
+  add_verdict "Config is ${XRAY_JSON_FORMAT}, not Xray-core — the Xray-protocol / stealth probes (11-26) need an Xray config (outbounds with 'protocol' + 'settings.vnext' + 'streamSettings'). The transport-layer probes still apply to the server; convert the config (or pass the Xray form) to test the tunnel"
+  XRAY_JSON_CONFIG=""   # the Xray-JSON probes below now skip cleanly
+fi
+
 _should_run xray    && probe_xray_protocol
 _should_run xrayjson && probe_xray_json
 _should_run xrayjson && probe_xray_throughput

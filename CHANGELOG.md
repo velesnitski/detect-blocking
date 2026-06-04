@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-06-04
+
+### Added
+
+- **Entry↔egress co-location signal (probe 16).** Most providers egress on a
+  *different* network than the Reality entry; a deployment that exits from the
+  **same /24** (or same ASN) as its entry runs ingress+egress on one block — a
+  distinctive, low-FP topology signature (e.g. an entry `.6` exiting via `.2` in
+  the same /24). The probe now compares the egress IP against the entry IP and
+  reports `same-/24` / `same-ASN` / `different`. Operator-visible only (a censor
+  doesn't see the egress), so it's reported for identification, not scored;
+  booleans only (IPs stay behind `--reveal`). JSON `xray_egress.egress_colocated`.
+  `query` was added to the ip-api field set to obtain the egress IP.
+
 ## [0.9.2] - 2026-06-04
 
 ### Changed

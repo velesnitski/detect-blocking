@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.9.2"
+readonly DETECT_BLOCKING_VERSION="0.9.3"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -599,7 +599,7 @@ XRAY_COVER_CN_MATCH=""      # 1 / 0 / "" (cert CN/SAN covers the configured serv
 # / banking services block. Sends the egress IP to a 3rd-party IP-info service
 # — disable with --no-egress-check. Output: country code + flags, never the IP.
 XRAY_EGRESS_CHECK="${XRAY_EGRESS_CHECK:-1}"                 # 1 = run (--no-egress-check opts out)
-XRAY_EGRESS_INFO_URL="${XRAY_EGRESS_INFO_URL:-http://ip-api.com/json/?fields=status,countryCode,hosting,proxy,mobile}"
+XRAY_EGRESS_INFO_URL="${XRAY_EGRESS_INFO_URL:-http://ip-api.com/json/?fields=status,countryCode,hosting,proxy,mobile,query}"
 XRAY_EGRESS_DNS_URL="${XRAY_EGRESS_DNS_URL:-http://edns.ip-api.com/json}"
 # Fallback reputation source with an explicit datacenter / proxy / ASN-type flag
 # (the ipinfo/ipwho.is/ifconfig ASN pool has none). Queried through the tunnel
@@ -612,6 +612,7 @@ XRAY_EGRESS_PROXY=""        # 1 / 0 — ip-api: on a proxy blocklist
 XRAY_EGRESS_MOBILE=""       # 1 / 0 — ip-api: mobile carrier IP
 XRAY_EGRESS_ASN_HOSTING=""  # 1 / 0 — 2nd source: ASN/org looks like a hosting provider
 XRAY_EGRESS_DC=""           # 1 / 0 — 3rd source (fallback): datacenter / hosting-type ASN
+XRAY_EGRESS_COLOCATED=""    # same-/24 / same-ASN / different — is the egress co-located with the entry?
 XRAY_EGRESS_DNS_COUNTRY=""  # country of the DNS resolver seen through the tunnel (informational)
 
 # ---- probe 17: held-session stability (delayed-RST / volumetric kill-shaping) ----
@@ -2781,12 +2782,37 @@ probe_xray_egress() {
   info "ip-api:  country=${XRAY_EGRESS_COUNTRY:-?}, hosting=${XRAY_EGRESS_HOSTING:-n/a}, proxy=${XRAY_EGRESS_PROXY:-n/a}, mobile=${XRAY_EGRESS_MOBILE:-n/a}"
   info "2nd src: ASN/org looks like a hosting provider = ${XRAY_EGRESS_ASN_HOSTING:-n/a}"
   [ -n "$XRAY_EGRESS_DC" ] && info "3rd src: datacenter/hosting-type ASN = ${XRAY_EGRESS_DC} (fallback — used because ip-api gave no flags)"
-  # --reveal: the operator-only specifics the share-safe lines deliberately omit.
-  if [ "${REVEAL:-0}" = "1" ]; then
-    local eg_ip
-    eg_ip=$(printf '%s' "$info_json" | sed -nE 's/.*"query":"([^"]*)".*/\1/p' | head -1)
-    reveal "egress IP = ${eg_ip:-?} | org = ${org:-?} | country = ${XRAY_EGRESS_COUNTRY:-?}"
+
+  # Entry↔egress co-location — a deployment-topology tell. Most providers egress
+  # on a DIFFERENT network than the entry; a deployment that exits from the SAME
+  # /24 (or same ASN) as its Reality entry runs ingress+egress on one block — a
+  # distinctive, per-provider signature (e.g. an entry .6 exiting via .2 in the
+  # same /24). Operator-visible only (a censor doesn't see the egress), so it's
+  # reported as identification, not scored. Booleans only — IPs only via --reveal.
+  local eg_ip="" entry_ip
+  eg_ip=$(printf '%s' "$info_json" | sed -nE 's/.*"query":"([^"]*)".*/\1/p' | head -1)
+  [ -z "$eg_ip" ] && eg_ip=$(printf '%s' "${dc_json:-}" | jq -r '.ip // empty' 2>/dev/null)
+  # Entry IP: RESOLVED_IP when probe 1 ran, else the (often IP-literal) VPN_HOST.
+  entry_ip="${RESOLVED_IP:-$VPN_HOST}"
+  if [ -n "$eg_ip" ] && [ -n "$entry_ip" ]; then
+    case "$entry_ip$eg_ip" in
+      *[!0-9.]*) : ;;  # skip if either isn't a bare IPv4 (v6 / hostname)
+      *)
+        if [ "${entry_ip%.*}" = "${eg_ip%.*}" ]; then
+          XRAY_EGRESS_COLOCATED="same-/24"
+        else
+          local e_asn g_asn; e_asn=$(_asn_of "$entry_ip"); g_asn=$(_asn_of "$eg_ip")
+          if [ -n "$e_asn" ] && [ "$e_asn" = "$g_asn" ]; then XRAY_EGRESS_COLOCATED="same-ASN"
+          else XRAY_EGRESS_COLOCATED="different"; fi
+        fi ;;
+    esac
   fi
+  case "$XRAY_EGRESS_COLOCATED" in
+    same-/24) info "topology: egress is in the SAME /24 as the Reality entry → single-block deployment (distinctive per-provider tell)" ;;
+    same-ASN) info "topology: egress shares the entry's ASN (same provider/network) → co-located deployment" ;;
+  esac
+  # --reveal: the operator-only specifics the share-safe lines deliberately omit.
+  reveal "egress IP = ${eg_ip:-?} | entry IP = ${entry_ip:-?} | org = ${org:-?} | country = ${XRAY_EGRESS_COUNTRY:-?} | colocated = ${XRAY_EGRESS_COLOCATED:-?}"
 
   XRAY_EGRESS_STATUS="ok"
   local flagged=0
@@ -4167,6 +4193,7 @@ _emit_json() {
     --arg xe_mobile         "$XRAY_EGRESS_MOBILE" \
     --arg xe_asn_hosting    "$XRAY_EGRESS_ASN_HOSTING" \
     --arg xe_dc             "$XRAY_EGRESS_DC" \
+    --arg xe_colocated      "$XRAY_EGRESS_COLOCATED" \
     --arg xe_dns_country    "$XRAY_EGRESS_DNS_COUNTRY" \
     --arg xst_status        "$XRAY_STABILITY_STATUS" \
     --arg xst_total         "$XRAY_STABILITY_TOTAL" \
@@ -4354,6 +4381,7 @@ _emit_json() {
           mobile: tri_bool(($xe_mobile | tonumber? // -1)),
           asn_hosting: tri_bool(($xe_asn_hosting | tonumber? // -1)),
           datacenter_fallback: tri_bool(($xe_dc | tonumber? // -1)),
+          egress_colocated: opt($xe_colocated),
           dns_resolver_geo: opt($xe_dns_country)
         },
         xray_stability: {

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-06-04
+
+### Added
+
+- **Probe 16 egress reputation: a fallback source so flags aren't "n/a" when
+  ip-api is rate-limited.** When ip-api's flag endpoint returns nothing (rate
+  limited → no `countryCode`, so `hosting`/`proxy`/`mobile` came back `n/a`),
+  the probe used to fall to *"reputation only partially checked"*. It now queries
+  a third source (`XRAY_EGRESS_DC_URL`, default `ipapi.is`) through the tunnel
+  for an **explicit datacenter / proxy / ASN-type flag** — which the existing
+  ASN pool (ipinfo / ipwho.is / ifconfig) doesn't provide and the org-keyword
+  heuristic misses for providers off its list. So a rate-limited run now still
+  determines the egress is (or isn't) a datacenter instead of leaving it
+  incomplete. JSON `xray_egress.datacenter_fallback`. New test
+  `tests/test_egress_fallback.sh`.
+
 ## [0.9.0] - 2026-06-04
 
 ### Added

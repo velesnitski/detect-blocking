@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.9.0"
+readonly DETECT_BLOCKING_VERSION="0.9.1"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -601,12 +601,17 @@ XRAY_COVER_CN_MATCH=""      # 1 / 0 / "" (cert CN/SAN covers the configured serv
 XRAY_EGRESS_CHECK="${XRAY_EGRESS_CHECK:-1}"                 # 1 = run (--no-egress-check opts out)
 XRAY_EGRESS_INFO_URL="${XRAY_EGRESS_INFO_URL:-http://ip-api.com/json/?fields=status,countryCode,hosting,proxy,mobile}"
 XRAY_EGRESS_DNS_URL="${XRAY_EGRESS_DNS_URL:-http://edns.ip-api.com/json}"
+# Fallback reputation source with an explicit datacenter / proxy / ASN-type flag
+# (the ipinfo/ipwho.is/ifconfig ASN pool has none). Queried through the tunnel
+# when ip-api's flags are unavailable (rate-limited), so reputation isn't "n/a".
+XRAY_EGRESS_DC_URL="${XRAY_EGRESS_DC_URL:-https://api.ipapi.is/}"
 XRAY_EGRESS_STATUS=""       # ok, partial (geo only, no flags), skipped, disabled, curl-missing, no-data
 XRAY_EGRESS_COUNTRY=""      # ISO country code seen at the egress
 XRAY_EGRESS_HOSTING=""      # 1 / 0 — ip-api: datacenter / hosting IP
 XRAY_EGRESS_PROXY=""        # 1 / 0 — ip-api: on a proxy blocklist
 XRAY_EGRESS_MOBILE=""       # 1 / 0 — ip-api: mobile carrier IP
 XRAY_EGRESS_ASN_HOSTING=""  # 1 / 0 — 2nd source: ASN/org looks like a hosting provider
+XRAY_EGRESS_DC=""           # 1 / 0 — 3rd source (fallback): datacenter / hosting-type ASN
 XRAY_EGRESS_DNS_COUNTRY=""  # country of the DNS resolver seen through the tunnel (informational)
 
 # ---- probe 17: held-session stability (delayed-RST / volumetric kill-shaping) ----
@@ -2736,6 +2741,20 @@ probe_xray_egress() {
   fi
   [ -z "$XRAY_EGRESS_COUNTRY" ] && XRAY_EGRESS_COUNTRY="$cc2"
 
+  # Source 3 (fallback) — when ip-api's flag endpoint was rate-limited (no
+  # countryCode above → have_flags=0), get an explicit datacenter/proxy/ASN-type
+  # flag from ipapi.is so reputation is still determined, not "n/a". The keyword
+  # heuristic (source 2) misses providers not on its list; this is authoritative.
+  if [ "$have_flags" = "0" ] && command -v jq >/dev/null 2>&1; then
+    local dc_json
+    dc_json=$(curl -sS --max-time "$maxt" --socks5-hostname "127.0.0.1:$port" "$XRAY_EGRESS_DC_URL" 2>/dev/null)
+    if printf '%s' "$dc_json" | grep -q '"is_datacenter"'; then
+      XRAY_EGRESS_DC=$(printf '%s' "$dc_json" | jq -r 'if (.is_datacenter == true) or (((.asn.type // .company.type) // "") | ascii_downcase | test("hosting")) then 1 else 0 end' 2>/dev/null)
+      [ -z "$XRAY_EGRESS_PROXY" ] && XRAY_EGRESS_PROXY=$(printf '%s' "$dc_json" | jq -r 'if (.is_proxy==true) or (.is_vpn==true) or (.is_tor==true) then 1 else 0 end' 2>/dev/null)
+      [ -z "$XRAY_EGRESS_COUNTRY" ] && XRAY_EGRESS_COUNTRY=$(printf '%s' "$dc_json" | jq -r '(.location.country_code // .country_code) // empty' 2>/dev/null)
+    fi
+  fi
+
   # If neither source gave a country, last-resort HTTPS country (Cloudflare).
   if [ -z "$XRAY_EGRESS_COUNTRY" ]; then
     XRAY_EGRESS_COUNTRY=$(curl -sS --max-time "$maxt" --socks5-hostname "127.0.0.1:$port" \
@@ -2761,6 +2780,7 @@ probe_xray_egress() {
   # Report what each source said (booleans/class only — never the IP or org).
   info "ip-api:  country=${XRAY_EGRESS_COUNTRY:-?}, hosting=${XRAY_EGRESS_HOSTING:-n/a}, proxy=${XRAY_EGRESS_PROXY:-n/a}, mobile=${XRAY_EGRESS_MOBILE:-n/a}"
   info "2nd src: ASN/org looks like a hosting provider = ${XRAY_EGRESS_ASN_HOSTING:-n/a}"
+  [ -n "$XRAY_EGRESS_DC" ] && info "3rd src: datacenter/hosting-type ASN = ${XRAY_EGRESS_DC} (fallback — used because ip-api gave no flags)"
   # --reveal: the operator-only specifics the share-safe lines deliberately omit.
   if [ "${REVEAL:-0}" = "1" ]; then
     local eg_ip
@@ -2773,6 +2793,7 @@ probe_xray_egress() {
   [ "${XRAY_EGRESS_PROXY:-0}" = "1" ] && flagged=1
   [ "${XRAY_EGRESS_HOSTING:-0}" = "1" ] && flagged=1
   [ "${XRAY_EGRESS_ASN_HOSTING:-0}" = "1" ] && flagged=1
+  [ "${XRAY_EGRESS_DC:-0}" = "1" ] && flagged=1
 
   if [ "$flagged" = "1" ]; then
     if [ "${XRAY_EGRESS_HOSTING:-0}" != "1" ] && [ "${XRAY_EGRESS_PROXY:-0}" != "1" ] && [ "${XRAY_EGRESS_ASN_HOSTING:-0}" = "1" ]; then
@@ -2785,9 +2806,11 @@ probe_xray_egress() {
     fi
   elif [ "$have_flags" = "1" ] && [ -n "$XRAY_EGRESS_ASN_HOSTING" ]; then
     ok "egress not flagged by ip-api or by the ASN/org heuristic — looks clean (2 sources; still a heuristic, not proof of residential)"
+  elif [ "$XRAY_EGRESS_DC" = "0" ]; then
+    ok "egress not flagged — ip-api was rate-limited, but the fallback source reports a non-datacenter ASN (cross-checked)"
   else
     XRAY_EGRESS_STATUS="partial"
-    warn "egress geo=${XRAY_EGRESS_COUNTRY} — reputation only partially checked (a source was unreachable; flags may be incomplete)"
+    warn "egress geo=${XRAY_EGRESS_COUNTRY} — reputation only partially checked (every reputation source was unreachable; flags may be incomplete)"
   fi
 }
 
@@ -4139,6 +4162,7 @@ _emit_json() {
     --arg xe_proxy          "$XRAY_EGRESS_PROXY" \
     --arg xe_mobile         "$XRAY_EGRESS_MOBILE" \
     --arg xe_asn_hosting    "$XRAY_EGRESS_ASN_HOSTING" \
+    --arg xe_dc             "$XRAY_EGRESS_DC" \
     --arg xe_dns_country    "$XRAY_EGRESS_DNS_COUNTRY" \
     --arg xst_status        "$XRAY_STABILITY_STATUS" \
     --arg xst_total         "$XRAY_STABILITY_TOTAL" \
@@ -4325,6 +4349,7 @@ _emit_json() {
           proxy: tri_bool(($xe_proxy | tonumber? // -1)),
           mobile: tri_bool(($xe_mobile | tonumber? // -1)),
           asn_hosting: tri_bool(($xe_asn_hosting | tonumber? // -1)),
+          datacenter_fallback: tri_bool(($xe_dc | tonumber? // -1)),
           dns_resolver_geo: opt($xe_dns_country)
         },
         xray_stability: {

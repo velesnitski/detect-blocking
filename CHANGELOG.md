@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-06-04
+
+### Added
+
+- **Routing-coverage probe (split-tunnel) — the tool now understands the
+  `routing` table it used to strip.** A "selected sites via the proxy, rest
+  direct" config expresses its intent in `routing.rules`, which every other
+  probe discards (`del(.routing)`). The new probe has two tiers:
+  - **Tier 1 — static map + lint** (always, pure-jq): maps each rule per
+    outbound (domain / geosite / geoip / ip counts), resolves the **default
+    route** (catch-all rule, else the first outbound), classifies proxy vs
+    direct outbounds, and lints the footguns — an `outboundTag` **referenced but
+    not defined** (matched traffic silently dropped → verdict), and the
+    **default-route direction** (all-proxy vs selective).
+  - **Tier 2 — live split-tunnel test** (when the tunnel is up): launches
+    xray-core with the **full config (routing intact)** and fetches a sample of
+    proxy-routed sites through it, so you can see the split actually carries them
+    — catching a dead proxy path that the generic tunnel test (probe 12) can miss
+    when its own target happens to route direct.
+
+  JSON gains `probes.xray_routing` (`status`, `default_outbound`,
+  `proxy_outbounds`, `undefined_outbound_tags`, `live_test`, `live_results`).
+  New test `tests/test_routing.sh`.
+
 ## [0.7.5] - 2026-06-03
 
 ### Changed

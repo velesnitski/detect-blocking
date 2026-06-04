@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.7.5"
+readonly DETECT_BLOCKING_VERSION="0.8.0"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -671,6 +671,16 @@ XRAY_FLEET_STATUS=""        # ok, skipped, disabled, xray-missing, jq-missing, s
 XRAY_FLEET_TOTAL=""         # outbounds tested
 XRAY_FLEET_OK=""            # outbounds whose tunnel reached egress
 XRAY_FLEET_RESULTS=""       # "tag|state|rtt ..." for JSON
+
+# Routing-coverage probe (split-tunnel): static map+lint, plus a live test when
+# the tunnel is up. Set in probe_xray_routing.
+XRAY_ROUTING_STATUS=""      # ok, skipped, none, jq-missing
+XRAY_ROUTING_DEFAULT=""     # the effective default-route outbound tag
+XRAY_ROUTING_UNDEF=""       # outboundTags referenced in rules but not defined
+XRAY_ROUTING_PROXY_TAGS=""  # proxy outbound tags that routing sends traffic to
+XRAY_ROUTING_LIVE=""        # live split-tunnel test: ok / skipped / partial / failed
+XRAY_ROUTING_LIVE_RESULTS="" # "target|state ..." for JSON
+XRAY_ROUTING_PID=""         # xray pid for the live test (EXIT-cleaned)
 
 # ---- probe 22: bufferbloat / latency-under-load ----
 # 13/14 measure bandwidth; this measures the latency a "fast" tunnel adds while
@@ -3197,6 +3207,155 @@ EOF
   fi
 }
 
+# Routing-coverage probe (split-tunnel). A "selected sites via the proxy, rest
+# direct" config expresses its intent in routing.rules — which the other probes
+# strip (probe 12/21 del .routing). Tier 1 maps the rules per outbound and lints
+# the footguns (undefined outboundTag, default-route direction). Tier 2, when the
+# tunnel is up, fetches a sample of proxy-routed sites through the LIVE config
+# (routing intact) so you can see the split actually carries them.
+probe_xray_routing() {
+  if [ -z "$XRAY_JSON_CONFIG" ] || [ ! -r "$XRAY_JSON_CONFIG" ]; then
+    XRAY_ROUTING_STATUS="skipped"; return 0
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    XRAY_ROUTING_STATUS="jq-missing"; return 0
+  fi
+  local nrules
+  nrules=$(jq -r '(.routing.rules // []) | length' "$XRAY_JSON_CONFIG" 2>/dev/null)
+  if [ "${nrules:-0}" -le 0 ]; then
+    XRAY_ROUTING_STATUS="none"; return 0
+  fi
+
+  hdr "Routing coverage (split-tunnel)"
+
+  # ---- Tier 1: static map + lint ----
+  local defined_tags referenced_tags proxy_tags default_tag undef="" t tag
+  defined_tags=$(jq -r '[.outbounds[]?.tag // empty] | join(" ")' "$XRAY_JSON_CONFIG" 2>/dev/null)
+  referenced_tags=$(jq -r '[.routing.rules[]?.outboundTag // empty] | unique | join(" ")' "$XRAY_JSON_CONFIG" 2>/dev/null)
+  proxy_tags=$(jq -r '[.outbounds[]? | select(.settings.vnext != null or .settings.servers != null) | .tag // empty] | join(" ")' "$XRAY_JSON_CONFIG" 2>/dev/null)
+  XRAY_ROUTING_PROXY_TAGS="$proxy_tags"
+
+  # Default route: a catch-all rule (network/port/protocol set, no domain/ip) →
+  # its tag; otherwise Xray's implicit default is the first outbound.
+  default_tag=$(jq -r '
+    [ .routing.rules[]? | select((.domain == null) and (.ip == null)
+        and ((.network != null) or (.port != null) or (.protocol != null))) ]
+    | last | .outboundTag // empty' "$XRAY_JSON_CONFIG" 2>/dev/null)
+  [ -z "$default_tag" ] && default_tag=$(jq -r '.outbounds[0].tag // empty' "$XRAY_JSON_CONFIG" 2>/dev/null)
+  XRAY_ROUTING_DEFAULT="$default_tag"
+
+  for t in $referenced_tags; do
+    case " $defined_tags " in *" $t "*) ;; *) undef="${undef:+$undef }$t" ;; esac
+  done
+  XRAY_ROUTING_UNDEF="$undef"
+
+  for tag in $referenced_tags; do
+    [ -z "$tag" ] && continue
+    local nd ng ngi nip kind="direct/other"
+    nd=$(jq -r --arg t "$tag"  '[.routing.rules[]? | select(.outboundTag==$t) | (.domain // [])[] | select(startswith("geosite:") | not)] | length' "$XRAY_JSON_CONFIG" 2>/dev/null)
+    ng=$(jq -r --arg t "$tag"  '[.routing.rules[]? | select(.outboundTag==$t) | (.domain // [])[] | select(startswith("geosite:"))]     | length' "$XRAY_JSON_CONFIG" 2>/dev/null)
+    ngi=$(jq -r --arg t "$tag" '[.routing.rules[]? | select(.outboundTag==$t) | (.ip // [])[]     | select(startswith("geoip:"))]       | length' "$XRAY_JSON_CONFIG" 2>/dev/null)
+    nip=$(jq -r --arg t "$tag" '[.routing.rules[]? | select(.outboundTag==$t) | (.ip // [])[]     | select(startswith("geoip:") | not)] | length' "$XRAY_JSON_CONFIG" 2>/dev/null)
+    case " $proxy_tags " in *" $tag "*) kind="proxy" ;; esac
+    info "$(printf '%-14s (%-12s): %s domains · %s geosite · %s geoip · %s ip' "$tag" "$kind" "$nd" "$ng" "$ngi" "$nip")"
+  done
+  info "default route → ${default_tag:-<first outbound>}"
+
+  if [ -n "$undef" ]; then
+    fail "routing references undefined outboundTag(s): $undef → matched traffic is dropped/misrouted"
+    add_verdict "Routing references outboundTag(s) not defined in outbounds ($undef) — traffic matching those rules is silently dropped or misrouted; fix the tag names"
+  fi
+  case " $proxy_tags " in
+    *" $default_tag "*) info "default route is a PROXY outbound → ALL traffic tunnels (not just the listed sites)" ;;
+    *) [ -n "$proxy_tags" ] && info "default route is direct → only the listed sites/categories use the proxy (selective routing)" ;;
+  esac
+  XRAY_ROUTING_STATUS="ok"
+
+  # ---- Tier 2: live split-tunnel test (needs a working tunnel) ----
+  if [ "${XRAY_JSON_STATUS:-}" != "ok" ]; then
+    info "live split-tunnel test skipped — tunnel not established (see probe 12); the map above is static"
+    XRAY_ROUTING_LIVE="skipped"; return 0
+  fi
+  if ! check_cmd xray || ! check_cmd curl; then
+    XRAY_ROUTING_LIVE="skipped"; return 0
+  fi
+
+  # Sample up to 4 explicit domains routed to a proxy outbound (geosite/geoip
+  # need the .dat files to expand to hosts, so we sample the literal domains).
+  local samples
+  samples=$(jq -r --arg ptags "$proxy_tags" '
+    ($ptags | split(" ") | map(select(length > 0))) as $pt
+    | [ .routing.rules[]? | select(.outboundTag as $t | ($pt | index($t)))
+        | (.domain // [])[] | select(startswith("geosite:") | not)
+        | sub("^(domain:|full:)"; "") ]
+    | unique | .[0:4][]' "$XRAY_JSON_CONFIG" 2>/dev/null)
+  if [ -z "$samples" ]; then
+    info "live test: no explicit proxy-routed domains to sample (only geosite/geoip categories)"
+    XRAY_ROUTING_LIVE="ok"; return 0
+  fi
+
+  local socks_port base patched log pid i ready
+  socks_port=$(_find_free_port) || { XRAY_ROUTING_LIVE="skipped"; return 0; }
+  base=$(mktemp -t detect_blocking.routing.XXXXXX) || { XRAY_ROUTING_LIVE="skipped"; return 0; }
+  patched="${base}.json"
+  if ! mv "$base" "$patched" 2>/dev/null; then rm -f "$base"; XRAY_ROUTING_LIVE="skipped"; return 0; fi
+  # Keep routing + outbounds intact; only relocate the socks inbound to our port.
+  if ! jq --argjson p "$socks_port" '
+        .inbounds = [{ tag:"socks", listen:"127.0.0.1", port:$p, protocol:"socks", settings:{auth:"noauth", udp:true} }]
+        | del(.observatory)
+      ' "$XRAY_JSON_CONFIG" > "$patched" 2>/dev/null; then
+    rm -f "$patched"; XRAY_ROUTING_LIVE="skipped"; return 0
+  fi
+  log=$(mktemp -t detect_blocking.routinglog.XXXXXX)
+  xray run -c "$patched" >"$log" 2>&1 &
+  pid=$!; XRAY_ROUTING_PID="$pid"
+  ready=0
+  for i in $(seq 1 $(( TIMEOUT * 5 + 10 ))); do
+    nc -z 127.0.0.1 "$socks_port" 2>/dev/null && { ready=1; break; }
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.2
+  done
+  if [ "$ready" -ne 1 ]; then
+    warn "live test: xray did not start with the full routing config"
+    XRAY_ROUTING_LIVE="failed"
+    kill "$pid" 2>/dev/null; XRAY_ROUTING_PID=""
+    rm -f "$patched" "$log" 2>/dev/null
+    return 0
+  fi
+
+  local d code okc=0 ntested=0 mt
+  mt=$(( ( ${XRAY_JSON_RTT_MS:-3000} + 999 ) / 1000 + TIMEOUT ))
+  for d in $samples; do
+    [ -z "$d" ] && continue
+    ntested=$(( ntested + 1 ))
+    code=$(curl -sS -k --max-time "$mt" --socks5-hostname "127.0.0.1:$socks_port" \
+           -o /dev/null -w '%{http_code}' "https://$d/" 2>/dev/null)
+    [ -z "$code" ] && code="000"
+    if [ "$code" != "000" ]; then
+      okc=$(( okc + 1 )); info "  routed $(printf '%-18s' "$d") → HTTP $code (carried by the config)"
+    else
+      info "  routed $(printf '%-18s' "$d") → unreachable through the config"
+    fi
+    XRAY_ROUTING_LIVE_RESULTS="${XRAY_ROUTING_LIVE_RESULTS}${XRAY_ROUTING_LIVE_RESULTS:+ }${d}|${code}"
+  done
+
+  kill "$pid" 2>/dev/null; for i in 1 2 3; do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done; kill -9 "$pid" 2>/dev/null
+  XRAY_ROUTING_PID=""
+  rm -f "$patched" "$log" 2>/dev/null
+
+  if [ "$okc" -eq "$ntested" ]; then
+    ok "split-tunnel works — all $ntested sampled proxy-routed sites reachable through the config"
+    XRAY_ROUTING_LIVE="ok"
+  elif [ "$okc" -eq 0 ]; then
+    fail "0/$ntested proxy-routed sites reachable through the config — the proxy path isn't carrying them"
+    add_verdict "Split-tunnel: none of the sampled proxy-routed sites load through the config — the proxy outbound isn't carrying traffic, so the sites this config should unblock won't work"
+    XRAY_ROUTING_LIVE="failed"
+  else
+    warn "$okc/$ntested proxy-routed sites reachable through the config — partial"
+    XRAY_ROUTING_LIVE="partial"
+  fi
+}
+
 # Warm round-trip (ms) through the tunnel: one keep-alive curl fetches the tiny
 # trace endpoint N times — the first pays the handshake, the rest are warm, so
 # their min is the true per-request RTT with handshake cost excluded. Echoes
@@ -3894,6 +4053,12 @@ _emit_json() {
     --arg xf_total          "$XRAY_FLEET_TOTAL" \
     --arg xf_ok             "$XRAY_FLEET_OK" \
     --arg xf_results        "$XRAY_FLEET_RESULTS" \
+    --arg xr_status         "$XRAY_ROUTING_STATUS" \
+    --arg xr_default        "$XRAY_ROUTING_DEFAULT" \
+    --arg xr_proxy          "$XRAY_ROUTING_PROXY_TAGS" \
+    --arg xr_undef          "$XRAY_ROUTING_UNDEF" \
+    --arg xr_live           "$XRAY_ROUTING_LIVE" \
+    --arg xr_liveres        "$XRAY_ROUTING_LIVE_RESULTS" \
     --arg xbb_status        "$XRAY_BUFFERBLOAT_STATUS" \
     --arg xbb_idle          "$XRAY_BUFFERBLOAT_IDLE_MS" \
     --arg xbb_load          "$XRAY_BUFFERBLOAT_LOAD_MS" \
@@ -4094,6 +4259,19 @@ _emit_json() {
             end
           )
         },
+        xray_routing: {
+          status: opt($xr_status),
+          default_outbound: opt($xr_default),
+          proxy_outbounds: (if $xr_proxy == "" then [] else ($xr_proxy | split(" ") | map(select(length > 0))) end),
+          undefined_outbound_tags: (if $xr_undef == "" then [] else ($xr_undef | split(" ") | map(select(length > 0))) end),
+          live_test: opt($xr_live),
+          live_results: (
+            if $xr_liveres == "" then []
+            else ($xr_liveres | split(" ") | map(select(length > 0) | split("|")
+                  | { domain: .[0], http_code: .[1] }))
+            end
+          )
+        },
         xray_bufferbloat: {
           status: opt($xbb_status),
           idle_rtt_ms: (if $xbb_idle == "" then null else ($xbb_idle | tonumber? // null) end),
@@ -4224,6 +4402,8 @@ _cleanup() {
   [ -n "$XRAY_JSON_SYNTH_PATH" ] && rm -f "$XRAY_JSON_SYNTH_PATH" 2>/dev/null
   # Inline / stdin JSON we wrote to a temp file holds live credentials — remove it.
   [ -n "$XRAY_INLINE_JSON_PATH" ] && rm -f "$XRAY_INLINE_JSON_PATH" 2>/dev/null
+  # Routing-probe xray instance (live split-tunnel test) — don't orphan it.
+  [ -n "$XRAY_ROUTING_PID" ] && kill "$XRAY_ROUTING_PID" 2>/dev/null
 }
 trap _cleanup EXIT
 
@@ -4314,6 +4494,7 @@ _should_run xrayjson && probe_xray_stability
 { _should_run xray || _should_run xrayjson; } && probe_clock_skew
 { _should_run xray || _should_run xrayjson; } && probe_xray_active_probe
 _should_run xrayjson && probe_xray_fleet
+_should_run xrayjson && probe_xray_routing
 _should_run xrayjson && probe_xray_bufferbloat
 { _should_run xray || _should_run xrayjson; } && probe_xray_mtu
 { _should_run xray || _should_run xrayjson; } && probe_xray_tls_parity

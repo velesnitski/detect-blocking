@@ -24,20 +24,28 @@ cfg() {  # $1 = fingerprint value
 }
 det() { printf '%s' "$1" | jq -r ".probes.xray_detectability.$2"; }
 
-# qq → uncommon uTLS fp flagged, score includes its +10.
+# qq → flagged uncommon (reported), and the SCORE captured.
 out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config-json "$(cfg qq)" --only xrayjson --json 2>/dev/null)
 [ "$(det "$out" utls_fp_uncommon)" = "true" ]  || fail "fp=qq should set utls_fp_uncommon=true"
 fp_qq=$(det "$out" deployment_fingerprint)
+score_qq=$(det "$out" score)
 [ -n "$fp_qq" ] && [ "$fp_qq" != "null" ]       || fail "deployment_fingerprint should be present"
 
 # chrome → common, not flagged.
 out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config-json "$(cfg chrome)" --only xrayjson --json 2>/dev/null)
 [ "$(det "$out" utls_fp_uncommon)" = "false" ] || fail "fp=chrome should set utls_fp_uncommon=false"
 fp_chrome=$(det "$out" deployment_fingerprint)
+score_chrome=$(det "$out" score)
+
+# The uTLS fp is a TRADEOFF, NOT scored: qq and an otherwise-identical chrome
+# config must yield the SAME detectability score (rarity neither helps nor hurts
+# the number — the operator's empirical result vs the censor decides).
+[ "$score_qq" = "$score_chrome" ] \
+  || fail "uTLS fp must not change the score (qq=$score_qq vs chrome=$score_chrome) — it's a tradeoff, not scored"
 
 # Fingerprint stability + sensitivity: same config → same hash; fp change → different.
 out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config-json "$(cfg qq)" --only xrayjson --json 2>/dev/null)
 [ "$(det "$out" deployment_fingerprint)" = "$fp_qq" ] || fail "deployment fingerprint must be stable for the same config"
-[ "$fp_qq" != "$fp_chrome" ] || fail "a different uTLS fp must change the deployment fingerprint"
+[ "$fp_qq" != "$fp_chrome" ] || fail "a different uTLS fp must still change the deployment fingerprint (identification)"
 
-echo "PASS: uncommon uTLS fp scored+flagged; deployment fingerprint stable + fp-sensitive"
+echo "PASS: uncommon uTLS fp reported but NOT scored (tradeoff); fingerprint stable + fp-sensitive"

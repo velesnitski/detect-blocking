@@ -744,10 +744,12 @@ the **passive** structure a censor can read off the wire without probing at all:
   A non-resolving cover is *also* why the active baselines (20/24) report "not
   evaluated" — there's no genuine cover site to compare against, and the score
   now says so instead of leaving a silent gap;
-- the **uTLS fingerprint** — Reality mimics a browser's ClientHello, and a
-  regional/uncommon choice (`fp=qq`/`360`, China-specific browsers) is a stable,
-  distinctive **JA3** outside its home region (`chrome` etc. blend; `random`
-  isn't penalized — no fixed JA3).
+- the **uTLS fingerprint** — Reality mimics a browser's ClientHello. This is
+  reported as a **tradeoff, not scored**: a rare/regional fp (`qq`/`360`)
+  **evades signature/deny-list censors** like TSPU (which blocklists the
+  near-universal `chrome`-uTLS-Reality JA3 — so `chrome` is often *more* blocked),
+  but is an **outlier to anomaly detection**. Your empirical result against the
+  target censor decides; the fp is still folded into the deployment fingerprint.
 
 It also emits a **deployment fingerprint** — a short, stable, share-safe hash of
 the config's *identifying shape* (protocol / security / network / flow / uTLS-fp

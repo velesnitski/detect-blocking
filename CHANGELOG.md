@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-06-04
+
+### Changed
+
+- **The uTLS fingerprint is a tradeoff, no longer a scored penalty.** v0.9.0
+  scored an uncommon uTLS fp (`qq`/`360`) as `+10` detectability — but that
+  modeled only *anomaly/allow-list* censors (rare = outlier). Against a
+  *signature/deny-list* censor like **TSPU**, which blocklists the near-universal
+  `chrome`-uTLS-Reality JA3, a rare fp is exactly what **evades** — so `chrome`
+  can be *more* detectable, not less. The score now adds **0 points** for fp
+  distinctiveness and presents it as a two-sided tradeoff (signature-evasion vs
+  anomaly-visibility), letting the operator's empirical result against the target
+  censor decide. The fp is still reported and still folded into the **deployment
+  fingerprint** (so it continues to *identify* a deployment), just not penalized.
+  Net: an `fp=qq` Reality node returns from 40/100 (high) to its structural
+  30/100 (moderate). Test updated to assert fp does not move the score.
+
 ## [0.9.1] - 2026-06-04
 
 ### Added

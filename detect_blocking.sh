@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.9.1"
+readonly DETECT_BLOCKING_VERSION="0.9.2"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -3883,26 +3883,30 @@ probe_xray_detectability() {
   fi
   score=$(( score + sniq_pts ))
 
-  # --- uTLS fingerprint distinctiveness (JA3) ---
-  # Reality mimics a browser's ClientHello via uTLS. A globally-common browser
-  # (chrome/firefox/safari/edge/ios/android) blends into the crowd; a regional/
-  # uncommon one — qq or 360 (China-specific browsers, rare elsewhere) — yields a
-  # stable, distinctive JA3 a fingerprinter can match. (random/randomized give no
-  # fixed JA3, so they're not penalized here.) Censor-visible, and a per-provider
-  # constant — this is the kind of tell that turns "a Reality server" into "THAT
-  # provider's Reality server".
+  # --- uTLS fingerprint (JA3) — a TRADEOFF, deliberately NOT scored ---
+  # Reality mimics a browser's ClientHello via uTLS, and the fp choice cuts both
+  # ways depending on the censor's model:
+  #   - SIGNATURE / deny-list (what TSPU does to Reality): it blocklists known
+  #     circumvention JA3s, and `chrome` is the near-universal default → the
+  #     most-signatured, most-blocked. A rare/regional fp (qq, 360) is NOT on the
+  #     list → it EVADES. Rarity is the feature here.
+  #   - ANOMALY / allow-list: flags anything that isn't a common browser, so a
+  #     rare fp is a JA3 OUTLIER → more visible.
+  # The operator's empirical result against the TARGET censor is authoritative,
+  # so we report the fp and fold it into the deployment fingerprint (it still
+  # IDENTIFIES the deployment), but add NO points either way.
   local fp_pts=0 fp_desc utls_fp
   utls_fp=$(_xray_utls_fp)
   case "$utls_fp" in
     qq|360)
-      fp_pts=10; XRAY_PASSIVE_UTLS_RARE=1
-      fp_desc="'${utls_fp}' — regional/uncommon → distinctive JA3" ;;
+      XRAY_PASSIVE_UTLS_RARE=1
+      fp_desc="'${utls_fp}' regional/uncommon — evades signature blocklists (e.g. TSPU), JA3 outlier to anomaly detection (tradeoff, not scored)" ;;
     ""|chrome|firefox|safari|ios|android|edge|random|randomized|randomizedalpn|randomizednoalpn)
       XRAY_PASSIVE_UTLS_RARE=0
-      fp_desc="${utls_fp:-unset} — common/randomized, blends" ;;
+      fp_desc="${utls_fp:-unset} — common/randomized (chrome is the most-signatured circumvention fp)" ;;
     *)
-      fp_pts=10; XRAY_PASSIVE_UTLS_RARE=1
-      fp_desc="'${utls_fp}' — non-standard → distinctive JA3" ;;
+      XRAY_PASSIVE_UTLS_RARE=1
+      fp_desc="'${utls_fp}' non-standard JA3 (tradeoff, not scored)" ;;
   esac
   score=$(( score + fp_pts ))
 
@@ -3972,11 +3976,11 @@ probe_xray_detectability() {
     fi
   fi
 
-  # Name an uncommon uTLS fingerprint — a stable, distinctive JA3, and a
-  # per-provider constant (so it doubles as a provider tell, e.g. fp=qq).
+  # Uncommon uTLS fingerprint — reported as a TRADEOFF, not a tell (not scored).
+  # It's still a per-deployment constant, so it identifies the deployment (and is
+  # in the fingerprint hash) even though it doesn't move the score.
   if [ "${XRAY_PASSIVE_UTLS_RARE:-0}" = "1" ]; then
-    warn "uTLS fingerprint $fp_desc — a fixed, uncommon ClientHello stands out to a JA3/JA4 fingerprinter"
-    add_verdict "uTLS fingerprint is uncommon ($utls_fp) — Reality mimics this browser's ClientHello, and a regional/rare choice (qq, 360) is a distinctive, stable JA3 outside its home region, plus a per-deployment constant a fingerprinter can pivot on. Prefer a globally-common fp (chrome) to blend in"
+    info "uTLS fp '$utls_fp' is a JA3 tradeoff, NOT scored: a rare/regional fp EVADES signature/deny-list censors (TSPU blocklists the common chrome-uTLS-Reality JA3 — why qq often works there) but is an outlier to anomaly detection. Your result against the target censor decides; it stays in the deployment fingerprint either way"
     reveal "uTLS fingerprint = $utls_fp"
   fi
 

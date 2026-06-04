@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-06-04
+
+### Fixed
+
+- **Routing default-route detection no longer mistakes a `protocol:`/`port:`-only
+  rule for the catch-all.** A full-tunnel-with-bypass config (e.g.
+  `protocol:bittorrent → direct`, a domain bypass list → direct, and everything
+  else → the proxy via Xray's first-outbound default) was read **backwards** as
+  *"default → direct, selective routing"*. A true catch-all matches everything —
+  no `domain`/`ip`/`port`/`protocol` narrowing — so protocol- and port-scoped
+  rules are now excluded, and the default correctly falls back to the first
+  outbound. Such a config now reads *"default → proxy, ALL traffic tunnels"*.
+  Regression test added to `tests/test_routing.sh`.
+
 ## [0.8.1] - 2026-06-04
 
 ### Changed

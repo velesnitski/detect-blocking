@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.8.1"
+readonly DETECT_BLOCKING_VERSION="0.8.2"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -3254,11 +3254,15 @@ probe_xray_routing() {
   proxy_tags=$(jq -r '[.outbounds[]? | select(.settings.vnext != null or .settings.servers != null) | .tag // empty] | join(" ")' "$XRAY_JSON_CONFIG" 2>/dev/null)
   XRAY_ROUTING_PROXY_TAGS="$proxy_tags"
 
-  # Default route: a catch-all rule (network/port/protocol set, no domain/ip) →
-  # its tag; otherwise Xray's implicit default is the first outbound.
+  # Default route: a TRUE catch-all matches everything — a rule with no domain,
+  # ip, port, OR protocol narrowing (network-only or empty). A protocol:/port:-
+  # only rule (e.g. protocol:bittorrent → direct) is selective, NOT the default,
+  # so it must be excluded — else a full-tunnel-with-bypass config gets read
+  # backwards as "selective routing". Falls back to Xray's implicit default
+  # (the first outbound) when no catch-all rule exists.
   default_tag=$(jq -r '
     [ .routing.rules[]? | select((.domain == null) and (.ip == null)
-        and ((.network != null) or (.port != null) or (.protocol != null))) ]
+        and (.port == null) and (.protocol == null)) ]
     | last | .outboundTag // empty' "$XRAY_JSON_CONFIG" 2>/dev/null)
   [ -z "$default_tag" ] && default_tag=$(jq -r '.outbounds[0].tag // empty' "$XRAY_JSON_CONFIG" 2>/dev/null)
   XRAY_ROUTING_DEFAULT="$default_tag"

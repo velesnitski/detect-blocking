@@ -30,6 +30,15 @@ printf '%s' "$r" | jq -e 'has("live_test")' >/dev/null || fail "live_test field 
 printf '%s' "$out" | jq -e '(.verdicts // []) | map(select(test("not defined in outbounds"))) | length > 0' >/dev/null \
   || fail "an undefined outboundTag should raise a verdict"
 
+# Regression: a full-tunnel-with-bypass config — only protocol:/domain: rules go
+# direct, NO catch-all, proxy is the first outbound → Xray's default is the
+# PROXY (everything tunnels except the bypass). A protocol-only rule must NOT be
+# mistaken for the catch-all (that read the split backwards as "selective").
+BYPASS='{"inbounds":[{"tag":"s","listen":"127.0.0.1","port":10808,"protocol":"socks","settings":{"auth":"noauth"}}],"routing":{"rules":[{"type":"field","protocol":["bittorrent"],"outboundTag":"direct"},{"type":"field","domain":["domain:example.com","domain:example.net"],"outboundTag":"direct"}]},"outbounds":[{"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"127.0.0.1","port":1,"users":[{"id":"00000000-0000-0000-0000-000000000000","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.net","publicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","shortId":"01"}}},{"tag":"direct","protocol":"freedom"}]}'
+out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config-json "$BYPASS" --only xrayjson --json 2>/dev/null)
+[ "$(rt "$out" | jq -r '.default_outbound')" = "proxy" ] \
+  || fail "full-tunnel-with-bypass: default must be the first outbound (proxy), not a protocol:-only direct rule"
+
 # A config with NO routing table → status 'none' (nothing to map).
 NOROUTE='{"inbounds":[{"tag":"s","listen":"127.0.0.1","port":10808,"protocol":"socks","settings":{"auth":"noauth"}}],"outbounds":[{"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"127.0.0.1","port":1,"users":[{"id":"00000000-0000-0000-0000-000000000000","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.net","publicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","shortId":"01"}}}]}'
 out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config-json "$NOROUTE" --only xrayjson --json 2>/dev/null)

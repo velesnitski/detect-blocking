@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.8.2"
+readonly DETECT_BLOCKING_VERSION="0.9.0"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -734,6 +734,8 @@ XRAY_PASSIVE_ASN_MATCH=""   # 1 / 0 / "" — server IP on the cover's network (o
 XRAY_PASSIVE_FP_STRONG=""   # 1 / 0 — both passive tells co-occur (the Reality structural signature)
 XRAY_PASSIVE_SNI_RESOLVES="" # 1 / 0 / "" — cover SNI publicly resolves (a non-resolving SNI is a tell)
 XRAY_PASSIVE_SNI_KEYWORD=""  # 1 / 0 — cover SNI contains a circumvention/antagonistic keyword (cleartext)
+XRAY_PASSIVE_UTLS_RARE=""    # 1 / 0 — uTLS fingerprint is uncommon/regional (distinctive JA3)
+XRAY_DEPLOY_FINGERPRINT=""   # short stable hash of the config's identifying shape (provider match)
 
 # ---- baseline / diff mode (longitudinal regression detection) ----
 # --save-baseline FILE writes this run's share-safe JSON; --diff-baseline FILE
@@ -2534,6 +2536,22 @@ _xray_cover_sni() {
   fi
 }
 
+# The configured uTLS fingerprint (fp=) — the browser whose ClientHello Reality
+# mimics. Lower-cased; empty if unset. From the share-link or the JSON.
+_xray_utls_fp() {
+  local v=""
+  if [ -n "$XRAY_CONFIG" ]; then
+    v=$(printf '%s' "$XRAY_CONFIG" | sed -nE 's|.*[?&]fp=([^&#]*).*|\1|p' | head -1)
+  elif [ -n "$XRAY_JSON_CONFIG" ] && [ -r "$XRAY_JSON_CONFIG" ] && command -v jq >/dev/null 2>&1; then
+    v=$(jq -r '.outbounds // []
+        | map(select(.streamSettings.security == "reality" or .streamSettings.security == "tls"))
+        | first
+        | (.streamSettings.realitySettings.fingerprint // .streamSettings.tlsSettings.fingerprint) // empty
+      ' "$XRAY_JSON_CONFIG" 2>/dev/null)
+  fi
+  printf '%s' "$v" | tr '[:upper:]' '[:lower:]'
+}
+
 # Probe 15 — Reality cover authenticity. Connects plain-TLS (unauthenticated,
 # exactly what a GFW/TSPU active prober does) with the configured serverName
 # and inspects the presented certificate. A genuine Reality server relays such
@@ -3842,6 +3860,29 @@ probe_xray_detectability() {
   fi
   score=$(( score + sniq_pts ))
 
+  # --- uTLS fingerprint distinctiveness (JA3) ---
+  # Reality mimics a browser's ClientHello via uTLS. A globally-common browser
+  # (chrome/firefox/safari/edge/ios/android) blends into the crowd; a regional/
+  # uncommon one — qq or 360 (China-specific browsers, rare elsewhere) — yields a
+  # stable, distinctive JA3 a fingerprinter can match. (random/randomized give no
+  # fixed JA3, so they're not penalized here.) Censor-visible, and a per-provider
+  # constant — this is the kind of tell that turns "a Reality server" into "THAT
+  # provider's Reality server".
+  local fp_pts=0 fp_desc utls_fp
+  utls_fp=$(_xray_utls_fp)
+  case "$utls_fp" in
+    qq|360)
+      fp_pts=10; XRAY_PASSIVE_UTLS_RARE=1
+      fp_desc="'${utls_fp}' — regional/uncommon → distinctive JA3" ;;
+    ""|chrome|firefox|safari|ios|android|edge|random|randomized|randomizedalpn|randomizednoalpn)
+      XRAY_PASSIVE_UTLS_RARE=0
+      fp_desc="${utls_fp:-unset} — common/randomized, blends" ;;
+    *)
+      fp_pts=10; XRAY_PASSIVE_UTLS_RARE=1
+      fp_desc="'${utls_fp}' — non-standard → distinctive JA3" ;;
+  esac
+  score=$(( score + fp_pts ))
+
   # --- passive conjunction: the Reality structural signature ---
   # Either passive tell alone is FP-prone (legit services use 8443; domain
   # fronting legitimately mismatches ASN). TOGETHER — presenting an SNI for a
@@ -3873,6 +3914,7 @@ probe_xray_detectability() {
   info "$(printf 'passive · port:             %-38s +%d' "$port_desc" "$port_pts")"
   info "$(printf 'passive · SNI↔IP network:   %-38s +%d' "$sni_desc" "$sni_pts")"
   info "$(printf 'passive · SNI quality:      %-38s +%d' "$sniq_desc" "$sniq_pts")"
+  info "$(printf 'passive · uTLS fp (JA3):    %-38s +%d' "$fp_desc" "$fp_pts")"
   info "$(printf 'passive · conjunction:      %-38s +%d' "$conj_desc" "$conj_pts")"
   info "bands: 0-14 low · 15-39 moderate · 40-69 high · 70-100 critical"
 
@@ -3905,6 +3947,39 @@ probe_xray_detectability() {
     if [ "${XRAY_PASSIVE_SNI_RESOLVES:-1}" = "0" ]; then
       add_verdict "Reality cover SNI is NXDOMAIN (it doesn't publicly resolve) — a softer tell: it only bites a censor that actively resolves the SNIs it sees (not the cheap default), but it does mean the cover isn't a real site you blend into, and it's why the active-probe/TLS-parity baselines went 'not evaluated' (no genuine cover to compare against). Prefer a real, resolving cover domain"
     fi
+  fi
+
+  # Name an uncommon uTLS fingerprint — a stable, distinctive JA3, and a
+  # per-provider constant (so it doubles as a provider tell, e.g. fp=qq).
+  if [ "${XRAY_PASSIVE_UTLS_RARE:-0}" = "1" ]; then
+    warn "uTLS fingerprint $fp_desc — a fixed, uncommon ClientHello stands out to a JA3/JA4 fingerprinter"
+    add_verdict "uTLS fingerprint is uncommon ($utls_fp) — Reality mimics this browser's ClientHello, and a regional/rare choice (qq, 360) is a distinctive, stable JA3 outside its home region, plus a per-deployment constant a fingerprinter can pivot on. Prefer a globally-common fp (chrome) to blend in"
+    reveal "uTLS fingerprint = $utls_fp"
+  fi
+
+  # ---- Deployment fingerprint: a stable, share-safe signature of the config's
+  # identifying shape, so the SAME provider/template is recognizable across nodes
+  # (different IP/keys/SNI, same fingerprint). Hashes only structural constants —
+  # never the IP, UUID, keys, or cover domain — so it's safe to share/compare.
+  if check_cmd openssl; then
+    local _proto _net _flow _sidlen _routesig _canon
+    _proto=$(_xray_cfg_field protocol '.outbounds[0].protocol')
+    _net=$(_xray_cfg_field network '.outbounds[0].streamSettings.network'); [ -z "$_net" ] && _net=tcp
+    _flow=$(_xray_cfg_field flow '.outbounds[0].settings.vnext[0].users[0].flow')
+    _sidlen=$(_xray_cfg_field sid '.outbounds[0].streamSettings.realitySettings.shortId'); _sidlen=${#_sidlen}
+    # routing signature: sorted unique match-type:outboundTag shapes + domain-set
+    # size — the curated routing recipe, a strong per-provider signal.
+    _routesig=""
+    if [ -n "$XRAY_JSON_CONFIG" ] && [ -r "$XRAY_JSON_CONFIG" ] && command -v jq >/dev/null 2>&1; then
+      _routesig=$(jq -r '
+        [ .routing.rules[]? | "\(if .domain then "d" else "" end)\(if .ip then "i" else "" end)\(if .protocol then "p" else "" end)\(if .network then "n" else "" end)>\(.outboundTag // "")" ] | sort | join(",")
+        + "|dn=" + ([ .routing.rules[]? | (.domain // [])[] ] | length | tostring)
+      ' "$XRAY_JSON_CONFIG" 2>/dev/null)
+    fi
+    _canon="${_proto}|sec=$(_xray_cfg_field security '.outbounds[0].streamSettings.security')|net=${_net}|flow=${_flow}|fp=${utls_fp}|sidlen=${_sidlen}|port=${VPN_PORT_TCP}|route=${_routesig}"
+    XRAY_DEPLOY_FINGERPRINT=$(printf '%s' "$_canon" | openssl dgst -sha256 2>/dev/null | sed -nE 's/.*([0-9a-f]{64}).*/\1/p' | cut -c1-12)
+    [ -n "$XRAY_DEPLOY_FINGERPRINT" ] && info "deployment fingerprint: ${XRAY_DEPLOY_FINGERPRINT} (stable across nodes of the same provider/template — match it to recognize this deployment)"
+    reveal "fingerprint canonical: ${_canon}"
   fi
 }
 
@@ -4115,6 +4190,8 @@ _emit_json() {
     --arg xpf_fp_strong     "$XRAY_PASSIVE_FP_STRONG" \
     --arg xpf_sni_resolves  "$XRAY_PASSIVE_SNI_RESOLVES" \
     --arg xpf_sni_keyword   "$XRAY_PASSIVE_SNI_KEYWORD" \
+    --arg xpf_utls_rare     "$XRAY_PASSIVE_UTLS_RARE" \
+    --arg xd_deployfp       "$XRAY_DEPLOY_FINGERPRINT" \
     --argjson verdicts      "$verdicts_json" '
     def words: split(" ") | map(select(length > 0));
     def opt(s): if s == "" then null else s end;
@@ -4336,7 +4413,9 @@ _emit_json() {
           sni_ip_asn_match: tri_bool(($xpf_asn_match | tonumber? // -1)),
           passive_fingerprint_strong: tri_bool(($xpf_fp_strong | tonumber? // -1)),
           sni_resolves: tri_bool(($xpf_sni_resolves | tonumber? // -1)),
-          sni_keyword: tri_bool(($xpf_sni_keyword | tonumber? // -1))
+          sni_keyword: tri_bool(($xpf_sni_keyword | tonumber? // -1)),
+          utls_fp_uncommon: tri_bool(($xpf_utls_rare | tonumber? // -1)),
+          deployment_fingerprint: opt($xd_deployfp)
         }
       },
       verdicts: $verdicts

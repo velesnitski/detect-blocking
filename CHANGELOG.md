@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-06-04
+
+### Added
+
+- **uTLS-fingerprint distinctiveness as a detectability signal (probe 26).**
+  Reality mimics a browser's ClientHello via uTLS. A globally-common browser
+  (`chrome`/`firefox`/`safari`/`edge`/`ios`/`android`) blends in; a regional or
+  uncommon one — `qq` / `360` (China-specific browsers, rare elsewhere) — yields
+  a **stable, distinctive JA3** a fingerprinter can match (`random`/`randomized`
+  give no fixed JA3, so they aren't penalized). The score now folds this in
+  (`+10`) and names it, and it's a per-deployment constant — so e.g. an `fp=qq`
+  config moves from 30/100 (moderate) to 40/100 (high). JSON
+  `xray_detectability.utls_fp_uncommon`.
+- **Deployment fingerprint — recognize the same provider/template across nodes.**
+  A short, stable, **share-safe** SHA-256 hash over the config's *identifying
+  shape* — protocol / security / network / flow / uTLS-fp / shortId-length /
+  port / a routing-recipe signature — and **nothing sensitive** (never the IP,
+  UUID, keys, or cover domain). Two configs from the same provider hash
+  identically (only per-node IP/keys/SNI differ), so you can match a known
+  deployment's fingerprint to answer "is this the same provider?". JSON
+  `xray_detectability.deployment_fingerprint`. New test
+  `tests/test_utls_fingerprint.sh`.
+
 ## [0.8.2] - 2026-06-04
 
 ### Fixed

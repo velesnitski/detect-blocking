@@ -26,7 +26,8 @@ printf '%s' "$out" | jq -e '
   .probes.xray_detectability
   | has("score") and has("band") and has("port_standard")
     and has("sni_ip_asn_match") and has("passive_fingerprint_strong")
-' >/dev/null || fail "detectability schema missing keys (incl. folded passive + conjunction)"
+    and has("utls_fp_uncommon") and has("deployment_fingerprint")
+' >/dev/null || fail "detectability schema missing keys (incl. uTLS fp + deployment fingerprint)"
 # No separate passive-fingerprint probe block should exist anymore.
 [ "$(printf '%s' "$out" | jq -r '.probes | has("xray_passive_fingerprint")')" = "false" ] \
   || fail "xray_passive_fingerprint should be folded into xray_detectability"

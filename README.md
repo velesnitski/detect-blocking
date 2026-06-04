@@ -743,7 +743,17 @@ the **passive** structure a censor can read off the wire without probing at all:
   censor's name…) is exactly what a censor resolves to nothing or keyword-matches.
   A non-resolving cover is *also* why the active baselines (20/24) report "not
   evaluated" — there's no genuine cover site to compare against, and the score
-  now says so instead of leaving a silent gap.
+  now says so instead of leaving a silent gap;
+- the **uTLS fingerprint** — Reality mimics a browser's ClientHello, and a
+  regional/uncommon choice (`fp=qq`/`360`, China-specific browsers) is a stable,
+  distinctive **JA3** outside its home region (`chrome` etc. blend; `random`
+  isn't penalized — no fixed JA3).
+
+It also emits a **deployment fingerprint** — a short, stable, share-safe hash of
+the config's *identifying shape* (protocol / security / network / flow / uTLS-fp
+/ shortId-length / port / routing-recipe, and **nothing** sensitive). Two configs
+from the same provider hash identically (only per-node IP/keys/SNI differ), so
+you can match a known deployment to answer *"is this the same provider?"*.
 
 Active tells weigh heaviest. Each passive tell alone is FP-prone (legit services
 use 8443; domain fronting legitimately mismatches ASN), so they weigh less — but

@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.8.0"
+readonly DETECT_BLOCKING_VERSION="0.8.1"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -834,6 +834,25 @@ _host_pings() {
   [ -n "$ip" ] || return 1
   ping -c 1 -W 2 "$ip" >/dev/null 2>&1 && return 0
   ping -c 1 -t 2 "$ip" >/dev/null 2>&1 && return 0
+  return 1
+}
+
+# True (0) if an HTTPS URL is reachable. "Reachable" = an HTTP status came back,
+# OR the TLS handshake to the target completed (time_appconnect > 0) — the latter
+# so a CDN/asset host that serves no root page still counts as reached. $1=url,
+# $2=max-time, optional $3="host:port" routes through a SOCKS5 proxy.
+_url_reachable() {
+  local url="$1" mt="$2" socks="${3:-}" out code appc
+  if [ -n "$socks" ]; then
+    out=$(curl -sS -k --max-time "$mt" --socks5-hostname "$socks" -o /dev/null \
+          -w '%{http_code} %{time_appconnect}' "$url" 2>/dev/null)
+  else
+    out=$(curl -sS -k --max-time "$mt" -o /dev/null \
+          -w '%{http_code} %{time_appconnect}' "$url" 2>/dev/null)
+  fi
+  code="${out%% *}"; appc="${out##* }"
+  [ -n "$code" ] && [ "$code" != "000" ] && return 0
+  [ -n "$appc" ] && awk "BEGIN{exit !(${appc:-0}>0)}" 2>/dev/null && return 0
   return 1
 }
 
@@ -3323,35 +3342,46 @@ probe_xray_routing() {
     return 0
   fi
 
-  local d code okc=0 ntested=0 mt
+  # Per domain: carried (proxy reached it) / proxy-failed (reachable DIRECT but
+  # not via the proxy — the only real routing fault) / n-a (unreachable both ways
+  # — a non-fetchable apex or suffix-match entry like cdninstagram.com, NOT a
+  # proxy problem). Comparing against a direct baseline is what keeps a CDN apex
+  # from masquerading as a split-tunnel failure.
+  local d okc=0 failc=0 nac=0 mt state
   mt=$(( ( ${XRAY_JSON_RTT_MS:-3000} + 999 ) / 1000 + TIMEOUT ))
   for d in $samples; do
     [ -z "$d" ] && continue
-    ntested=$(( ntested + 1 ))
-    code=$(curl -sS -k --max-time "$mt" --socks5-hostname "127.0.0.1:$socks_port" \
-           -o /dev/null -w '%{http_code}' "https://$d/" 2>/dev/null)
-    [ -z "$code" ] && code="000"
-    if [ "$code" != "000" ]; then
-      okc=$(( okc + 1 )); info "  routed $(printf '%-18s' "$d") → HTTP $code (carried by the config)"
+    if _url_reachable "https://$d/" "$mt" "127.0.0.1:$socks_port"; then
+      state="carried"; okc=$(( okc + 1 ))
+      info "  routed $(printf '%-18s' "$d") → carried by the config"
+    elif _url_reachable "https://$d/" "$mt"; then
+      state="proxy-failed"; failc=$(( failc + 1 ))
+      info "  routed $(printf '%-18s' "$d") → reachable DIRECT but NOT through the config (routing/proxy fault)"
     else
-      info "  routed $(printf '%-18s' "$d") → unreachable through the config"
+      state="n-a"; nac=$(( nac + 1 ))
+      info "  routed $(printf '%-18s' "$d") → n/a (not fetchable directly either — suffix-match/CDN apex)"
     fi
-    XRAY_ROUTING_LIVE_RESULTS="${XRAY_ROUTING_LIVE_RESULTS}${XRAY_ROUTING_LIVE_RESULTS:+ }${d}|${code}"
+    XRAY_ROUTING_LIVE_RESULTS="${XRAY_ROUTING_LIVE_RESULTS}${XRAY_ROUTING_LIVE_RESULTS:+ }${d}|${state}"
   done
 
   kill "$pid" 2>/dev/null; for i in 1 2 3; do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done; kill -9 "$pid" 2>/dev/null
   XRAY_ROUTING_PID=""
   rm -f "$patched" "$log" 2>/dev/null
 
-  if [ "$okc" -eq "$ntested" ]; then
-    ok "split-tunnel works — all $ntested sampled proxy-routed sites reachable through the config"
+  local fetchable=$(( okc + failc ))
+  if [ "$fetchable" -eq 0 ]; then
+    info "live test inconclusive — all $nac sampled domains are non-fetchable apexes (suffix-match/CDN); nothing to carry"
+    XRAY_ROUTING_LIVE="inconclusive"
+  elif [ "$failc" -eq 0 ]; then
+    ok "split-tunnel works — all $okc fetchable proxy-routed sites carried$( [ "$nac" -gt 0 ] && printf ' (%s n/a: non-fetchable apex, not a proxy fault)' "$nac" )"
     XRAY_ROUTING_LIVE="ok"
   elif [ "$okc" -eq 0 ]; then
-    fail "0/$ntested proxy-routed sites reachable through the config — the proxy path isn't carrying them"
-    add_verdict "Split-tunnel: none of the sampled proxy-routed sites load through the config — the proxy outbound isn't carrying traffic, so the sites this config should unblock won't work"
+    fail "0/$fetchable fetchable proxy-routed sites carried — the proxy path isn't carrying them"
+    add_verdict "Split-tunnel: every fetchable proxy-routed site loads directly but NOT through the config — the proxy outbound isn't carrying traffic, so the sites this config should unblock won't work"
     XRAY_ROUTING_LIVE="failed"
   else
-    warn "$okc/$ntested proxy-routed sites reachable through the config — partial"
+    warn "$okc/$fetchable fetchable proxy-routed sites carried — $failc reachable direct but not through the config (partial)"
+    add_verdict "Split-tunnel partial: $failc proxy-routed site(s) load directly but not through the config — the routing/proxy isn't carrying them (the other $okc are fine; non-fetchable apexes are ignored)"
     XRAY_ROUTING_LIVE="partial"
   fi
 }
@@ -4268,7 +4298,7 @@ _emit_json() {
           live_results: (
             if $xr_liveres == "" then []
             else ($xr_liveres | split(" ") | map(select(length > 0) | split("|")
-                  | { domain: .[0], http_code: .[1] }))
+                  | { domain: .[0], result: .[1] }))
             end
           )
         },

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-06-04
+
+### Changed
+
+- **Routing live test no longer counts a non-fetchable apex as a split-tunnel
+  failure.** Tier 2 marked any failed fetch "unreachable", so a routed domain
+  whose **apex doesn't resolve** (e.g. `cdninstagram.com` — a suffix-match entry
+  for `*.cdninstagram.com`, not a host) or a CDN host with no root page looked
+  like a proxy fault. Each sampled domain is now classified against a **direct
+  baseline**: `carried` (proxy reached it), `proxy-failed` (reachable directly
+  but **not** through the proxy — the only real routing fault), or `n-a`
+  (unreachable both ways → ignored). "Reached" also counts a completed
+  TLS-to-target handshake, not just an HTTP status, so asset hosts that serve no
+  root page still register. JSON `live_results[].http_code` → `.result`.
+
 ## [0.8.0] - 2026-06-04
 
 ### Added

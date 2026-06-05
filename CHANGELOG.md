@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-06-05
+
+### Added
+
+- **Routing `domainStrategy` / DNS-leak check.** The routing probe now reads
+  `routing.domainStrategy` and flags **`IPOnDemand`/`IPIfNonMatch` with no `dns`
+  block** as a DNS-leak + latency risk: those strategies resolve destination
+  domains to IP (to evaluate `ip`/`geoip` rules) via the **system/ISP resolver**,
+  so the resolver sees the proxied and direct domains even though traffic is
+  tunneled. With sniffing on, domain rules match without resolution, so the fix
+  is `domainStrategy: "AsIs"` (+ a `dns` block routed through the proxy). JSON
+  `xray_routing.domain_strategy` and `dns_leak_risk`.
+- **Self-owned / obscure cover detector (probe 26).** A good Reality cover is a
+  popular site on a major CDN (blocking it costs the censor collateral). A cover
+  that **resolves to a hosting/VPS network** rather than a CDN is self-owned or
+  obscure — low collateral to block, and often a brand/operator domain (a
+  provider tell). Detected via the **datacenter flag** (ip-api `hosting`, then
+  ipapi.is `is_datacenter`/ASN-type) — not just the org name, so it catches small
+  hosts an org-keyword list misses. Scored `+10` and named; a CDN-hosted cover
+  (e.g. `example.net`) is not flagged. JSON `xray_detectability.cover_obscure`.
+
 ## [0.9.3] - 2026-06-04
 
 ### Added

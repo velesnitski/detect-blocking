@@ -39,9 +39,20 @@ out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config-json "$BYPASS" --only xrayjson --js
 [ "$(rt "$out" | jq -r '.default_outbound')" = "proxy" ] \
   || fail "full-tunnel-with-bypass: default must be the first outbound (proxy), not a protocol:-only direct rule"
 
+# domainStrategy / DNS-leak: IPOnDemand + an ip/geoip rule + NO dns block →
+# dns_leak_risk true (Xray resolves domains via the system resolver). Pure-jq /
+# static, so deterministic.
+LEAK='{"inbounds":[{"tag":"s","listen":"127.0.0.1","port":10808,"protocol":"socks","settings":{"auth":"noauth"},"sniffing":{"enabled":true,"routeOnly":true,"destOverride":["tls"]}}],"routing":{"domainStrategy":"IPOnDemand","rules":[{"type":"field","domain":["geosite:telegram"],"outboundTag":"proxy"},{"type":"field","ip":["geoip:telegram"],"outboundTag":"proxy"},{"type":"field","network":"tcp,udp","outboundTag":"direct"}]},"outbounds":[{"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"127.0.0.1","port":1,"users":[{"id":"00000000-0000-0000-0000-000000000000","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.net","publicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","shortId":"01"}}},{"tag":"direct","protocol":"freedom"}]}'
+out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config-json "$LEAK" --only xrayjson --json 2>/dev/null)
+[ "$(rt "$out" | jq -r '.domain_strategy')" = "IPOnDemand" ] || fail "domain_strategy should be reported (IPOnDemand)"
+[ "$(rt "$out" | jq -r '.dns_leak_risk')" = "true" ]      || fail "IPOnDemand + no dns block should set dns_leak_risk=true"
+# Same config switched to AsIs → no local resolution → no leak.
+out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config-json "$(printf '%s' "$LEAK" | sed 's/IPOnDemand/AsIs/')" --only xrayjson --json 2>/dev/null)
+[ "$(rt "$out" | jq -r '.dns_leak_risk')" = "false" ] || fail "domainStrategy=AsIs should NOT be a DNS-leak risk"
+
 # A config with NO routing table → status 'none' (nothing to map).
 NOROUTE='{"inbounds":[{"tag":"s","listen":"127.0.0.1","port":10808,"protocol":"socks","settings":{"auth":"noauth"}}],"outbounds":[{"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"127.0.0.1","port":1,"users":[{"id":"00000000-0000-0000-0000-000000000000","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.net","publicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","shortId":"01"}}}]}'
 out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config-json "$NOROUTE" --only xrayjson --json 2>/dev/null)
 [ "$(rt "$out" | jq -r '.status')" = "none" ] || fail "a config with no routing.rules should report status 'none'"
 
-echo "PASS: routing map + default route + proxy outbounds + undefined-tag lint; no-routing → none"
+echo "PASS: routing map + default route + undefined-tag lint + domainStrategy DNS-leak; no-routing → none"

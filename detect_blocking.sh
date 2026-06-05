@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.9.3"
+readonly DETECT_BLOCKING_VERSION="0.10.0"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -687,6 +687,8 @@ XRAY_ROUTING_PROXY_TAGS=""  # proxy outbound tags that routing sends traffic to
 XRAY_ROUTING_LIVE=""        # live split-tunnel test: ok / skipped / partial / failed
 XRAY_ROUTING_LIVE_RESULTS="" # "target|state ..." for JSON
 XRAY_ROUTING_PID=""         # xray pid for the live test (EXIT-cleaned)
+XRAY_ROUTING_DOMAINSTRATEGY="" # routing.domainStrategy (AsIs / IPIfNonMatch / IPOnDemand)
+XRAY_ROUTING_DNS_RISK=""    # 1 / 0 — domainStrategy resolves domains locally with no dns block (leak)
 
 # ---- probe 22: bufferbloat / latency-under-load ----
 # 13/14 measure bandwidth; this measures the latency a "fast" tunnel adds while
@@ -741,6 +743,7 @@ XRAY_PASSIVE_FP_STRONG=""   # 1 / 0 — both passive tells co-occur (the Reality
 XRAY_PASSIVE_SNI_RESOLVES="" # 1 / 0 / "" — cover SNI publicly resolves (a non-resolving SNI is a tell)
 XRAY_PASSIVE_SNI_KEYWORD=""  # 1 / 0 — cover SNI contains a circumvention/antagonistic keyword (cleartext)
 XRAY_PASSIVE_UTLS_RARE=""    # 1 / 0 — uTLS fingerprint is uncommon/regional (distinctive JA3)
+XRAY_PASSIVE_COVER_OBSCURE="" # 1 / 0 — cover SNI resolves to a hosting/VPS net (self-owned/obscure), not a CDN
 XRAY_DEPLOY_FINGERPRINT=""   # short stable hash of the config's identifying shape (provider match)
 
 # ---- baseline / diff mode (longitudinal regression detection) ----
@@ -3359,6 +3362,32 @@ probe_xray_routing() {
     *" $default_tag "*) info "default route is a PROXY outbound → ALL traffic tunnels (not just the listed sites)" ;;
     *) [ -n "$proxy_tags" ] && info "default route is direct → only the listed sites/categories use the proxy (selective routing)" ;;
   esac
+
+  # --- domainStrategy / DNS-resolution leak ---
+  # IPOnDemand resolves a destination domain to IP the moment matching hits an
+  # IP/geoip rule; IPIfNonMatch resolves when no domain rule matched. Either way,
+  # with NO `dns` block those lookups go to the system/ISP resolver — a DNS leak
+  # (the resolver sees the proxied & direct domains even though traffic is
+  # tunneled) plus added latency. With sniffing on, domain rules match WITHOUT
+  # resolution, so "AsIs" avoids it entirely.
+  local dstrat has_dns has_iprule
+  dstrat=$(jq -r '.routing.domainStrategy // "AsIs"' "$XRAY_JSON_CONFIG" 2>/dev/null)
+  has_dns=$(jq -e 'has("dns") and ((.dns.servers // []) | length > 0)' "$XRAY_JSON_CONFIG" >/dev/null 2>&1 && echo 1 || echo 0)
+  has_iprule=$(jq -r '[.routing.rules[]? | select(.ip != null)] | length' "$XRAY_JSON_CONFIG" 2>/dev/null)
+  info "domainStrategy: ${dstrat} · dns block: $( [ "$has_dns" = 1 ] && echo present || echo none )"
+  XRAY_ROUTING_DOMAINSTRATEGY="$dstrat"
+  case "$dstrat" in
+    IPOnDemand|IPIfNonMatch)
+      if [ "$has_dns" = "0" ]; then
+        XRAY_ROUTING_DNS_RISK=1
+        warn "domainStrategy=${dstrat} with no dns block → Xray resolves destination domains via the system resolver (DNS leak + latency)"
+        add_verdict "Routing domainStrategy=${dstrat} resolves destination domains to IP for routing$( [ "${has_iprule:-0}" -gt 0 ] && echo ' (to evaluate the geoip/ip rules)' ), but there is no 'dns' block — so those lookups use the system/ISP resolver: a DNS leak (the resolver sees the proxied and direct domains even though traffic is tunneled) plus added latency. Sniffing is matching your domain rules without resolution, so set domainStrategy=\"AsIs\" (and add a 'dns' block routed through the proxy for fully leak-proof resolution)"
+      else
+        XRAY_ROUTING_DNS_RISK=0
+        info "domainStrategy=${dstrat} with a dns block — resolution is controlled (ensure the dns servers route through the proxy, not the system resolver)"
+      fi ;;
+    *) XRAY_ROUTING_DNS_RISK=0 ;;   # AsIs / unset → no local resolution for routing
+  esac
   XRAY_ROUTING_STATUS="ok"
 
   # ---- Tier 2: live split-tunnel test (needs a working tunnel) ----
@@ -3904,8 +3933,36 @@ probe_xray_detectability() {
           *)            sniq_desc="$sniq_desc + circumvention keyword" ;;
         esac ;;
     esac
+    # (c) cover popularity: a good Reality cover is a popular site on a major CDN
+    #     (blocking it costs the censor collateral). A cover that resolves to a
+    #     hosting/VPS network is self-owned / obscure — low collateral to block,
+    #     and often a brand/operator domain → a detectability tell AND a provider
+    #     identifier. Skipped for a non-resolving/keyword SNI (already flagged).
+    if [ "$sni_resolves" = "1" ] && [ "${XRAY_PASSIVE_SNI_KEYWORD:-0}" != "1" ] \
+       && [ -n "${cov_ips:-}" ] && check_cmd curl; then
+      local cov_ip1 cov_info cov_dc=""
+      cov_ip1=$(printf '%s' "$cov_ips" | _first_word)
+      cov_info=$(curl -sS --max-time "$TIMEOUT" "http://ip-api.com/json/${cov_ip1}?fields=status,hosting,org,isp,as" 2>/dev/null)
+      if printf '%s' "$cov_info" | tr '[:upper:]' '[:lower:]' | grep -qiE 'cloudflare|akamai|fastly|google|amazon|aws|cloudfront|microsoft|azure|apple|edgecast|verizon|limelight|lumen|level ?3|g.?core|bunny|stackpath|cdn77|incapsula|sucuri|netlify|vercel|github'; then
+        XRAY_PASSIVE_COVER_OBSCURE=0   # popular CDN/cloud cover — blends, good
+      else
+        # Not a major CDN. Is it a hosting/datacenter network? Use the flags
+        # (ip-api hosting, then ipapi.is is_datacenter) — org-keyword alone misses
+        # small hosts an org-keyword list misses, the v0.9.1 lesson.
+        if printf '%s' "$cov_info" | grep -q '"hosting":true'; then cov_dc=1
+        else cov_dc=$(curl -sS --max-time "$TIMEOUT" "${XRAY_EGRESS_DC_URL}?q=${cov_ip1}" 2>/dev/null \
+              | jq -r 'if (.is_datacenter==true) or ((((.asn.type // .company.type) // "")|ascii_downcase)|test("hosting")) then 1 else 0 end' 2>/dev/null); fi
+        if [ "$cov_dc" = "1" ]; then
+          XRAY_PASSIVE_COVER_OBSCURE=1; sniq_pts=$(( sniq_pts + 10 ))
+          case "$sniq_desc" in
+            real-looking) sniq_desc="self-owned/obscure cover (resolves to a hosting network, not a popular CDN site)" ;;
+            *)            sniq_desc="$sniq_desc + obscure cover" ;;
+          esac
+        fi
+      fi
+    fi
     # --reveal: show the operator the actual offending serverName (terminal only).
-    [ "$sniq_pts" -gt 0 ] && reveal "cover serverName = \"$sni\" — the cleartext SNI flagged above; replace with a real, popular, resolving third-party domain"
+    [ "$sniq_pts" -gt 0 ] && reveal "cover serverName = \"$sni\" — the cleartext SNI flagged above; replace with a real, popular, resolving third-party domain (one on a major CDN)"
   fi
   score=$(( score + sniq_pts ))
 
@@ -4000,6 +4057,14 @@ probe_xray_detectability() {
     if [ "${XRAY_PASSIVE_SNI_RESOLVES:-1}" = "0" ]; then
       add_verdict "Reality cover SNI is NXDOMAIN (it doesn't publicly resolve) — a softer tell: it only bites a censor that actively resolves the SNIs it sees (not the cheap default), but it does mean the cover isn't a real site you blend into, and it's why the active-probe/TLS-parity baselines went 'not evaluated' (no genuine cover to compare against). Prefer a real, resolving cover domain"
     fi
+  fi
+
+  # Self-owned / obscure cover — resolves, no keyword, but lives on a hosting/VPS
+  # network rather than a major CDN: low collateral for a censor to block, and
+  # often a brand/operator domain (so it also identifies the deployment).
+  if [ "${XRAY_PASSIVE_COVER_OBSCURE:-0}" = "1" ]; then
+    warn "cover SNI is self-owned/obscure — resolves to a hosting/VPS network, not a popular CDN site"
+    add_verdict "Reality cover resolves to a hosting/VPS network rather than a major CDN — it's a self-owned or obscure cover, not a popular third-party site. A censor can blocklist it with little collateral damage (unlike blocking a big CDN domain), and a self-owned cover often names the operator (a provider tell). Borrow a genuinely popular domain hosted on a large shared CDN (Cloudflare/Akamai/Fastly/Google/Amazon/Microsoft) as the Reality cover"
   fi
 
   # Uncommon uTLS fingerprint — reported as a TRADEOFF, not a tell (not scored).
@@ -4218,6 +4283,8 @@ _emit_json() {
     --arg xf_ok             "$XRAY_FLEET_OK" \
     --arg xf_results        "$XRAY_FLEET_RESULTS" \
     --arg xr_status         "$XRAY_ROUTING_STATUS" \
+    --arg xr_dstrat         "$XRAY_ROUTING_DOMAINSTRATEGY" \
+    --arg xr_dnsrisk        "$XRAY_ROUTING_DNS_RISK" \
     --arg xr_default        "$XRAY_ROUTING_DEFAULT" \
     --arg xr_proxy          "$XRAY_ROUTING_PROXY_TAGS" \
     --arg xr_undef          "$XRAY_ROUTING_UNDEF" \
@@ -4245,6 +4312,7 @@ _emit_json() {
     --arg xpf_fp_strong     "$XRAY_PASSIVE_FP_STRONG" \
     --arg xpf_sni_resolves  "$XRAY_PASSIVE_SNI_RESOLVES" \
     --arg xpf_sni_keyword   "$XRAY_PASSIVE_SNI_KEYWORD" \
+    --arg xpf_cover_obscure "$XRAY_PASSIVE_COVER_OBSCURE" \
     --arg xpf_utls_rare     "$XRAY_PASSIVE_UTLS_RARE" \
     --arg xd_deployfp       "$XRAY_DEPLOY_FINGERPRINT" \
     --argjson verdicts      "$verdicts_json" '
@@ -4429,6 +4497,8 @@ _emit_json() {
         },
         xray_routing: {
           status: opt($xr_status),
+          domain_strategy: opt($xr_dstrat),
+          dns_leak_risk: tri_bool(($xr_dnsrisk | tonumber? // -1)),
           default_outbound: opt($xr_default),
           proxy_outbounds: (if $xr_proxy == "" then [] else ($xr_proxy | split(" ") | map(select(length > 0))) end),
           undefined_outbound_tags: (if $xr_undef == "" then [] else ($xr_undef | split(" ") | map(select(length > 0))) end),
@@ -4471,6 +4541,7 @@ _emit_json() {
           passive_fingerprint_strong: tri_bool(($xpf_fp_strong | tonumber? // -1)),
           sni_resolves: tri_bool(($xpf_sni_resolves | tonumber? // -1)),
           sni_keyword: tri_bool(($xpf_sni_keyword | tonumber? // -1)),
+          cover_obscure: tri_bool(($xpf_cover_obscure | tonumber? // -1)),
           utls_fp_uncommon: tri_bool(($xpf_utls_rare | tonumber? // -1)),
           deployment_fingerprint: opt($xd_deployfp)
         }

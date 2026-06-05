@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-06-05
+
+### Added
+
+- **Parser-vs-destination fix-class one-liner** in the recommendation block — the
+  "ByeDPI vs Xray" decision in one line, chosen from what actually fired:
+  **PARSER** (a fragmentation bypass was confirmed → a client-side desync like
+  ByeDPI/zapret beats the block with no server, on your own IP) vs
+  **DESTINATION/PROBE** (IP block / active probing / detectable protocol → you
+  need a destination-hiding tunnel like Reality/Xray). Parser wins when a
+  fragmentation bypass is present (a server is then optional); it does not fire on
+  a routine moderate-detectability run.
+
 ## [0.13.0] - 2026-06-05
 
 ### Added

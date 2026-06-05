@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.13.0"
+readonly DETECT_BLOCKING_VERSION="0.13.1"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -5111,6 +5111,33 @@ else
   done
   if [ "${#_recs[@]}" -gt 0 ]; then
     [ "$LOG_QUIET" = "1" ] || printf '\n%s\n' "${YEL}Recommendation:${RST}"
+    # ByeDPI-vs-Xray in one orienting line, chosen from what actually fired:
+    # PARSER block (the DPI can't be made to match → a client-side desync like
+    # ByeDPI beats it with no server) vs DESTINATION/PROBE block (the destination
+    # or the server itself is the target → you need a destination-hiding tunnel).
+    # Parser wins if a fragmentation bypass was confirmed (then a server is
+    # optional). Printed with ▸ to set it apart from the → action items.
+    _fixclass=""
+    for v in "${VERDICTS[@]}"; do
+      case "$v" in *"TLS-record fragmentation"*) _fixclass="parser"; break ;; esac
+    done
+    if [ -z "$_fixclass" ]; then
+      for v in "${VERDICTS[@]}"; do
+        case "$v" in
+          *"RST injection"*|*"unauthenticated prober"*|*"cover is fake"*|*"Silent packet"*|*"unreachable"*|*"IP-level"*|*"SNI-BASED"*|*"SNI inspection"*|*"fully-encrypted-traffic"*)
+            _fixclass="destprobe"; break ;;
+        esac
+      done
+    fi
+    if [ "$LOG_QUIET" != "1" ]; then
+      if [ "$_fixclass" = "parser" ]; then
+        printf "  ${YEL}▸${RST} %s\n" "Fix class — PARSER: the block dies to packet desync (probe 3), so a client-side tool (ByeDPI / zapret / GoodbyeDPI) beats it with NO server, on your own IP. A Reality/Xray tunnel is only needed if you also want to hide the destination or change your exit country."
+      elif [ "$_fixclass" = "destprobe" ]; then
+        printf "  ${YEL}▸${RST} %s\n" "Fix class — DESTINATION/PROBE: packet desync (ByeDPI) won't beat this — the destination or the server itself is the target (IP block / active probing / detectable protocol). That needs a destination-hiding tunnel (Reality/Xray) — set one up, or harden yours per the items below."
+      fi
+    fi
+    [ "$_fixclass" = "parser" ]   && _log_line REC "[fix-class=parser] client-side desync (ByeDPI) suffices; no server needed"
+    [ "$_fixclass" = "destprobe" ] && _log_line REC "[fix-class=destprobe] needs a destination-hiding tunnel (Reality/Xray), not a client desync"
     for rec in "${_recs[@]}"; do
       _side=$(_rec_side "$rec")
       if [ "$LOG_QUIET" != "1" ]; then

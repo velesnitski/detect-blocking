@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.13.1"
+readonly DETECT_BLOCKING_VERSION="0.14.0"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -99,6 +99,7 @@ fi
 LOG_FILE="${LOG_FILE:-}"
 LOG_QUIET="${LOG_QUIET:-0}"
 ONLY_PROBES="${ONLY_PROBES:-}"
+XRAY_ONLY="${XRAY_ONLY:-}"   # 1 = --xray-only (run only the Xray-protocol probes 11-26 + routing/egress)
 SKIP_PROBES="${SKIP_PROBES:-}"
 JSON_MODE="${JSON_MODE:-0}"
 # --reveal: print the real offending values (cover SNI, egress IP/org, matched
@@ -126,6 +127,7 @@ while [ $# -gt 0 ]; do
     --log-file=*)  LOG_FILE="${1#--log-file=}"; shift ;;
     --only)        ONLY_PROBES="${2:-}"; shift 2 ;;
     --only=*)      ONLY_PROBES="${1#--only=}"; shift ;;
+    --xray-only)   ONLY_PROBES="xray,xrayjson"; XRAY_ONLY=1; shift ;;
     --skip)        SKIP_PROBES="${2:-}"; shift 2 ;;
     --skip=*)      SKIP_PROBES="${1#--skip=}"; shift ;;
     --watch)       WATCH_INTERVAL="${2:-}"; shift 2 ;;
@@ -171,6 +173,7 @@ while [ $# -gt 0 ]; do
       printf '  --quiet, -q         suppress stdout (logging still works)\n'
       printf '  --log-file PATH     append timestamped entries to PATH\n'
       printf '  --only LIST         run only listed probes (comma-separated)\n'
+      printf '  --xray-only         only the Xray-protocol probes (11-26 + routing/egress); skips transport probes 0-10 (alias for --only xray,xrayjson; needs --xray-config / --xray-config-json)\n'
       printf '  --skip LIST         skip listed probes\n'
       printf '  --watch SECONDS     repeat probe every SECONDS, until interrupted\n'
       printf '  --from-file PATH    iterate over hosts in file (one per line, # comments)\n'
@@ -198,6 +201,11 @@ while [ $# -gt 0 ]; do
     *)  VPN_HOST="${1}"; shift ;;
   esac
 done
+
+# --xray-only runs only the Xray-protocol probes, which need a config to test.
+if [ "${XRAY_ONLY:-}" = "1" ] && [ -z "$XRAY_CONFIG" ] && [ -z "$XRAY_JSON_CONFIG" ]; then
+  printf '%s\n' "note: --xray-only runs the Xray-protocol probes (11-26) but no --xray-config / --xray-config-json was given — nothing to probe" >&2
+fi
 
 if [ "$JSON_MODE" = "1" ]; then
   check_cmd jq || die "--json requires jq (install: brew install jq / apt-get install jq)"

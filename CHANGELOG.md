@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-06-05
+
+### Added
+
+- **`--xray-only` flag.** Runs only the Xray-protocol probes (11–26 + routing /
+  egress) and skips the transport probes (0–10) — a convenience alias for
+  `--only xray,xrayjson` for quickly re-checking a config's tunnel/stealth/routing
+  without the network-layer probes. Warns if no `--xray-config` /
+  `--xray-config-json` was given (nothing to probe).
+
 ## [0.13.1] - 2026-06-05
 
 ### Added

@@ -7,7 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.12.0] - 2026-06-05
+## [0.13.0] - 2026-06-05
+
+### Added
+
+- **GFW fully-encrypted-traffic (FET) exposure check (probe 18).** Implements the
+  detection from *"How the Great Firewall of China Detects and Blocks Fully
+  Encrypted Traffic"* (gfw.report, USENIX Security '23). Since 2021 the GFW
+  *exempts* traffic that looks like a known protocol — a TLS record header, an
+  HTTP verb, or mostly-printable bytes — and **blocks the rest** by an entropy
+  test (set bits/byte ≈3.4–4.6 = looks random). A proxy with **no TLS/HTTP
+  framing** — Shadowsocks, or VMess/VLESS over **raw TCP with `security: none`** —
+  is random from byte 0, matches no exemption, and is blocked. The check is
+  purely static (protocol + security + transport): TLS/REALITY match the TLS
+  exemption, `ws`/`grpc`/`xhttp` carry plaintext HTTP framing, and UDP transports
+  (mKCP/QUIC) aren't covered by this TCP classifier. Flags exposure with a verdict
+  and a fix (wrap in TLS/REALITY, use an HTTP-framed transport, or add an
+  obfs/prefix+padding for Shadowsocks). JSON `xray_lint.fet_exposed`.
+- **Self-steal as a second SNI↔IP fix.** The CDN-fronting suggestion now also
+  names the `self-steal` REALITY pattern (server fronts its own site via
+  `realitySettings.target` + its own `serverNames`, so the cover resolves to the
+  server itself — no mismatch).
+
+
 
 ### Added
 

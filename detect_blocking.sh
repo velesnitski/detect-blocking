@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.12.0"
+readonly DETECT_BLOCKING_VERSION="0.13.0"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -647,6 +647,8 @@ XRAY_STABILITY_RESULTS=""   # "size|state|rtt ..." for JSON
 # masquerading as DPI. Findings name the protocol knob, never the secret value.
 XRAY_LINT_STATUS=""         # ok, warn, skipped
 XRAY_LINT_FINDINGS=""       # newline-joined short codes for JSON
+XRAY_FET_EXPOSED=""         # 1 / 0 / "" — fully-encrypted (no TLS/HTTP framing) → GFW entropy classifier (USENIX'23)
+XRAY_ID_UUID=""             # 1 / 0 / "" — client id is a canonical UUID (vs a hand-assigned/non-UUID string; share-safe: format only)
 
 # ---- probe 19: clock skew (Reality auth is time-windowed) ----
 # A client clock off by minutes makes the Reality handshake fail in a way that
@@ -800,6 +802,24 @@ hdr()  { [ "$LOG_QUIET" = "1" ] || printf "\n${BLU}== %s ==${RST}\n" "$1"; _log_
 
 declare -a VERDICTS=()
 add_verdict() { VERDICTS+=("$1"); _log_line VERDICT "$1"; }
+
+# Triage tag for a recommendation: who has to act on it. server-side = the
+# operator must change the server / cover / egress / deployment; client-side =
+# the user edits their own config or runs a local tool; network = the local
+# network / resolver is the problem. Keyword-matched and conservative — anything
+# ambiguous returns "" (no tag, no claim). Advisory UX only; the logged rec text
+# is unchanged. Matched in priority order (server first).
+_rec_side() {
+  case "$1" in
+    *"Reality 'dest'"*|*"serverNames"*|*"self-signed"*|*"CA-valid cover"*|*"large shared CDN"*|*"CDN-fronting"*|*"self-steal"*|*"residential or clean"*|*"clean-IP egress"*|*"'fallbacks'"*|*"wrap in TLS or switch to REALITY"*|*"recognizable shape"*|*"cover on a large"*|*"serve on 443"*)
+      printf 'server-side' ;;
+    *'domainStrategy='*|*"split-horizon"*|*"drop them from the proxy"*|*"DPI-desync"*|*"ByeDPI"*|*"GoodbyeDPI"*|*"zapret"*|*"uTLS-mimicked"*|*"curl-impersonate"*|*"UA header in client"*|*"IPv6-preferred"*|*"change flow= variant"*|*"DOH_URL"*)
+      printf 'client-side' ;;
+    *"DoH"*|*"DoT"*|*"out-of-band resolver"*|*"system resolver"*|*"trusted resolver"*|*"another vantage"*|*"control sites"*|*"resolver/network"*)
+      printf 'network' ;;
+    *) printf '' ;;
+  esac
+}
 
 # Operator-only detail (the real cover SNI / egress IP / matched keyword). Goes
 # to the TERMINAL ONLY when --reveal is set: it deliberately does NOT call
@@ -3059,6 +3079,57 @@ $1"
     _lint_add "allowInsecure=true — client skips cert validation; it's masking an invalid/self-signed cert (a strong active-probe tell) and is MITM-able. Use a real valid-cert domain, or Reality (no client cert needed)"
   fi
 
+  # --- GFW fully-encrypted-traffic (FET) exposure (gfw.report, USENIX'23) ---
+  # Since 2021 the GFW EXEMPTS traffic that looks like a known protocol — a TLS
+  # record header ([\x16-\x17]\x03[\x00-\x09]), an HTTP verb, or mostly-printable
+  # bytes — and BLOCKS the rest by an entropy test (set bits/byte ~3.4-4.6 = looks
+  # random/encrypted). A proxy with NO TLS/HTTP framing (Shadowsocks, or
+  # VMess/VLESS over RAW TCP with security=none) is random from byte 0, matches no
+  # exemption, and is blocked. TLS/Reality match the TLS exemption; ws/grpc/xhttp
+  # carry plaintext HTTP framing; UDP transports (mKCP/QUIC) aren't covered by
+  # this TCP classifier. Purely static — read protocol + security + transport.
+  local proto fet=""
+  if [ -n "$XRAY_CONFIG" ]; then proto=${XRAY_CONFIG%%://*}
+  else proto=$(_xray_cfg_field protocol '.outbounds[0].protocol'); fi
+  proto=$(printf '%s' "$proto" | tr '[:upper:]' '[:lower:]')
+  case "$proto" in
+    ss|shadowsocks) fet=1 ;;                       # fully-encrypted, no framing
+    vmess|vless|trojan)
+      case "$sec" in
+        ""|none) case "$net" in tcp|raw) fet=1 ;; *) fet=0 ;; esac ;;  # raw=exposed; ws/grpc/xhttp carry HTTP framing
+        *) fet=0 ;;                                # tls/reality → TLS exemption
+      esac ;;
+  esac
+  XRAY_FET_EXPOSED="$fet"
+  if [ "$fet" = "1" ]; then
+    case "$proto" in
+      ss|shadowsocks) warn "GFW fully-encrypted-traffic exposure: Shadowsocks has no TLS/HTTP framing → random from byte 0, so the GFW entropy classifier (USENIX'23) blocks it unless a plugin/SS-2022 prefix breaks the popcount band" ;;
+      *)              warn "GFW fully-encrypted-traffic exposure: ${proto}+raw-TCP with security=none has no TLS/HTTP framing → the GFW entropy classifier (USENIX'23) blocks fully-random traffic" ;;
+    esac
+    add_verdict "GFW fully-encrypted-traffic (FET) exposure: this transport sends fully-encrypted bytes with no TLS record header or HTTP framing, so it is random from the first byte. Since 2021 the GFW exempts traffic that looks like a known protocol (TLS / HTTP / mostly-printable) and BLOCKS the rest via an entropy test (set bits per byte ~3.4-4.6). Give it a recognizable shape: wrap in TLS or switch to REALITY (matches the TLS exemption), use a transport with plaintext HTTP framing (ws / xhttp), or for Shadowsocks add an obfs/TLS plugin or a printable prefix + padding. UDP transports (mKCP/QUIC) are not covered by this TCP classifier"
+  fi
+
+  # --- client id format (share-safe: format + length only, NEVER the value) ---
+  # VLESS/VMess hash a non-UUID id to a derived UUID, so a hand-assigned string
+  # works — but it's unusual, can indicate a typo/truncated UUID (which still
+  # passes `xray -test` yet fails auth against a UUID server), and a short/shared
+  # id is a fleet-credential signal. We only report whether it's a canonical UUID
+  # and its length — never the id itself (it's a secret).
+  local cfg_id=""
+  if [ -n "$XRAY_JSON_CONFIG" ] && command -v jq >/dev/null 2>&1; then
+    cfg_id=$(jq -r '(.outbounds[0].settings.vnext[0].users[0].id) // empty' "$XRAY_JSON_CONFIG" 2>/dev/null | head -1)
+  elif [ -n "$XRAY_CONFIG" ]; then
+    case "$XRAY_CONFIG" in vless://*) cfg_id=${XRAY_CONFIG#vless://}; cfg_id=${cfg_id%%@*} ;; esac
+  fi
+  if [ -n "$cfg_id" ]; then
+    if printf '%s' "$cfg_id" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+      XRAY_ID_UUID=1
+    else
+      XRAY_ID_UUID=0
+      info "client id is not a canonical UUID (${#cfg_id}-char string) — VLESS/VMess hash it to a derived UUID so it still works, but it's unusual (a typo/truncated UUID also passes 'xray -test' yet fails auth, and a short/shared id is a fleet-credential tell); confirm it matches the server's user id exactly"
+    fi
+  fi
+
   # Server-side VLESS fallbacks (active-probe defense): an inbound that relays
   # unauthenticated clients to a real site. Informational — a good sign when
   # present; only meaningful on a server/inbound config (client configs lack it).
@@ -4236,6 +4307,13 @@ probe_xray_detectability() {
     _canon="${_proto}|sec=$(_xray_cfg_field security '.outbounds[0].streamSettings.security')|net=${_net}|flow=${_flow}|fp=${utls_fp}|sidlen=${_sidlen}|port=${VPN_PORT_TCP}|route=${_routesig}"
     XRAY_DEPLOY_FINGERPRINT=$(printf '%s' "$_canon" | openssl dgst -sha256 2>/dev/null | sed -nE 's/.*([0-9a-f]{64}).*/\1/p' | cut -c1-12)
     [ -n "$XRAY_DEPLOY_FINGERPRINT" ] && info "deployment fingerprint: ${XRAY_DEPLOY_FINGERPRINT} (stable across nodes of the same provider/template — match it to recognize this deployment)"
+    # The fingerprint hashes the config TEMPLATE/shape, not the server's health —
+    # a sibling node with the SAME fingerprint can score very differently if its
+    # server-side cover relay (probes 15/20) is misconfigured. Flag that when this
+    # node scores high, so a matching fingerprint isn't read as a clean bill.
+    if [ -n "$XRAY_DEPLOY_FINGERPRINT" ] && [ "$score" -ge 40 ]; then
+      info "note: the deployment fingerprint identifies the config TEMPLATE, not its health — a sibling node of the same template/fingerprint can be clean while THIS one scores ${score} (here the active probes 15/20 are what diverge); match fingerprints to cluster a fleet, but score each node on its own"
+    fi
     reveal "fingerprint canonical: ${_canon}"
   fi
 }
@@ -4411,6 +4489,8 @@ _emit_json() {
     --arg xst_rttmax        "$XRAY_STABILITY_RTT_MAX" \
     --arg xl_status         "$XRAY_LINT_STATUS" \
     --arg xl_findings       "$XRAY_LINT_FINDINGS" \
+    --arg xl_fet            "$XRAY_FET_EXPOSED" \
+    --arg xl_iduuid         "$XRAY_ID_UUID" \
     --arg xck_status        "$XRAY_CLOCK_STATUS" \
     --arg xck_skew          "$XRAY_CLOCK_SKEW_S" \
     --arg xap_status        "$XRAY_ACTIVE_STATUS" \
@@ -4616,6 +4696,8 @@ _emit_json() {
         },
         xray_lint: {
           status: opt($xl_status),
+          fet_exposed: tri_bool(($xl_fet | tonumber? // -1)),
+          id_uuid: tri_bool(($xl_iduuid | tonumber? // -1)),
           findings: (if $xl_findings == "" then [] else ($xl_findings | split("\n") | map(select(length > 0))) end)
         },
         xray_clock: {
@@ -4962,7 +5044,7 @@ else
   _seen_recs=""   # de-dupe: distinct verdicts often map to the same fix
   for v in "${VERDICTS[@]}"; do
     case "$v" in
-      *"Detectability "*|*"Passive Reality/Xray fingerprint"*) rec="stealth/fingerprint finding, not a live block — make the server blend in: serve the cover SNI on 443, point Reality 'dest'/'serverNames' at a real CA-valid cover, and choose a cover hosted on the server's own network (or a large shared CDN). The structural fix for the SNI↔IP mismatch and entry/egress co-location tells is CDN-fronting: put the entry behind a CDN (e.g. Cloudflare) so the cover SNI resolves to the CDN's own IPs and the connection terminates on the CDN — eliminating both tells at the source" ;;
+      *"Detectability "*|*"Passive Reality/Xray fingerprint"*) rec="stealth/fingerprint finding, not a live block — make the server blend in: serve the cover SNI on 443, point Reality 'dest'/'serverNames' at a real CA-valid cover, and choose a cover hosted on the server's own network (or a large shared CDN). The structural fix for the SNI↔IP mismatch and entry/egress co-location tells is CDN-fronting: put the entry behind a CDN (e.g. Cloudflare) so the cover SNI resolves to the CDN's own IPs and the connection terminates on the CDN — eliminating both tells at the source. (Or a 'self-steal' REALITY setup: the server fronts its OWN real site via realitySettings.target + its own serverNames, so the cover resolves to the server itself — no mismatch.)" ;;
       *"SNI"*)                    rec="try Reality / domain fronting / ECH-enabled client" ;;
       *"System DNS failure"*)     rec="use DoH inside the VPN client and check router/provider DNS" ;;
       *"DNS sinkhole"*)           rec="use DoH inside the VPN client, not system resolver" ;;
@@ -5017,6 +5099,7 @@ else
       *"intermittently fails"*)   rec="treat as a flaky path / congested egress, not a hard block; re-test from another vantage" ;;
       *"domainStrategy="*)        rec="set domainStrategy=\"AsIs\" — domain rules match on the sniffed SNI with no local lookup, and 'direct' traffic still resolves locally at the freedom outbound (so you keep the real-user DNS-then-connect pattern); local resolution of PROXIED domains only leaks intent (the censor sees the entry flow, not the proxied destination). If you need geoip routing on domain targets, use a SPLIT-HORIZON 'dns' block: tunneled DoH for foreign/blocked domains (route the resolver's IP to a proxy outbound) + the local resolver for domestic/direct. The canonical China-grade recipe pairs this with routing geosite:cn/geoip:cn → direct and 'fakedns' for the proxied side (no real lookup, no leak, instant routing)" ;;
       *"through the proxy while the egress is on datacenter"*) rec="route the streaming / payment domains through a residential or clean-IP egress (or drop them from the proxy set) — datacenter egress IPs get geo/proxy-blocked by exactly those services" ;;
+      *"fully-encrypted-traffic (FET) exposure"*) rec="give the proxy a recognizable shape so it isn't fully random: wrap in TLS or switch to REALITY (matches the GFW's TLS exemption), or use a transport with plaintext HTTP framing (ws/xhttp). For Shadowsocks, add an obfs/TLS plugin or a printable prefix + padding to push set-bits/byte out of the 3.4-4.6 block band; or move to a UDP transport (mKCP/QUIC), which this TCP classifier doesn't cover" ;;
       *) rec="" ;;
     esac
     if [ -n "$rec" ]; then
@@ -5029,7 +5112,10 @@ else
   if [ "${#_recs[@]}" -gt 0 ]; then
     [ "$LOG_QUIET" = "1" ] || printf '\n%s\n' "${YEL}Recommendation:${RST}"
     for rec in "${_recs[@]}"; do
-      [ "$LOG_QUIET" = "1" ] || printf "  → %s\n" "$rec"
+      _side=$(_rec_side "$rec")
+      if [ "$LOG_QUIET" != "1" ]; then
+        if [ -n "$_side" ]; then printf "  → [%s] %s\n" "$_side" "$rec"; else printf "  → %s\n" "$rec"; fi
+      fi
       _log_line REC "$rec"
     done
   fi

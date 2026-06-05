@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.10.0"
+readonly DETECT_BLOCKING_VERSION="0.11.0"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -689,6 +689,8 @@ XRAY_ROUTING_LIVE_RESULTS="" # "target|state ..." for JSON
 XRAY_ROUTING_PID=""         # xray pid for the live test (EXIT-cleaned)
 XRAY_ROUTING_DOMAINSTRATEGY="" # routing.domainStrategy (AsIs / IPIfNonMatch / IPOnDemand)
 XRAY_ROUTING_DNS_RISK=""    # 1 / 0 — domainStrategy resolves domains locally with no dns block (leak)
+XRAY_ROUTING_SNIFF=""       # 1 / 0 — an inbound has sniffing.enabled (domain rules match on the SNI, no local lookup)
+XRAY_ROUTING_PROXY_SENSITIVE="" # csv of sensitive categories routed to the proxy (streaming / payment) — cross-checked vs egress reputation
 
 # ---- probe 22: bufferbloat / latency-under-load ----
 # 13/14 measure bandwidth; this measures the latency a "fast" tunnel adds while
@@ -3363,31 +3365,87 @@ probe_xray_routing() {
     *) [ -n "$proxy_tags" ] && info "default route is direct → only the listed sites/categories use the proxy (selective routing)" ;;
   esac
 
-  # --- domainStrategy / DNS-resolution leak ---
-  # IPOnDemand resolves a destination domain to IP the moment matching hits an
-  # IP/geoip rule; IPIfNonMatch resolves when no domain rule matched. Either way,
-  # with NO `dns` block those lookups go to the system/ISP resolver — a DNS leak
-  # (the resolver sees the proxied & direct domains even though traffic is
-  # tunneled) plus added latency. With sniffing on, domain rules match WITHOUT
-  # resolution, so "AsIs" avoids it entirely.
-  local dstrat has_dns has_iprule
+  # --- domainStrategy / DNS-resolution leak (precise per strategy) ---
+  # IPOnDemand resolves a domain ONLY when matching reaches an ip/geoip rule —
+  # so with no ip rules it never resolves (behaves like AsIs). IPIfNonMatch
+  # resolves EVERY destination that no domain rule matched (it re-runs the rules
+  # against the resolved IP), regardless of ip rules. Either resolution, with no
+  # `dns` block, hits the system/ISP resolver — a DNS leak (the resolver sees the
+  # proxied & direct domains even though traffic is tunneled) plus latency. With
+  # sniffing on, domain rules match on the SNI WITHOUT resolution, so "AsIs"
+  # avoids it and the ip/geoip rules degrade to matching IP-literal connections
+  # only (usually all they were catching anyway).
+  local dstrat has_dns has_iprule has_sniff
   dstrat=$(jq -r '.routing.domainStrategy // "AsIs"' "$XRAY_JSON_CONFIG" 2>/dev/null)
   has_dns=$(jq -e 'has("dns") and ((.dns.servers // []) | length > 0)' "$XRAY_JSON_CONFIG" >/dev/null 2>&1 && echo 1 || echo 0)
   has_iprule=$(jq -r '[.routing.rules[]? | select(.ip != null)] | length' "$XRAY_JSON_CONFIG" 2>/dev/null)
-  info "domainStrategy: ${dstrat} · dns block: $( [ "$has_dns" = 1 ] && echo present || echo none )"
+  has_sniff=$(jq -e 'any((.inbounds // [])[]?; .sniffing.enabled == true)' "$XRAY_JSON_CONFIG" >/dev/null 2>&1 && echo 1 || echo 0)
   XRAY_ROUTING_DOMAINSTRATEGY="$dstrat"
+  XRAY_ROUTING_SNIFF="$has_sniff"
+  info "domainStrategy: ${dstrat} · dns block: $( [ "$has_dns" = 1 ] && echo present || echo none ) · sniffing: $( [ "$has_sniff" = 1 ] && echo on || echo off ) · ip/geoip rules: ${has_iprule:-0}"
+  XRAY_ROUTING_DNS_RISK=0
   case "$dstrat" in
-    IPOnDemand|IPIfNonMatch)
-      if [ "$has_dns" = "0" ]; then
-        XRAY_ROUTING_DNS_RISK=1
-        warn "domainStrategy=${dstrat} with no dns block → Xray resolves destination domains via the system resolver (DNS leak + latency)"
-        add_verdict "Routing domainStrategy=${dstrat} resolves destination domains to IP for routing$( [ "${has_iprule:-0}" -gt 0 ] && echo ' (to evaluate the geoip/ip rules)' ), but there is no 'dns' block — so those lookups use the system/ISP resolver: a DNS leak (the resolver sees the proxied and direct domains even though traffic is tunneled) plus added latency. Sniffing is matching your domain rules without resolution, so set domainStrategy=\"AsIs\" (and add a 'dns' block routed through the proxy for fully leak-proof resolution)"
+    IPOnDemand)
+      if [ "${has_iprule:-0}" -le 0 ]; then
+        info "domainStrategy=IPOnDemand but there are no ip/geoip rules → it never actually resolves (IPOnDemand only resolves to evaluate an ip rule). No leak, but it's a no-op — set \"AsIs\" for clarity"
+      elif [ "$has_dns" = "1" ]; then
+        info "domainStrategy=IPOnDemand with a dns block — resolution is controlled (ensure the dns servers route through the proxy, not the system resolver)"
       else
-        XRAY_ROUTING_DNS_RISK=0
-        info "domainStrategy=${dstrat} with a dns block — resolution is controlled (ensure the dns servers route through the proxy, not the system resolver)"
+        XRAY_ROUTING_DNS_RISK=1
+        warn "domainStrategy=IPOnDemand + ${has_iprule} ip/geoip rule(s) and no dns block → those rules resolve domain targets via the system resolver (DNS leak + latency)"
+        if [ "$has_sniff" = "1" ]; then
+          add_verdict "Routing domainStrategy=IPOnDemand resolves domain targets to IP to evaluate the ${has_iprule} ip/geoip rule(s), with no 'dns' block — those lookups hit the system/ISP resolver (a DNS leak + latency). Sniffing already matches your domain rules without resolution, and under \"AsIs\" the ip/geoip rules still match IP-literal connections — so set domainStrategy=\"AsIs\" (you only lose geoip matching on domain targets, which your domain list likely already covers; add a 'dns' block routed through the proxy if you need it)"
+        else
+          add_verdict "Routing domainStrategy=IPOnDemand resolves domain targets via the system resolver to evaluate the ip/geoip rules, and the inbound has no sniffing — so even domain rules can force a local lookup (DNS leak + latency). Enable sniffing (enabled:true, routeOnly:true) so domain rules match on the SNI, then set domainStrategy=\"AsIs\" and add a 'dns' block routed through the proxy for the ip/geoip rules"
+        fi
       fi ;;
-    *) XRAY_ROUTING_DNS_RISK=0 ;;   # AsIs / unset → no local resolution for routing
+    IPIfNonMatch)
+      if [ "$has_dns" = "1" ]; then
+        info "domainStrategy=IPIfNonMatch with a dns block — resolution is controlled (ensure the dns servers route through the proxy, not the system resolver)"
+      else
+        XRAY_ROUTING_DNS_RISK=1
+        warn "domainStrategy=IPIfNonMatch with no dns block → every destination that no domain rule matched is resolved via the system resolver, even with no ip rules (DNS leak + latency)"
+        add_verdict "Routing domainStrategy=IPIfNonMatch resolves EVERY destination that no domain rule matched (it re-runs the rules against the resolved IP) with no 'dns' block — so those lookups hit the system/ISP resolver: a DNS leak across all unmatched traffic, plus latency. Sniffing matches your domain rules without resolution, so set domainStrategy=\"AsIs\"$( [ "$has_sniff" = 1 ] || printf '%s' ' (and enable sniffing on the inbound)' ) (add a 'dns' block routed through the proxy if you need ip/geoip matching on domain targets)"
+      fi ;;
+    *) : ;;   # AsIs / unset → no local resolution for routing
   esac
+
+  # --- egress reputation vs routing intent (cross-probe) ---
+  # probe 16 (egress) ran before this probe, so its reputation flags are set. A
+  # config that deliberately routes streaming / payment domains THROUGH a proxy
+  # whose egress is on datacenter/proxy reputation lists is at war with itself:
+  # those exact services geo-block datacenter IPs, so they'll error through this
+  # node. We connect the routing intent to the egress verdict the tool already
+  # has — more actionable than the generic "datacenter egress" note.
+  local proxy_domains sens=""
+  proxy_domains=$(jq -r --arg ptags "$proxy_tags" '
+      ($ptags | split(" ") | map(select(length > 0))) as $pt
+      | [ .routing.rules[]? | select(.outboundTag as $t | ($pt | index($t)))
+          | (.domain // [])[] ] | join(" ")' "$XRAY_JSON_CONFIG" 2>/dev/null)
+  if printf '%s' "$proxy_domains" | grep -qiE 'netflix|nflx|hulu|disney|bamgrid|hbomax|primevideo|amazonvideo|spotify|scdn|peacock|paramount|max\.com|geosite:(netflix|disney|hbo|spotify)'; then
+    sens="streaming"
+  fi
+  if printf '%s' "$proxy_domains" | grep -qiE 'paypal|stripe|mastercard|sberbank|tinkoff|revolut|coinbase|binance'; then
+    sens="${sens:+$sens,}payment"
+  fi
+  XRAY_ROUTING_PROXY_SENSITIVE="$sens"
+  if [ -n "$sens" ]; then
+    case "$XRAY_EGRESS_STATUS" in
+      ok|partial)
+        local eg_flagged=0
+        [ "${XRAY_EGRESS_PROXY:-0}" = "1" ]       && eg_flagged=1
+        [ "${XRAY_EGRESS_HOSTING:-0}" = "1" ]     && eg_flagged=1
+        [ "${XRAY_EGRESS_ASN_HOSTING:-0}" = "1" ] && eg_flagged=1
+        [ "${XRAY_EGRESS_DC:-0}" = "1" ]          && eg_flagged=1
+        if [ "$eg_flagged" = "1" ]; then
+          warn "proxy-routed set includes ${sens} services, but the egress is on datacenter/proxy reputation lists → those services will geo/proxy-block through this node"
+          add_verdict "Routing sends ${sens} services through the proxy while the egress is on datacenter/proxy reputation lists — those exact services geo-block datacenter IPs, so they'll challenge or error through this node. Route ${sens} via a residential / clean-IP egress, or drop them from the proxy set"
+        else
+          info "proxy-routed set includes ${sens} services — egress reputation is clean at this vantage, but a datacenter egress would geo-block them (re-check from the deploy egress)"
+        fi ;;
+      *) info "proxy-routed set includes ${sens} services — egress reputation not checked (tunnel down / check disabled); on a datacenter egress these services geo-block" ;;
+    esac
+  fi
   XRAY_ROUTING_STATUS="ok"
 
   # ---- Tier 2: live split-tunnel test (needs a working tunnel) ----
@@ -4285,6 +4343,8 @@ _emit_json() {
     --arg xr_status         "$XRAY_ROUTING_STATUS" \
     --arg xr_dstrat         "$XRAY_ROUTING_DOMAINSTRATEGY" \
     --arg xr_dnsrisk        "$XRAY_ROUTING_DNS_RISK" \
+    --arg xr_sniff          "$XRAY_ROUTING_SNIFF" \
+    --arg xr_sensitive      "$XRAY_ROUTING_PROXY_SENSITIVE" \
     --arg xr_default        "$XRAY_ROUTING_DEFAULT" \
     --arg xr_proxy          "$XRAY_ROUTING_PROXY_TAGS" \
     --arg xr_undef          "$XRAY_ROUTING_UNDEF" \
@@ -4499,6 +4559,8 @@ _emit_json() {
           status: opt($xr_status),
           domain_strategy: opt($xr_dstrat),
           dns_leak_risk: tri_bool(($xr_dnsrisk | tonumber? // -1)),
+          sniffing: tri_bool(($xr_sniff | tonumber? // -1)),
+          proxy_sensitive_categories: (if $xr_sensitive == "" then [] else ($xr_sensitive | split(",") | map(select(length > 0))) end),
           default_outbound: opt($xr_default),
           proxy_outbounds: (if $xr_proxy == "" then [] else ($xr_proxy | split(" ") | map(select(length > 0))) end),
           undefined_outbound_tags: (if $xr_undef == "" then [] else ($xr_undef | split(" ") | map(select(length > 0))) end),
@@ -4838,6 +4900,8 @@ else
       *"Egress IP is on datacenter/proxy"*) rec="for streaming / payment / banking, route those flows through a residential or clean-IP egress; for censorship circumvention the current egress is fine" ;;
       *"delayed RST"*|*"kill-shaping"*) rec="rotate endpoint / cover SNI, shorten session reuse, or add traffic padding — the handshake is fine, the proven flow is being dropped" ;;
       *"intermittently fails"*)   rec="treat as a flaky path / congested egress, not a hard block; re-test from another vantage" ;;
+      *"domainStrategy="*)        rec="set domainStrategy=\"AsIs\" so domain rules match on the sniffed SNI without a local lookup (the ip/geoip rules still match IP-literal connections); add a 'dns' block routed through the proxy if you need leak-proof ip/geoip matching on domain targets" ;;
+      *"through the proxy while the egress is on datacenter"*) rec="route the streaming / payment domains through a residential or clean-IP egress (or drop them from the proxy set) — datacenter egress IPs get geo/proxy-blocked by exactly those services" ;;
       *) rec="" ;;
     esac
     if [ -n "$rec" ]; then

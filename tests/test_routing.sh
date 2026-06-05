@@ -49,10 +49,34 @@ out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config-json "$LEAK" --only xrayjson --json
 # Same config switched to AsIs → no local resolution → no leak.
 out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config-json "$(printf '%s' "$LEAK" | sed 's/IPOnDemand/AsIs/')" --only xrayjson --json 2>/dev/null)
 [ "$(rt "$out" | jq -r '.dns_leak_risk')" = "false" ] || fail "domainStrategy=AsIs should NOT be a DNS-leak risk"
+# Sniffing is reported (the LEAK config enables it on the inbound).
+out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config-json "$LEAK" --only xrayjson --json 2>/dev/null)
+[ "$(rt "$out" | jq -r '.sniffing')" = "true" ] || fail "sniffing should be reported true when an inbound enables it"
+
+# Precision: IPOnDemand with NO ip/geoip rules NEVER resolves (it only resolves
+# to evaluate an ip rule) → NOT a leak, even with no dns block. IPIfNonMatch in
+# the same shape DOES leak (it resolves every unmatched destination regardless).
+NOIP='{"inbounds":[{"tag":"s","listen":"127.0.0.1","port":10808,"protocol":"socks","settings":{"auth":"noauth"},"sniffing":{"enabled":true,"routeOnly":true,"destOverride":["tls"]}}],"routing":{"domainStrategy":"IPOnDemand","rules":[{"type":"field","domain":["domain:youtube.com"],"outboundTag":"proxy"},{"type":"field","network":"tcp,udp","outboundTag":"direct"}]},"outbounds":[{"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"127.0.0.1","port":1,"users":[{"id":"00000000-0000-0000-0000-000000000000","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.net","publicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","shortId":"01"}}},{"tag":"direct","protocol":"freedom"}]}'
+out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config-json "$NOIP" --only xrayjson --json 2>/dev/null)
+[ "$(rt "$out" | jq -r '.dns_leak_risk')" = "false" ] || fail "IPOnDemand with no ip/geoip rules is a no-op, NOT a DNS leak"
+out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config-json "$(printf '%s' "$NOIP" | sed 's/IPOnDemand/IPIfNonMatch/')" --only xrayjson --json 2>/dev/null)
+[ "$(rt "$out" | jq -r '.dns_leak_risk')" = "true" ] || fail "IPIfNonMatch + no dns leaks regardless of ip rules"
+
+# Egress-vs-routing: a config routing a streaming service through the proxy is
+# tagged streaming in proxy_sensitive_categories (static parse; the conflict
+# verdict itself needs a live datacenter egress, so only the field is asserted).
+STREAM='{"inbounds":[{"tag":"s","listen":"127.0.0.1","port":10808,"protocol":"socks","settings":{"auth":"noauth"}}],"routing":{"rules":[{"type":"field","domain":["domain:netflix.com","domain:adobe.com"],"outboundTag":"proxy"},{"type":"field","network":"tcp,udp","outboundTag":"direct"}]},"outbounds":[{"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"127.0.0.1","port":1,"users":[{"id":"00000000-0000-0000-0000-000000000000","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.net","publicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","shortId":"01"}}},{"tag":"direct","protocol":"freedom"}]}'
+out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config-json "$STREAM" --only xrayjson --json 2>/dev/null)
+printf '%s' "$(rt "$out")" | jq -e '.proxy_sensitive_categories | index("streaming")' >/dev/null \
+  || fail "a streaming domain routed to the proxy should be tagged 'streaming'"
+# A config with no streaming/payment domains → empty categories.
+out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config-json "$LEAK" --only xrayjson --json 2>/dev/null)
+[ "$(rt "$out" | jq -r '.proxy_sensitive_categories | length')" = "0" ] \
+  || fail "a config with no streaming/payment proxy domains should have empty proxy_sensitive_categories"
 
 # A config with NO routing table → status 'none' (nothing to map).
 NOROUTE='{"inbounds":[{"tag":"s","listen":"127.0.0.1","port":10808,"protocol":"socks","settings":{"auth":"noauth"}}],"outbounds":[{"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"127.0.0.1","port":1,"users":[{"id":"00000000-0000-0000-0000-000000000000","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.net","publicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","shortId":"01"}}}]}'
 out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config-json "$NOROUTE" --only xrayjson --json 2>/dev/null)
 [ "$(rt "$out" | jq -r '.status')" = "none" ] || fail "a config with no routing.rules should report status 'none'"
 
-echo "PASS: routing map + default route + undefined-tag lint + domainStrategy DNS-leak; no-routing → none"
+echo "PASS: routing map + default route + undefined-tag lint + domainStrategy DNS-leak (per-strategy precision) + streaming/payment-vs-egress tag; no-routing → none"

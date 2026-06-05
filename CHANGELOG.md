@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-06-05
+
+### Added
+
+- **Egress-vs-routing-intent cross-check (routing probe ↔ probe 16).** New
+  cross-probe synthesis: if the proxy-routed set contains **streaming or payment
+  domains** AND the egress is on **datacenter/proxy reputation lists**, those
+  exact services will geo/proxy-block through the node. The tool already had both
+  facts (the routing map and the egress reputation flags) but never connected
+  them; now it warns, raises a verdict, and recommends a residential/clean-IP
+  egress for those flows (or dropping them from the proxy set). JSON
+  `xray_routing.proxy_sensitive_categories`.
+
+### Changed
+
+- **Per-strategy `domainStrategy` precision.** The DNS-leak check no longer
+  treats `IPOnDemand` and `IPIfNonMatch` identically. `IPOnDemand` only resolves
+  to evaluate an `ip`/`geoip` rule, so with **no `ip` rules it never resolves**
+  and is no longer flagged (a no-op, not a leak). `IPIfNonMatch` resolves
+  **every** unmatched destination regardless of `ip` rules, so it's flagged
+  whenever there's no `dns` block. The advice also reads the inbound
+  **sniffing** state: with sniffing on, domain rules match leak-free and the fix
+  is `domainStrategy: "AsIs"`; with sniffing off, it tells you to enable sniffing
+  first. JSON `xray_routing.sniffing`.
+
 ## [0.10.0] - 2026-06-05
 
 ### Added

@@ -27,8 +27,8 @@ printf '%s' "$out" | jq -e '
   | has("score") and has("band") and has("port_standard")
     and has("sni_ip_asn_match") and has("passive_fingerprint_strong")
     and has("utls_fp_uncommon") and has("deployment_fingerprint")
-    and has("cover_obscure")
-' >/dev/null || fail "detectability schema missing keys (incl. uTLS fp + deployment fingerprint)"
+    and has("cover_obscure") and has("tls_in_tls_protected") and has("mux_enabled")
+' >/dev/null || fail "detectability schema missing keys (incl. uTLS fp + deployment fingerprint + vision)"
 # No separate passive-fingerprint probe block should exist anymore.
 [ "$(printf '%s' "$out" | jq -r '.probes | has("xray_passive_fingerprint")')" = "false" ] \
   || fail "xray_passive_fingerprint should be folded into xray_detectability"
@@ -47,4 +47,16 @@ out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config "$URL" --only xray --json 2>/dev/nu
 score=$(printf '%s' "$out" | jq -r '.probes.xray_detectability.score')
 [ "${score:-0}" -ge 10 ] || fail "non-443 port should add >=10 to the score, got '$score'"
 
-echo "PASS: probe 26 is last, folds active + passive (+conjunction) signals, schema intact"
+# TLS-in-TLS / vision: this URL is VLESS+REALITY+TCP with NO flow → exposed.
+[ "$(printf '%s' "$out" | jq -r '.probes.xray_detectability.tls_in_tls_protected')" = "false" ] \
+  || fail "REALITY+TCP without xtls-rprx-vision should report tls_in_tls_protected=false"
+# Same config WITH vision flow → protected, and scores lower (the +15 is removed).
+URLV="${URL}&flow=xtls-rprx-vision"
+outv=$(TIMEOUT=2 bash "$SCRIPT" --xray-config "$URLV" --only xray --json 2>/dev/null)
+[ "$(printf '%s' "$outv" | jq -r '.probes.xray_detectability.tls_in_tls_protected')" = "true" ] \
+  || fail "REALITY+TCP with xtls-rprx-vision should report tls_in_tls_protected=true"
+scorev=$(printf '%s' "$outv" | jq -r '.probes.xray_detectability.score')
+[ "${scorev:-0}" -lt "${score:-0}" ] \
+  || fail "vision-present score ($scorev) should be lower than vision-absent ($score)"
+
+echo "PASS: probe 26 is last, folds active + passive (+conjunction + TLS-in-TLS) signals, schema intact"

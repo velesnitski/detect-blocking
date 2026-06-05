@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-06-05
+
+### Added
+
+- **TLS-in-TLS exposure check (probe 26, scored +15).** Flags VLESS-REALITY
+  configs that lack `flow: "xtls-rprx-vision"` — the inner TLS records of a
+  proxied HTTPS site carry a length/timing signature visible inside the outer
+  REALITY TLS, which the most advanced censors detect passively (REALITY with a
+  non-XTLS flow is officially discouraged for this reason). Detected statically
+  from the flow/transport (the *mitigation*, not the packet signature — no
+  `tshark`). Unlike the uTLS-fp tradeoff, vision is near-universally correct, so
+  it scores. JSON `xray_detectability.tls_in_tls_protected`.
+- **CDN-fronting suggestion.** When the SNI↔IP mismatch / entry-egress
+  co-location tells fire, the recommendation now names CDN-fronting as the
+  structural fix: front the entry behind a CDN so the cover SNI resolves to the
+  CDN's own IPs and the connection terminates there, eliminating both tells.
+- **Traffic-shape advice (folded into the vision finding).** Suggests XHTTP +
+  padding where vision can't apply (CDN-frontable transports), and surfaces
+  `mux.cool` as a soft note (it adds a correlation/shape surface and is generally
+  unnecessary with vision). JSON `xray_detectability.mux_enabled`.
+- **Server-side VLESS `fallbacks` detection** (active-probe defense, info-only),
+  and the DNS recommendation now points to the canonical `geosite:cn`/`geoip:cn`
+  → direct + `fakedns` recipe.
+- **DNS split-horizon detection (routing probe).** A `dns` block with per-domain
+  servers (a tunneled foreign resolver + a local domestic one) is recognized as
+  the leak-free way to keep geoip routing. JSON `xray_routing.dns_split_horizon`.
+
+### Changed
+
+- **Sharper DNS-leak messaging.** The `domainStrategy` finding now explains the
+  *direction* of the leak: local resolution of a proxied domain is leak-only, not
+  blending (the local censor never sees the proxied destination — it connects
+  from the exit IP), while direct traffic already resolves locally at the
+  `freedom` outbound. Recommends a split-horizon `dns` block, and notes a tunneled
+  resolver's local blockability is irrelevant once routed through the proxy.
+- **Probe 18 lint** accepts `network: "raw"` (the current name for `tcp`) for
+  `flow=xtls-rprx-vision`, instead of flagging it as a misconfig.
+
+### Fixed
+
+- **False-positive "rotate endpoint" verdicts.** Probe 5's *"firewall blackhole /
+  full IP block"* is now suppressed when the tunnel actually works
+  (`XRAY_JSON_STATUS=ok`), and probe 13's *"data plane unusable"* is suppressed
+  when multi-stream capacity (probe 14) or held-session stability (probe 17) are
+  healthy — both replaced with one transient note. A single early/single-stream
+  stall no longer contradicts a working tunnel pushing full throughput (same
+  vantage-aware cross-reference as probe 2).
+
 ## [0.11.0] - 2026-06-05
 
 ### Added

@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.11.0"
+readonly DETECT_BLOCKING_VERSION="0.12.0"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -691,6 +691,7 @@ XRAY_ROUTING_DOMAINSTRATEGY="" # routing.domainStrategy (AsIs / IPIfNonMatch / I
 XRAY_ROUTING_DNS_RISK=""    # 1 / 0 — domainStrategy resolves domains locally with no dns block (leak)
 XRAY_ROUTING_SNIFF=""       # 1 / 0 — an inbound has sniffing.enabled (domain rules match on the SNI, no local lookup)
 XRAY_ROUTING_PROXY_SENSITIVE="" # csv of sensitive categories routed to the proxy (streaming / payment) — cross-checked vs egress reputation
+XRAY_ROUTING_DNS_SPLIT=""   # 1 / 0 — dns block uses per-domain servers (split-horizon: tunneled foreign + local domestic); "" when no dns block
 
 # ---- probe 22: bufferbloat / latency-under-load ----
 # 13/14 measure bandwidth; this measures the latency a "fast" tunnel adds while
@@ -746,6 +747,8 @@ XRAY_PASSIVE_SNI_RESOLVES="" # 1 / 0 / "" — cover SNI publicly resolves (a non
 XRAY_PASSIVE_SNI_KEYWORD=""  # 1 / 0 — cover SNI contains a circumvention/antagonistic keyword (cleartext)
 XRAY_PASSIVE_UTLS_RARE=""    # 1 / 0 — uTLS fingerprint is uncommon/regional (distinctive JA3)
 XRAY_PASSIVE_COVER_OBSCURE="" # 1 / 0 — cover SNI resolves to a hosting/VPS net (self-owned/obscure), not a CDN
+XRAY_PASSIVE_VISION=""       # 1 protected / 0 exposed / "" n/a — VLESS-Reality uses xtls-rprx-vision (anti TLS-in-TLS)
+XRAY_TRANSPORT_MUX=""        # 1 / 0 / "" — mux.cool enabled on the proxy outbound (shape/correlation note vs vision)
 XRAY_DEPLOY_FINGERPRINT=""   # short stable hash of the config's identifying shape (provider match)
 
 # ---- baseline / diff mode (longitudinal regression detection) ----
@@ -3018,9 +3021,9 @@ $1"
     fi
   }
 
-  # flow=vision requires TCP transport.
-  if [ -n "$flow" ] && [ "$net" != "tcp" ]; then
-    _lint_add "flow=$flow requires network=tcp, but network=$net — handshake will fail"
+  # flow=vision requires raw TCP transport ("raw" is the current name for "tcp").
+  if [ -n "$flow" ] && { [ "$net" != "tcp" ] && [ "$net" != "raw" ]; }; then
+    _lint_add "flow=$flow requires raw TCP transport (network=tcp/raw), but network=$net — handshake will fail"
   fi
   if [ "$sec" = "reality" ]; then
     [ -z "$pbk" ] && _lint_add "security=reality but publicKey (pbk) is missing"
@@ -3054,6 +3057,15 @@ $1"
   # cert is genuinely valid so allowInsecure can be dropped.
   if [ "$insec" = "1" ]; then
     _lint_add "allowInsecure=true — client skips cert validation; it's masking an invalid/self-signed cert (a strong active-probe tell) and is MITM-able. Use a real valid-cert domain, or Reality (no client cert needed)"
+  fi
+
+  # Server-side VLESS fallbacks (active-probe defense): an inbound that relays
+  # unauthenticated clients to a real site. Informational — a good sign when
+  # present; only meaningful on a server/inbound config (client configs lack it).
+  if [ -n "$XRAY_JSON_CONFIG" ] && command -v jq >/dev/null 2>&1; then
+    if jq -e '[.inbounds[]? | select((.settings.fallbacks // []) | length > 0)] | length > 0' "$XRAY_JSON_CONFIG" >/dev/null 2>&1; then
+      info "server-side VLESS fallbacks present — unauthenticated clients are relayed to a real site (active-probe defense)"
+    fi
   fi
 
   XRAY_LINT_FINDINGS="$findings"
@@ -3375,37 +3387,65 @@ probe_xray_routing() {
   # sniffing on, domain rules match on the SNI WITHOUT resolution, so "AsIs"
   # avoids it and the ip/geoip rules degrade to matching IP-literal connections
   # only (usually all they were catching anyway).
-  local dstrat has_dns has_iprule has_sniff
+  local dstrat has_dns has_iprule has_sniff has_dns_split=""
   dstrat=$(jq -r '.routing.domainStrategy // "AsIs"' "$XRAY_JSON_CONFIG" 2>/dev/null)
   has_dns=$(jq -e 'has("dns") and ((.dns.servers // []) | length > 0)' "$XRAY_JSON_CONFIG" >/dev/null 2>&1 && echo 1 || echo 0)
   has_iprule=$(jq -r '[.routing.rules[]? | select(.ip != null)] | length' "$XRAY_JSON_CONFIG" 2>/dev/null)
   has_sniff=$(jq -e 'any((.inbounds // [])[]?; .sniffing.enabled == true)' "$XRAY_JSON_CONFIG" >/dev/null 2>&1 && echo 1 || echo 0)
+  # Split-horizon dns = at least one server is an object with a per-domain
+  # `domains` map → foreign/blocked names can resolve over a tunneled resolver
+  # while domestic names stay on the local one (the leak-free way to keep geoip).
+  if [ "$has_dns" = "1" ]; then
+    has_dns_split=$(jq -e '[.dns.servers[]? | select(type=="object" and has("domains"))] | length > 0' "$XRAY_JSON_CONFIG" >/dev/null 2>&1 && echo 1 || echo 0)
+  fi
   XRAY_ROUTING_DOMAINSTRATEGY="$dstrat"
   XRAY_ROUTING_SNIFF="$has_sniff"
+  XRAY_ROUTING_DNS_SPLIT="$has_dns_split"
   info "domainStrategy: ${dstrat} · dns block: $( [ "$has_dns" = 1 ] && echo present || echo none ) · sniffing: $( [ "$has_sniff" = 1 ] && echo on || echo off ) · ip/geoip rules: ${has_iprule:-0}"
   XRAY_ROUTING_DNS_RISK=0
+  # The sharp distinction a censor-aware operator needs: local resolution here is
+  # leak-only, NOT blending. `direct` traffic ALREADY resolves locally at the
+  # freedom outbound (so "AsIs" keeps the real-user DNS-then-connect look the
+  # operator wants), while a PROXIED domain connects from the EXIT IP — the local
+  # censor never sees that connection, so resolving it locally adds zero blending
+  # and only leaks intent; in a censored network the local resolver is poisoned,
+  # mis-driving the very geoip rule it was meant to feed.
+  local realism_note="local resolution here is leak-only, not blending: 'direct' traffic already resolves locally at the freedom outbound (so \"AsIs\" keeps the real-user DNS-then-connect pattern), while a PROXIED domain connects from the EXIT IP — the local censor never sees that connection, so resolving it locally adds no blending, only leaked intent; worse, a censored network's resolver poisons those answers and mis-drives the geoip rule"
+  local split_fix="to keep geoip routing without leaking blocked-domain lookups, use a SPLIT-HORIZON 'dns' block: a tunneled DoH server for foreign/blocked domains (route the resolver's IP to a proxy outbound) + the local resolver for domestic/direct"
   case "$dstrat" in
     IPOnDemand)
       if [ "${has_iprule:-0}" -le 0 ]; then
         info "domainStrategy=IPOnDemand but there are no ip/geoip rules → it never actually resolves (IPOnDemand only resolves to evaluate an ip rule). No leak, but it's a no-op — set \"AsIs\" for clarity"
       elif [ "$has_dns" = "1" ]; then
-        info "domainStrategy=IPOnDemand with a dns block — resolution is controlled (ensure the dns servers route through the proxy, not the system resolver)"
+        if [ "$has_dns_split" = "1" ]; then
+          info "domainStrategy=IPOnDemand with a SPLIT-HORIZON dns block (per-domain servers) → good shape: foreign lookups can be tunneled while domestic stay local. Confirm the foreign/DoH server egresses THROUGH the proxy (route its IP to a proxy outbound), else those lookups still leak"
+        else
+          info "domainStrategy=IPOnDemand with a single-server dns block — confirm that server egresses through the proxy (route its IP to a proxy outbound); a split-horizon dns block (tunneled DoH for foreign, local resolver for domestic) blends better and leaks less"
+        fi
       else
         XRAY_ROUTING_DNS_RISK=1
         warn "domainStrategy=IPOnDemand + ${has_iprule} ip/geoip rule(s) and no dns block → those rules resolve domain targets via the system resolver (DNS leak + latency)"
+        info "$realism_note"
+        info "$split_fix"
         if [ "$has_sniff" = "1" ]; then
-          add_verdict "Routing domainStrategy=IPOnDemand resolves domain targets to IP to evaluate the ${has_iprule} ip/geoip rule(s), with no 'dns' block — those lookups hit the system/ISP resolver (a DNS leak + latency). Sniffing already matches your domain rules without resolution, and under \"AsIs\" the ip/geoip rules still match IP-literal connections — so set domainStrategy=\"AsIs\" (you only lose geoip matching on domain targets, which your domain list likely already covers; add a 'dns' block routed through the proxy if you need it)"
+          add_verdict "Routing domainStrategy=IPOnDemand resolves domain targets to IP to evaluate the ${has_iprule} ip/geoip rule(s), with no 'dns' block — those lookups hit the system/ISP resolver (a DNS leak + latency). This is leak-only, not blending: direct traffic already resolves locally at the freedom outbound, and a proxied domain connects from the exit IP (the local censor never sees it). Sniffing matches your domain rules without resolution, so set domainStrategy=\"AsIs\"; if you genuinely need geoip on domain targets, use a split-horizon 'dns' block (tunneled DoH for foreign, local resolver for domestic) so blocked-domain lookups don't leak"
         else
-          add_verdict "Routing domainStrategy=IPOnDemand resolves domain targets via the system resolver to evaluate the ip/geoip rules, and the inbound has no sniffing — so even domain rules can force a local lookup (DNS leak + latency). Enable sniffing (enabled:true, routeOnly:true) so domain rules match on the SNI, then set domainStrategy=\"AsIs\" and add a 'dns' block routed through the proxy for the ip/geoip rules"
+          add_verdict "Routing domainStrategy=IPOnDemand resolves domain targets via the system resolver to evaluate the ip/geoip rules, and the inbound has no sniffing — so even domain rules can force a local lookup (DNS leak + latency). Enable sniffing (enabled:true, routeOnly:true) so domain rules match on the SNI, then set domainStrategy=\"AsIs\"; if you need geoip on domain targets use a split-horizon 'dns' block (tunneled DoH for foreign, local resolver for domestic)"
         fi
       fi ;;
     IPIfNonMatch)
       if [ "$has_dns" = "1" ]; then
-        info "domainStrategy=IPIfNonMatch with a dns block — resolution is controlled (ensure the dns servers route through the proxy, not the system resolver)"
+        if [ "$has_dns_split" = "1" ]; then
+          info "domainStrategy=IPIfNonMatch with a SPLIT-HORIZON dns block (per-domain servers) → good shape, but confirm the foreign/DoH server egresses THROUGH the proxy (route its IP to a proxy outbound), else unmatched-domain lookups still leak"
+        else
+          info "domainStrategy=IPIfNonMatch with a single-server dns block — confirm that server egresses through the proxy; a split-horizon dns block (tunneled DoH for foreign, local resolver for domestic) blends better and leaks less"
+        fi
       else
         XRAY_ROUTING_DNS_RISK=1
         warn "domainStrategy=IPIfNonMatch with no dns block → every destination that no domain rule matched is resolved via the system resolver, even with no ip rules (DNS leak + latency)"
-        add_verdict "Routing domainStrategy=IPIfNonMatch resolves EVERY destination that no domain rule matched (it re-runs the rules against the resolved IP) with no 'dns' block — so those lookups hit the system/ISP resolver: a DNS leak across all unmatched traffic, plus latency. Sniffing matches your domain rules without resolution, so set domainStrategy=\"AsIs\"$( [ "$has_sniff" = 1 ] || printf '%s' ' (and enable sniffing on the inbound)' ) (add a 'dns' block routed through the proxy if you need ip/geoip matching on domain targets)"
+        info "$realism_note"
+        info "$split_fix"
+        add_verdict "Routing domainStrategy=IPIfNonMatch resolves EVERY destination that no domain rule matched (it re-runs the rules against the resolved IP) with no 'dns' block — so those lookups hit the system/ISP resolver: a DNS leak across all unmatched traffic, plus latency. It's leak-only, not blending (direct traffic already resolves locally; proxied domains connect from the exit IP). Set domainStrategy=\"AsIs\"$( [ "$has_sniff" = 1 ] || printf '%s' ' (and enable sniffing on the inbound)' ); for geoip on domain targets use a split-horizon 'dns' block (tunneled DoH for foreign, local resolver for domestic)"
       fi ;;
     *) : ;;   # AsIs / unset → no local resolution for routing
   esac
@@ -4067,6 +4107,36 @@ probe_xray_detectability() {
   fi
   score=$(( score + conj_pts ))
 
+  # --- TLS-in-TLS exposure: VLESS-Reality without xtls-rprx-vision (SCORED) ---
+  # The most advanced censors' marquee PASSIVE attack detects TLS-in-TLS: when an
+  # HTTPS site is proxied, the inner TLS records carry a length/timing signature
+  # visible INSIDE the outer Reality TLS. flow=xtls-rprx-vision splices/pads the
+  # stream to erase it; REALITY with a non-XTLS (non-vision) flow is officially
+  # discouraged for exactly this. Detected statically from flow/transport — no
+  # tshark needed: we detect the MITIGATION, not the packet signature. NOT a
+  # tradeoff like the uTLS fp — vision is near-universally correct, so it scores.
+  local vis_pts=0 vis_desc="n/a (not a REALITY proxy)" v_sec v_net v_flow v_mux
+  v_sec=$(_xray_cfg_field security '.outbounds[0].streamSettings.security')
+  v_net=$(_xray_cfg_field type     '.outbounds[0].streamSettings.network')
+  v_flow=$(_xray_cfg_field flow    '.outbounds[0].settings.vnext[0].users[0].flow')
+  [ -z "$v_net" ] && v_net=tcp
+  if [ "$v_sec" = "reality" ]; then   # REALITY is VLESS-only → vision applies
+    if [ "$v_flow" = "xtls-rprx-vision" ]; then
+      XRAY_PASSIVE_VISION=1; vis_desc="xtls-rprx-vision present (anti TLS-in-TLS)"
+    else
+      XRAY_PASSIVE_VISION=0; vis_pts=15
+      case "$v_net" in
+        tcp|raw) vis_desc="no vision flow on REALITY+TCP — TLS-in-TLS exposure" ;;
+        *)       vis_desc="REALITY over ${v_net} (vision needs raw TCP) — TLS-in-TLS exposure" ;;
+      esac
+    fi
+  fi
+  score=$(( score + vis_pts ))
+  # mux.cool state (traffic-shape note, not scored): generally unnecessary with
+  # vision and adds a correlation/shape surface — folded into the suggestion.
+  v_mux=$(_xray_cfg_field _nourl '.outbounds[0].mux.enabled')
+  case "$v_mux" in true|1) XRAY_TRANSPORT_MUX=1 ;; false|0) XRAY_TRANSPORT_MUX=0 ;; *) XRAY_TRANSPORT_MUX="" ;; esac
+
   [ "$score" -gt 100 ] && score=100
   XRAY_DETECT_SCORE="$score"
   if   [ "$score" -ge 70 ]; then XRAY_DETECT_BAND="critical"
@@ -4084,6 +4154,7 @@ probe_xray_detectability() {
   info "$(printf 'passive · SNI quality:      %-38s +%d' "$sniq_desc" "$sniq_pts")"
   info "$(printf 'passive · uTLS fp (JA3):    %-38s +%d' "$fp_desc" "$fp_pts")"
   info "$(printf 'passive · conjunction:      %-38s +%d' "$conj_desc" "$conj_pts")"
+  info "$(printf 'passive · TLS-in-TLS:       %-38s +%d' "$vis_desc" "$vis_pts")"
   info "bands: 0-14 low · 15-39 moderate · 40-69 high · 70-100 critical"
 
   if [ "$score" -ge 40 ]; then
@@ -4123,6 +4194,16 @@ probe_xray_detectability() {
   if [ "${XRAY_PASSIVE_COVER_OBSCURE:-0}" = "1" ]; then
     warn "cover SNI is self-owned/obscure — resolves to a hosting/VPS network, not a popular CDN site"
     add_verdict "Reality cover resolves to a hosting/VPS network rather than a major CDN — it's a self-owned or obscure cover, not a popular third-party site. A censor can blocklist it with little collateral damage (unlike blocking a big CDN domain), and a self-owned cover often names the operator (a provider tell). Borrow a genuinely popular domain hosted on a large shared CDN (Cloudflare/Akamai/Fastly/Google/Amazon/Microsoft) as the Reality cover"
+  fi
+
+  # TLS-in-TLS exposure (vision absent) — the most advanced censors' marquee
+  # passive detector. Folds in the traffic-shape advice (XHTTP+padding when
+  # vision can't apply; disable mux with vision).
+  if [ "${XRAY_PASSIVE_VISION:-}" = "0" ]; then
+    warn "TLS-in-TLS exposure: VLESS-Reality without xtls-rprx-vision — advanced censors (e.g. the GFW) detect this passively"
+    add_verdict "VLESS-Reality without flow=\"xtls-rprx-vision\" → TLS-in-TLS exposure: when an HTTPS site is proxied, the inner TLS records carry a length/timing signature visible inside the outer Reality TLS, which advanced censors detect passively (REALITY with a non-XTLS flow is officially discouraged for this reason). Set the user 'flow' to \"xtls-rprx-vision\" on BOTH client and server (it requires raw TCP transport, network=tcp/raw). If you must use a CDN-frontable transport (ws/grpc/xhttp) where vision can't apply, prefer XHTTP with padding to blunt the traffic-shape signature$( [ "${XRAY_TRANSPORT_MUX:-}" = "1" ] && printf '%s' '; and disable mux.cool — with vision it is unnecessary and adds a correlation surface' )"
+  elif [ "${XRAY_PASSIVE_VISION:-}" = "1" ] && [ "${XRAY_TRANSPORT_MUX:-}" = "1" ]; then
+    info "mux.cool is enabled alongside vision — most REALITY+vision setups leave mux off (vision handles flow shaping; mux adds overhead and a correlation surface)"
   fi
 
   # Uncommon uTLS fingerprint — reported as a TRADEOFF, not a tell (not scored).
@@ -4344,6 +4425,7 @@ _emit_json() {
     --arg xr_dstrat         "$XRAY_ROUTING_DOMAINSTRATEGY" \
     --arg xr_dnsrisk        "$XRAY_ROUTING_DNS_RISK" \
     --arg xr_sniff          "$XRAY_ROUTING_SNIFF" \
+    --arg xr_dnssplit       "$XRAY_ROUTING_DNS_SPLIT" \
     --arg xr_sensitive      "$XRAY_ROUTING_PROXY_SENSITIVE" \
     --arg xr_default        "$XRAY_ROUTING_DEFAULT" \
     --arg xr_proxy          "$XRAY_ROUTING_PROXY_TAGS" \
@@ -4374,6 +4456,8 @@ _emit_json() {
     --arg xpf_sni_keyword   "$XRAY_PASSIVE_SNI_KEYWORD" \
     --arg xpf_cover_obscure "$XRAY_PASSIVE_COVER_OBSCURE" \
     --arg xpf_utls_rare     "$XRAY_PASSIVE_UTLS_RARE" \
+    --arg xpf_vision        "$XRAY_PASSIVE_VISION" \
+    --arg xtr_mux           "$XRAY_TRANSPORT_MUX" \
     --arg xd_deployfp       "$XRAY_DEPLOY_FINGERPRINT" \
     --argjson verdicts      "$verdicts_json" '
     def words: split(" ") | map(select(length > 0));
@@ -4560,6 +4644,7 @@ _emit_json() {
           domain_strategy: opt($xr_dstrat),
           dns_leak_risk: tri_bool(($xr_dnsrisk | tonumber? // -1)),
           sniffing: tri_bool(($xr_sniff | tonumber? // -1)),
+          dns_split_horizon: tri_bool(($xr_dnssplit | tonumber? // -1)),
           proxy_sensitive_categories: (if $xr_sensitive == "" then [] else ($xr_sensitive | split(",") | map(select(length > 0))) end),
           default_outbound: opt($xr_default),
           proxy_outbounds: (if $xr_proxy == "" then [] else ($xr_proxy | split(" ") | map(select(length > 0))) end),
@@ -4605,6 +4690,8 @@ _emit_json() {
           sni_keyword: tri_bool(($xpf_sni_keyword | tonumber? // -1)),
           cover_obscure: tri_bool(($xpf_cover_obscure | tonumber? // -1)),
           utls_fp_uncommon: tri_bool(($xpf_utls_rare | tonumber? // -1)),
+          tls_in_tls_protected: tri_bool(($xpf_vision | tonumber? // -1)),
+          mux_enabled: tri_bool(($xtr_mux | tonumber? // -1)),
           deployment_fingerprint: opt($xd_deployfp)
         }
       },
@@ -4806,6 +4893,34 @@ _should_run xrayjson && probe_xray_bufferbloat
 # port / SNI↔IP signals) — always run it last.
 { _should_run xray || _should_run xrayjson; } && probe_xray_detectability
 
+# ---- cross-reference: drop severe verdicts the rest of the run disproves ----
+# A single early/single-stream probe can fire a SEVERE verdict that later probes
+# contradict. Probe 5 reads a hung handshake as a "firewall blackhole / full IP
+# block"; probe 13 reads a single-stream stall as a "dead data plane". But a
+# working tunnel (probe 12) proves the IP is NOT blackholed, and healthy
+# multi-stream capacity (probe 14) / held-session stability (probe 17) prove the
+# data plane flows. Suppress the contradicted verdicts (and their "rotate
+# endpoint" recs) and leave one transient note — same over-alarm hardening as
+# probe 2's vantage-aware cross-reference. Runs before the summary so the JSON
+# and the printed verdict stay consistent.
+if [ "${#VERDICTS[@]}" -gt 0 ]; then
+  _vkept=(); _vsupp=0
+  for v in "${VERDICTS[@]}"; do
+    case "$v" in
+      *"Silent packet drop (firewall blackhole"*)
+        if [ "${XRAY_JSON_STATUS:-}" = "ok" ]; then _vsupp=1; continue; fi ;;
+      *"data plane is unusable"*)
+        if [ "${XRAY_SPEEDTEST_STATUS:-}" = "ok" ] || [ "${XRAY_STABILITY_STATUS:-}" = "ok" ]; then _vsupp=1; continue; fi ;;
+    esac
+    _vkept+=("$v")
+  done
+  VERDICTS=()
+  [ "${#_vkept[@]}" -gt 0 ] && VERDICTS=("${_vkept[@]}")
+  if [ "$_vsupp" = "1" ]; then
+    add_verdict "Transient (not a block): an early handshake (probe 5) and/or single-stream throughput (probe 13) read as a hard failure, but the tunnel established (probe 12) and multi-stream capacity (probe 14) / held-session stability (probe 17) are healthy — so that's load / path jitter, not an IP block or a dead data plane. The endpoint is fine; don't rotate it on that evidence."
+  fi
+fi
+
 # ---------- summary ----------
 
 # Baseline save / diff (longitudinal regression mode). Reuses the JSON emitter
@@ -4847,7 +4962,7 @@ else
   _seen_recs=""   # de-dupe: distinct verdicts often map to the same fix
   for v in "${VERDICTS[@]}"; do
     case "$v" in
-      *"Detectability "*|*"Passive Reality/Xray fingerprint"*) rec="stealth/fingerprint finding, not a live block — make the server blend in: serve the cover SNI on 443, point Reality 'dest'/'serverNames' at a real CA-valid cover, and choose a cover hosted on the server's own network (or a large shared CDN)" ;;
+      *"Detectability "*|*"Passive Reality/Xray fingerprint"*) rec="stealth/fingerprint finding, not a live block — make the server blend in: serve the cover SNI on 443, point Reality 'dest'/'serverNames' at a real CA-valid cover, and choose a cover hosted on the server's own network (or a large shared CDN). The structural fix for the SNI↔IP mismatch and entry/egress co-location tells is CDN-fronting: put the entry behind a CDN (e.g. Cloudflare) so the cover SNI resolves to the CDN's own IPs and the connection terminates on the CDN — eliminating both tells at the source" ;;
       *"SNI"*)                    rec="try Reality / domain fronting / ECH-enabled client" ;;
       *"System DNS failure"*)     rec="use DoH inside the VPN client and check router/provider DNS" ;;
       *"DNS sinkhole"*)           rec="use DoH inside the VPN client, not system resolver" ;;
@@ -4895,12 +5010,12 @@ else
       *"Xray full-config tunnel fails while plain TLS"*) rec="protocol-fingerprint DPI on the tunnel — verify UUID/keys, try a different SNI front, or change flow= variant" ;;
       *"timed out (even at"*)     rec="raise TIMEOUT (high-RTT / multi-hop tunnel) or check the server's upstream/egress health — this is latency, not a fingerprint block" ;;
       *"rejected (reset / closed pipe)"*) rec="protocol-fingerprint DPI or config drift — verify UUID / keys / flow / target SNI" ;;
-      *"Reality cover is fake"*)  rec="server-side fix: point Reality 'dest' at the real cover host:443 and add it to 'serverNames' so unauthenticated probes get relayed to a genuine CA-valid cert" ;;
+      *"Reality cover is fake"*)  rec="server-side fix: point Reality 'dest' at the real cover host:443 and add it to 'serverNames' so unauthenticated probes get relayed to a genuine CA-valid cert. (For a non-REALITY VLESS+TLS inbound, the equivalent active-probe defense is a 'fallbacks' array routing unauthenticated clients to a real local web server.)" ;;
       *"Reality cover/serverName mismatch"*) rec="align the client 'serverName' with the server's Reality dest / serverNames" ;;
       *"Egress IP is on datacenter/proxy"*) rec="for streaming / payment / banking, route those flows through a residential or clean-IP egress; for censorship circumvention the current egress is fine" ;;
       *"delayed RST"*|*"kill-shaping"*) rec="rotate endpoint / cover SNI, shorten session reuse, or add traffic padding — the handshake is fine, the proven flow is being dropped" ;;
       *"intermittently fails"*)   rec="treat as a flaky path / congested egress, not a hard block; re-test from another vantage" ;;
-      *"domainStrategy="*)        rec="set domainStrategy=\"AsIs\" so domain rules match on the sniffed SNI without a local lookup (the ip/geoip rules still match IP-literal connections); add a 'dns' block routed through the proxy if you need leak-proof ip/geoip matching on domain targets" ;;
+      *"domainStrategy="*)        rec="set domainStrategy=\"AsIs\" — domain rules match on the sniffed SNI with no local lookup, and 'direct' traffic still resolves locally at the freedom outbound (so you keep the real-user DNS-then-connect pattern); local resolution of PROXIED domains only leaks intent (the censor sees the entry flow, not the proxied destination). If you need geoip routing on domain targets, use a SPLIT-HORIZON 'dns' block: tunneled DoH for foreign/blocked domains (route the resolver's IP to a proxy outbound) + the local resolver for domestic/direct. The canonical China-grade recipe pairs this with routing geosite:cn/geoip:cn → direct and 'fakedns' for the proxied side (no real lookup, no leak, instant routing)" ;;
       *"through the proxy while the egress is on datacenter"*) rec="route the streaming / payment domains through a residential or clean-IP egress (or drop them from the proxy set) — datacenter egress IPs get geo/proxy-blocked by exactly those services" ;;
       *) rec="" ;;
     esac

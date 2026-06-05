@@ -62,6 +62,26 @@ out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config-json "$NOIP" --only xrayjson --json
 out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config-json "$(printf '%s' "$NOIP" | sed 's/IPOnDemand/IPIfNonMatch/')" --only xrayjson --json 2>/dev/null)
 [ "$(rt "$out" | jq -r '.dns_leak_risk')" = "true" ] || fail "IPIfNonMatch + no dns leaks regardless of ip rules"
 
+# Split-horizon dns: a dns block with per-domain servers (in real configs a
+# tunneled foreign resolver + a local domestic one) is the leak-free way to keep
+# geoip routing. Detection is STATIC jq over the config shape (per-domain server
+# objects), so the fixture is `freedom`-only with no proxy outbound: that makes
+# probe 12 skip the live tunnel entirely (a dns block + IPOnDemand + a dead proxy
+# would otherwise stall xray's resolver locally when xray is installed). With a
+# dns block present, IPOnDemand is not a leak; split-horizon is reported true.
+SPLITDNS='{"inbounds":[{"tag":"s","listen":"127.0.0.1","port":10808,"protocol":"socks","settings":{"auth":"noauth"},"sniffing":{"enabled":true,"routeOnly":true,"destOverride":["tls"]}}],"dns":{"servers":[{"address":"localhost","domains":["example.com"]},{"address":"localhost","domains":["example.net"]}],"queryStrategy":"UseIP"},"routing":{"domainStrategy":"IPOnDemand","rules":[{"type":"field","ip":["geoip:telegram"],"outboundTag":"direct"},{"type":"field","network":"tcp,udp","outboundTag":"direct"}]},"outbounds":[{"tag":"direct","protocol":"freedom"}]}'
+out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config-json "$SPLITDNS" --only xrayjson --json 2>/dev/null)
+[ "$(rt "$out" | jq -r '.dns_leak_risk')" = "false" ]     || fail "IPOnDemand WITH a dns block should not be flagged a leak"
+[ "$(rt "$out" | jq -r '.dns_split_horizon')" = "true" ]  || fail "per-domain dns servers should be detected as split-horizon"
+# A single-server dns block (no per-domain map) → split_horizon false (still present).
+SINGLEDNS=$(printf '%s' "$SPLITDNS" | jq -c '.dns.servers = ["localhost"]')
+out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config-json "$SINGLEDNS" --only xrayjson --json 2>/dev/null)
+[ "$(rt "$out" | jq -r '.dns_split_horizon')" = "false" ] || fail "a single-server dns block is not split-horizon"
+# No dns block → split_horizon null (unknown), schema field still present.
+out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config-json "$LEAK" --only xrayjson --json 2>/dev/null)
+printf '%s' "$(rt "$out")" | jq -e 'has("dns_split_horizon")' >/dev/null || fail "dns_split_horizon must be in the schema"
+[ "$(rt "$out" | jq -r '.dns_split_horizon')" = "null" ]  || fail "no dns block → dns_split_horizon should be null"
+
 # Egress-vs-routing: a config routing a streaming service through the proxy is
 # tagged streaming in proxy_sensitive_categories (static parse; the conflict
 # verdict itself needs a live datacenter egress, so only the field is asserted).
@@ -79,4 +99,4 @@ NOROUTE='{"inbounds":[{"tag":"s","listen":"127.0.0.1","port":10808,"protocol":"s
 out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config-json "$NOROUTE" --only xrayjson --json 2>/dev/null)
 [ "$(rt "$out" | jq -r '.status')" = "none" ] || fail "a config with no routing.rules should report status 'none'"
 
-echo "PASS: routing map + default route + undefined-tag lint + domainStrategy DNS-leak (per-strategy precision) + streaming/payment-vs-egress tag; no-routing → none"
+echo "PASS: routing map + default route + undefined-tag lint + domainStrategy DNS-leak (per-strategy precision + split-horizon dns) + streaming/payment-vs-egress tag; no-routing → none"

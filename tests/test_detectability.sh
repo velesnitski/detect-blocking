@@ -58,5 +58,14 @@ outv=$(TIMEOUT=2 bash "$SCRIPT" --xray-config "$URLV" --only xray --json 2>/dev/
 scorev=$(printf '%s' "$outv" | jq -r '.probes.xray_detectability.score')
 [ "${scorev:-0}" -lt "${score:-0}" ] \
   || fail "vision-present score ($scorev) should be lower than vision-absent ($score)"
+# REALITY over a NON-raw transport (gRPC) can't use vision → a tradeoff, NOT a
+# misconfig: tls_in_tls_protected is null (not false) and it is NOT scored +15.
+URLG=$(printf '%s' "$URL" | sed 's/type=tcp/type=grpc/')
+outg=$(TIMEOUT=2 bash "$SCRIPT" --xray-config "$URLG" --only xray --json 2>/dev/null)
+[ "$(printf '%s' "$outg" | jq -r '.probes.xray_detectability.tls_in_tls_protected')" = "null" ] \
+  || fail "REALITY over a non-raw transport (gRPC) should be a tradeoff (null), not exposed (false)"
+scoreg=$(printf '%s' "$outg" | jq -r '.probes.xray_detectability.score')
+[ "${scoreg:-0}" -lt "${score:-0}" ] \
+  || fail "REALITY+gRPC (tradeoff, no +15) should score lower than REALITY+TCP-without-vision ($score)"
 
-echo "PASS: probe 26 is last, folds active + passive (+conjunction + TLS-in-TLS) signals, schema intact"
+echo "PASS: probe 26 folds active+passive (+conjunction + TLS-in-TLS, vision tradeoff on non-raw) signals, schema intact"

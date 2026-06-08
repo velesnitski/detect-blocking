@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-06-05
+
+### Changed
+
+- **TLS-in-TLS / vision scoring is now correct on non-raw transports.** REALITY
+  over gRPC/ws/xhttp **can't** use `xtls-rprx-vision` (it needs raw TCP), so that
+  case is no longer scored `+15` "exposure" — it's a **censor-dependent tradeoff,
+  not a misconfig** (HTTP/2-framed transports are often *less* targeted than
+  raw+vision against current censors; no consensus —
+  [XTLS #2593](https://github.com/XTLS/Xray-core/discussions/2593)). The `+15`
+  now applies **only** to raw-TCP-without-vision (a real, available mitigation
+  left unused); the non-raw case emits a note and `xray_detectability.tls_in_tls_protected: null`.
+- **uTLS-fp note mentions JA4.** [JA4](https://github.com/FoxIO-LLC/ja4) (the JA3
+  successor) **sorts** the cipher/extension lists, so extension-shuffling no
+  longer hides a rare fp; and a proxy that tweaks the ClientHello or normalizes
+  HTTP headers breaks JA4 **parity** ([XTLS #4900](https://github.com/XTLS/Xray-core/issues/4900)).
+
+### Added
+
+- **QUIC-SNI advisory.** Flags QUIC-based configs (Hysteria2 / TUIC, or
+  `network: quic`) for the GFW's QUIC-SNI censorship — it decrypts the QUIC
+  Initial, reads the SNI, and blocks a residual list since 2024
+  ([gfw.report USENIX'25](https://gfw.report/publications/usenixsecurity25/en/)).
+  Mitigation: SNI-slicing across QUIC CRYPTO frames (default in `quic-go ≥ 0.52.0`,
+  inherited by Hysteria2/TUIC). Covers both Xray-form and sing-box configs.
+
 ## [0.14.0] - 2026-06-05
 
 ### Added

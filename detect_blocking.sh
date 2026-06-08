@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.14.0"
+readonly DETECT_BLOCKING_VERSION="0.14.1"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -810,6 +810,15 @@ hdr()  { [ "$LOG_QUIET" = "1" ] || printf "\n${BLU}== %s ==${RST}\n" "$1"; _log_
 
 declare -a VERDICTS=()
 add_verdict() { VERDICTS+=("$1"); _log_line VERDICT "$1"; }
+
+# QUIC-SNI advisory (gfw.report USENIX'25): since 2024 the GFW decrypts the QUIC
+# Initial packet (the key is derived from its header), reads the SNI, and blocks
+# a residual list (~3-min 4-tuple drop). Defeated by SNI-slicing across QUIC
+# CRYPTO frames — default in quic-go >= 0.52.0, which Hysteria2/TUIC inherited.
+# Advisory only (residual + region-specific, can't be tested from a clean vantage).
+_quic_sni_note() {
+  info "QUIC-based transport → the GFW censors QUIC by SNI (since 2024): it decrypts the QUIC Initial, reads the SNI, and blocks a residual list (~3-min 4-tuple drop). Mitigation: SNI-slicing across QUIC CRYPTO frames — default in quic-go >= 0.52.0, which Hysteria2/TUIC inherited; keep the client current. UDP/443 blocking is a separate risk."
+}
 
 # Triage tag for a recommendation: who has to act on it. server-side = the
 # operator must change the server / cover / egress / deployment; client-side =
@@ -3117,6 +3126,14 @@ $1"
     add_verdict "GFW fully-encrypted-traffic (FET) exposure: this transport sends fully-encrypted bytes with no TLS record header or HTTP framing, so it is random from the first byte. Since 2021 the GFW exempts traffic that looks like a known protocol (TLS / HTTP / mostly-printable) and BLOCKS the rest via an entropy test (set bits per byte ~3.4-4.6). Give it a recognizable shape: wrap in TLS or switch to REALITY (matches the TLS exemption), use a transport with plaintext HTTP framing (ws / xhttp), or for Shadowsocks add an obfs/TLS plugin or a printable prefix + padding. UDP transports (mKCP/QUIC) are not covered by this TCP classifier"
   fi
 
+  # QUIC-SNI exposure (advisory): a QUIC-based transport/protocol. Xray-form here
+  # (URL scheme hysteria2/tuic, or network=quic); sing-box configs are covered in
+  # the non-Xray branch since lint skips them.
+  case "$proto" in
+    hysteria2|hy2|tuic) _quic_sni_note ;;
+    *) [ "$net" = "quic" ] && _quic_sni_note ;;
+  esac
+
   # --- client id format (share-safe: format + length only, NEVER the value) ---
   # VLESS/VMess hash a non-UUID id to a derived UUID, so a hand-assigned string
   # works — but it's unusual, can indicate a typo/truncated UUID (which still
@@ -4160,7 +4177,7 @@ probe_xray_detectability() {
   case "$utls_fp" in
     qq|360)
       XRAY_PASSIVE_UTLS_RARE=1
-      fp_desc="'${utls_fp}' regional/uncommon — evades signature blocklists (e.g. TSPU), JA3 outlier to anomaly detection (tradeoff, not scored)" ;;
+      fp_desc="'${utls_fp}' regional/uncommon — evades signature blocklists (e.g. TSPU), JA3/JA4 outlier to anomaly detection (tradeoff, not scored)" ;;
     ""|chrome|firefox|safari|ios|android|edge|random|randomized|randomizedalpn|randomizednoalpn)
       XRAY_PASSIVE_UTLS_RARE=0
       fp_desc="${utls_fp:-unset} — common/randomized (chrome is the most-signatured circumvention fp)" ;;
@@ -4199,14 +4216,23 @@ probe_xray_detectability() {
   v_net=$(_xray_cfg_field type     '.outbounds[0].streamSettings.network')
   v_flow=$(_xray_cfg_field flow    '.outbounds[0].settings.vnext[0].users[0].flow')
   [ -z "$v_net" ] && v_net=tcp
-  if [ "$v_sec" = "reality" ]; then   # REALITY is VLESS-only → vision applies
+  if [ "$v_sec" = "reality" ]; then   # REALITY is VLESS-only → vision applies on raw TCP
     if [ "$v_flow" = "xtls-rprx-vision" ]; then
       XRAY_PASSIVE_VISION=1; vis_desc="xtls-rprx-vision present (anti TLS-in-TLS)"
     else
-      XRAY_PASSIVE_VISION=0; vis_pts=15
       case "$v_net" in
-        tcp|raw) vis_desc="no vision flow on REALITY+TCP — TLS-in-TLS exposure" ;;
-        *)       vis_desc="REALITY over ${v_net} (vision needs raw TCP) — TLS-in-TLS exposure" ;;
+        tcp|raw)
+          # Raw TCP and no vision = a clear, available mitigation left unused.
+          XRAY_PASSIVE_VISION=0; vis_pts=15
+          vis_desc="no vision flow on REALITY+TCP — TLS-in-TLS exposure" ;;
+        *)
+          # Non-raw transport (gRPC/ws/xhttp) CAN'T use vision — that's a
+          # censor-dependent TRADEOFF, not a misconfig, so it's NOT scored (the
+          # fp=qq lesson). HTTP/2-framed transports are often LESS targeted than
+          # raw+vision against current censors; no consensus, time-dependent
+          # (XTLS #2593). State 2 → JSON tls_in_tls_protected:null (neither).
+          XRAY_PASSIVE_VISION=2
+          vis_desc="REALITY over ${v_net} — vision N/A on a non-raw transport (tradeoff, not scored)" ;;
       esac
     fi
   fi
@@ -4281,6 +4307,8 @@ probe_xray_detectability() {
   if [ "${XRAY_PASSIVE_VISION:-}" = "0" ]; then
     warn "TLS-in-TLS exposure: VLESS-Reality without xtls-rprx-vision — advanced censors (e.g. the GFW) detect this passively"
     add_verdict "VLESS-Reality without flow=\"xtls-rprx-vision\" → TLS-in-TLS exposure: when an HTTPS site is proxied, the inner TLS records carry a length/timing signature visible inside the outer Reality TLS, which advanced censors detect passively (REALITY with a non-XTLS flow is officially discouraged for this reason). Set the user 'flow' to \"xtls-rprx-vision\" on BOTH client and server (it requires raw TCP transport, network=tcp/raw). If you must use a CDN-frontable transport (ws/grpc/xhttp) where vision can't apply, prefer XHTTP with padding to blunt the traffic-shape signature$( [ "${XRAY_TRANSPORT_MUX:-}" = "1" ] && printf '%s' '; and disable mux.cool — with vision it is unnecessary and adds a correlation surface' )"
+  elif [ "${XRAY_PASSIVE_VISION:-}" = "2" ]; then
+    info "REALITY over ${v_net}: vision (anti-TLS-in-TLS) only works on raw TCP, so it's N/A here — a tradeoff, not a flaw. An HTTP-framed transport (gRPC/XHTTP) is often LESS targeted than raw+vision against current censors, though it's censor- and time-dependent (no consensus; XTLS #2593). For raw TCP, vision stays the recommended anti-TLS-in-TLS choice; on gRPC/XHTTP, padding is the lever instead. Not scored."
   elif [ "${XRAY_PASSIVE_VISION:-}" = "1" ] && [ "${XRAY_TRANSPORT_MUX:-}" = "1" ]; then
     info "mux.cool is enabled alongside vision — most REALITY+vision setups leave mux off (vision handles flow shaping; mux adds overhead and a correlation surface)"
   fi
@@ -4289,7 +4317,8 @@ probe_xray_detectability() {
   # It's still a per-deployment constant, so it identifies the deployment (and is
   # in the fingerprint hash) even though it doesn't move the score.
   if [ "${XRAY_PASSIVE_UTLS_RARE:-0}" = "1" ]; then
-    info "uTLS fp '$utls_fp' is a JA3 tradeoff, NOT scored: a rare/regional fp EVADES signature/deny-list censors (TSPU blocklists the common chrome-uTLS-Reality JA3 — why qq often works there) but is an outlier to anomaly detection. Your result against the target censor decides; it stays in the deployment fingerprint either way"
+    info "uTLS fp '$utls_fp' is a JA3/JA4 tradeoff, NOT scored: a rare/regional fp EVADES signature/deny-list censors (TSPU blocklists the common chrome-uTLS-Reality JA3 — why qq often works there) but is an outlier to anomaly detection. Your result against the target censor decides; it stays in the deployment fingerprint either way"
+    info "note: JA4 (the JA3 successor) SORTS the cipher/extension lists, so the extension-shuffling that broke naive JA3 matching no longer hides a rare fp; and whatever fp you pick, the client must reproduce that browser's FULL ClientHello (extension order, GREASE) — a proxy that tweaks the ClientHello or normalizes HTTP headers breaks JA4 parity and is detectable as a Go proxy (XTLS #4900)"
     reveal "uTLS fingerprint = $utls_fp"
   fi
 
@@ -4780,7 +4809,7 @@ _emit_json() {
           sni_keyword: tri_bool(($xpf_sni_keyword | tonumber? // -1)),
           cover_obscure: tri_bool(($xpf_cover_obscure | tonumber? // -1)),
           utls_fp_uncommon: tri_bool(($xpf_utls_rare | tonumber? // -1)),
-          tls_in_tls_protected: tri_bool(($xpf_vision | tonumber? // -1)),
+          tls_in_tls_protected: (($xpf_vision | tonumber? // -1) as $v | if $v == 1 then true elif $v == 0 then false else null end),
           mux_enabled: tri_bool(($xtr_mux | tonumber? // -1)),
           deployment_fingerprint: opt($xd_deployfp)
         }
@@ -4958,6 +4987,12 @@ if [ -n "${XRAY_JSON_FORMAT:-}" ]; then
   info "its outbounds use 'type' / 'server' / 'route' (${XRAY_JSON_FORMAT}), not Xray's 'protocol' / 'settings.vnext' / 'streamSettings'"
   info "transport probes (0-10) above ran against its server; to test the tunnel itself, convert the config to Xray-core JSON"
   add_verdict "Config is ${XRAY_JSON_FORMAT}, not Xray-core — the Xray-protocol / stealth probes (11-26) need an Xray config (outbounds with 'protocol' + 'settings.vnext' + 'streamSettings'). The transport-layer probes still apply to the server; convert the config (or pass the Xray form) to test the tunnel"
+  # QUIC-SNI advisory for a sing-box Hysteria2/TUIC/QUIC outbound (read before the
+  # config path is cleared below).
+  if command -v jq >/dev/null 2>&1 && [ -n "$XRAY_JSON_CONFIG" ] \
+     && jq -e '[.outbounds[]? | select((.type // "") | ascii_downcase | test("hysteria|tuic|quic"))] | length > 0' "$XRAY_JSON_CONFIG" >/dev/null 2>&1; then
+    _quic_sni_note
+  fi
   XRAY_JSON_CONFIG=""   # the Xray-JSON probes below now skip cleanly
 fi
 

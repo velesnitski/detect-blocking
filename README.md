@@ -62,21 +62,26 @@ emits a clearly labelled verdict for each detected issue.
 | 13 | Tunnel throughput (auto with 12) | Pulls 10 MB from Cloudflare's speed-test backend through the same SOCKS tunnel; banded thresholds catch **cover-SNI traffic shaping** (RKN/TSPU/CN-style) that handshake-only probes miss |
 | 14 | Tunnel capacity (auto with 12) | N parallel streams × several CDN backends (Cloudflare / DataPacket / OVH) through the tunnel; reports the **best aggregate Mbps** — a real-speedtest-style estimate that defeats the single-stream under-reporting of probe 13. Runs by default; `--no-speedtest` to skip, auto-skipped in `--watch`/`--from-file` loops |
 | 15 | Reality cover authenticity (auto) | Plain-TLS probe like a censor's active prober: is the presented cert a CA-valid cover, or **self-signed/mismatched** (fake cover, trivially fingerprinted)? Booleans only — never prints the cover domain |
-| 16 | Egress integrity (auto with 12) | Through the tunnel: egress geo + **datacenter/proxy/mobile flags** (is the exit IP already on "this is a VPN" lists?) + DNS-resolver region, across **three sources** — ip-api, an ASN/org pool, and a datacenter-flag fallback (ipapi.is) that fills in when ip-api is rate-limited, so reputation isn't left "n/a". Country + flags only, never the IP. `--no-egress-check` to skip |
+| 16 | Egress integrity (auto with 12) | Through the tunnel: egress geo + **datacenter/proxy/mobile flags** (is the exit IP already on "this is a VPN" lists?) + DNS-resolver region, across **three sources** — ip-api, an ASN/org pool, and a datacenter-flag fallback (ipapi.is) that fills in when ip-api is rate-limited, so reputation isn't left "n/a". Also flags **entry↔egress co-location** (exit in the same /24 or ASN as the entry — a single-block topology tell). Country + flags only, never the IP. `--no-egress-check` to skip |
 | 17 | Held-session stability (auto with 12) | Holds the tunnel ~20s with periodic pulses to catch **delayed mid-session RST / kill-shaping** that short bursts (13/14) miss. `--no-stability` to skip; auto-skipped in `--watch`/`--from-file` loops |
-| 18 | Config pre-flight lint (auto) | Static validation of the URL/JSON for common Reality/VLESS misconfigs (`flow`/`network` mismatch, bad `shortId`, bare-IP SNI, missing `pbk`, `allowInsecure=true` masking an invalid cert, …) — so a typo doesn't masquerade as DPI, and stealth red flags surface even against an unreachable node. Names the knob, never the secret |
+| 18 | Config pre-flight lint (auto) | Static validation of the URL/JSON for common Reality/VLESS misconfigs (`flow`/`network` mismatch, bad `shortId`, bare-IP SNI, missing `pbk`, `allowInsecure=true` masking an invalid cert, …) — so a typo doesn't masquerade as DPI. Also: **GFW fully-encrypted-traffic (FET) exposure** — Shadowsocks / VMess-VLESS over raw TCP with `security: none` is random from byte 0 and blocked by the GFW's entropy classifier ([USENIX'23](https://gfw.report/publications/usenixsecurity23/en/)); TLS/REALITY + HTTP-framed + UDP transports are exempt. And a **share-safe `id`-format note** (UUID vs non-UUID + length — never the value). Names the knob, never the secret |
 | 19 | Clock skew (auto) | Reality auth is time-windowed; a client clock off by minutes fails the handshake like a block. Compares local time to a server `Date` header, warns past ±60s |
 | 20 | Active-probe resistance (auto) | Probe 15 checks the cover *cert*; this checks the cover *behaviour* — does an unauthenticated HTTPS request get relayed to the genuine cover site (real Reality) or return garbage (fake)? |
 | 21 | Per-outbound fleet matrix (auto on multi-outbound) | Tunnel-tests **each outbound** of a balancer/multi-outbound config and prints a health table by tag; tells a single dead endpoint apart from a fleet-wide config fault. Auto-enables when the JSON has >1 outbound; `--no-fleet` to disable |
-| — | Routing coverage / split-tunnel (auto on `routing.rules`) | Maps the `routing` table per outbound (domain/geosite/geoip counts), resolves the default route, lints undefined `outboundTag`s, and — when the tunnel is up — fetches a sample of **proxy-routed** sites through the live config to confirm the split actually carries them (catches a dead proxy path the generic tunnel test can miss when its target routes direct) |
+| — | Routing coverage / split-tunnel (auto on `routing.rules`) | Maps the `routing` table per outbound (domain/geosite/geoip counts), resolves the default route, lints undefined `outboundTag`s, and — when the tunnel is up — fetches a sample of **proxy-routed** sites through the live config to confirm the split actually carries them. Also flags **`domainStrategy` DNS-leak risk** (`IPOnDemand`/`IPIfNonMatch` with no `dns` block → routing resolves via the system resolver; recommends `AsIs` or a **split-horizon** `dns` block — detected separately), and a **streaming/payment-vs-datacenter-egress conflict** (those services geo-block datacenter exits) |
 | 22 | Bufferbloat / latency-under-load (auto with 12) | Warm RTT idle vs under a saturating download — the latency the tunnel adds when busy (what makes a "fast" link laggy on calls/gaming). `--no-bufferbloat` to skip |
 | 23 | Path MTU to server (auto) | DF-bit `ping` sweep finds the path MTU; a clamp below 1500 fragments the Reality ClientHello and can cause intermittent handshake failures that mimic DPI |
 | 24 | TLS-negotiation parity (auto) | Does the server negotiate the same TLS version / ALPN / cipher as the genuine cover? Stealth depth-3 (15 cert → 20 HTTP → 24 negotiation); a fake/wrong-`dest` server diverges |
 | 25 | Cover-SNI region-throttle (auto) | Is the cover domain itself shaped in-region (which the tunnel silently inherits)? Direct fetch vs a neutral baseline; when the cover root is too small, cross-checks the tunnel throughput (which carries the cover SNI) |
-| 26 | Detectability score (synthesis, always last) | Folds **active** stealth (15/20/24) **and passive** structure (non-443 port, SNI↔IP mismatch + conjunction = the VLESS-Reality signature, and **cover-SNI quality**: a cleartext SNI that is NXDOMAIN or carries a circumvention keyword) into one 0-100 score + band. Catches a server that defeats every active probe but is still passively fingerprintable, and names *why* the active baselines couldn't run |
+| 26 | Detectability score (synthesis, always last) | Folds **active** stealth (15/20/24) **and passive** structure into one 0-100 score + band: non-443 port, SNI↔IP mismatch + conjunction (the VLESS-Reality signature), **cover-SNI quality** (NXDOMAIN / circumvention keyword / **self-owned-obscure** cover on a hosting net vs a CDN), and **TLS-in-TLS exposure** — VLESS-REALITY without `flow=xtls-rprx-vision` (scored +15; the advanced-censor passive vector, [USENIX'23](https://github.com/net4people/bbs/issues/281)). The uTLS fp is reported as a **tradeoff, not scored**. Emits a share-safe **deployment fingerprint** (identifies the config *template*, not its health) |
 
-The verdict ends with a list of detected blocks plus an actionable
-recommendation for each (rotate IP, switch to Reality, use uTLS, etc).
+The verdict ends with the detected blocks plus a recommendation for each, each
+**tagged `[server-side]` / `[client-side]` / `[network]`** so you know what to
+fix in your config vs. what needs the operator. It opens with a one-line **fix
+class** (the ByeDPI-vs-Xray call, chosen from what fired): **PARSER** (a
+fragmentation bypass was confirmed → a client-side desync beats it, no server)
+vs **DESTINATION/PROBE** (IP block / active probing / detectable protocol →
+needs a Reality/Xray tunnel).
 
 ---
 
@@ -843,6 +848,9 @@ Options:
   -q, --quiet             Suppress stdout (logging to file still works).
       --log-file PATH     Append timestamped entries to PATH. Rotates at 10 MB.
       --only LIST         Run only the listed probes (comma-separated).
+      --xray-only         Only the Xray-protocol probes (11-26 + routing/egress);
+                          skips transport probes 0-10. Alias for
+                          --only xray,xrayjson; needs --xray-config[-json].
       --skip LIST         Skip the listed probes (comma-separated).
       --watch SECONDS     Repeat probe every SECONDS until interrupted.
       --from-file PATH    Iterate over hosts in file (one per line, # comments).
@@ -889,8 +897,11 @@ forward compatibility. Convenient for monitoring stacks:
 ```
 
 Top-level keys: `schema_version`, `version`, `timestamp` (ISO-8601 UTC),
-`target`, `environment`, `probes` (`dns`/`tcp`/`tls`/`request_filter`/`rst`/
-`udp`/`openvpn`/`control`), and `verdicts`.
+`target`, `environment`, `probes`, and `verdicts`. With an Xray config, `probes`
+adds the `xray_*` set (`xray_json`, `xray_egress`, `xray_lint`, `xray_routing`,
+`xray_detectability`, …) — run `--json | jq '.probes | keys'` for the full list.
+Notable fields: `xray_lint.fet_exposed`/`id_uuid`, `xray_routing.dns_leak_risk`/
+`dns_split_horizon`, `xray_detectability.tls_in_tls_protected`/`deployment_fingerprint`.
 
 ### Environment variables
 

@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.15.0"
+readonly DETECT_BLOCKING_VERSION="0.16.0"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -130,6 +130,8 @@ while [ $# -gt 0 ]; do
     --xray-only)   ONLY_PROBES="xray,xrayjson"; XRAY_ONLY=1; shift ;;
     --scan-covers) case "${2:-}" in ""|-*) XRAY_SCAN_COVERS=default; shift ;; *) XRAY_SCAN_COVERS="$2"; shift 2 ;; esac ;;
     --scan-covers=*) XRAY_SCAN_COVERS="${1#--scan-covers=}"; shift ;;
+    --censor-sweep) case "${2:-}" in ""|-*) XRAY_CENSOR_SWEEP=default; shift ;; *) XRAY_CENSOR_SWEEP="$2"; shift 2 ;; esac ;;
+    --censor-sweep=*) XRAY_CENSOR_SWEEP="${1#--censor-sweep=}"; shift ;;
     --skip)        SKIP_PROBES="${2:-}"; shift 2 ;;
     --skip=*)      SKIP_PROBES="${1#--skip=}"; shift ;;
     --watch)       WATCH_INTERVAL="${2:-}"; shift 2 ;;
@@ -177,6 +179,7 @@ while [ $# -gt 0 ]; do
       printf '  --only LIST         run only listed probes (comma-separated)\n'
       printf '  --xray-only         only the Xray-protocol probes (11-26 + routing/egress); skips transport probes 0-10 (alias for --only xray,xrayjson; needs --xray-config / --xray-config-json)\n'
       printf '  --scan-covers[=LIST] rank candidate Reality dest/serverName covers (TLSv1.3 + H2 + CA-valid + non-redirect); LIST is comma-separated, or omit for a built-in set\n'
+      printf '  --censor-sweep[=LIST] reachability of commonly-censored hosts, direct vs through the tunnel (does the tunnel unblock them?); LIST is comma-separated, or omit for a built-in set\n'
       printf '  --skip LIST         skip listed probes\n'
       printf '  --watch SECONDS     repeat probe every SECONDS, until interrupted\n'
       printf '  --from-file PATH    iterate over hosts in file (one per line, # comments)\n'
@@ -636,7 +639,18 @@ XRAY_SCAN_COVERS="${XRAY_SCAN_COVERS:-}"   # "" off; "default"/"1" built-in list
 XRAY_COVER_CANDIDATES="${XRAY_COVER_CANDIDATES:-www.microsoft.com www.apple.com dl.google.com www.amazon.com www.cloudflare.com www.bing.com}"
 XRAY_COVER_SCAN_STATUS=""   # ok / skipped
 XRAY_COVER_SCAN_BEST=""     # best-ranked candidate domain
-XRAY_COVER_SCAN_RESULTS=""  # "domain|tls13|h2|cavalid|nonredirect|verdict ..." for JSON
+XRAY_COVER_SCAN_RESULTS=""  # newline-joined "domain|tls13|h2|cavalid|nonredirect|verdict" for JSON
+
+# ---- censored-URL sweep (--censor-sweep): OONI-style reachability, direct vs tunnel ----
+# Tests a list of commonly-censored hosts DIRECT and (when the tunnel is up)
+# THROUGH it, classifying each: reachable-both / blocked-direct-but-tunnel-carries
+# (the tunnel is doing its job) / direct-only-not-carried (routing/proxy fault) /
+# blocked-both. Reuses _url_reachable + the SOCKS-through-tunnel path. Opt-in.
+XRAY_CENSOR_SWEEP="${XRAY_CENSOR_SWEEP:-}"   # "" off; "default"/"1" built-in list; or comma-separated hosts
+XRAY_CENSOR_URLS="${XRAY_CENSOR_URLS:-www.bbc.com www.wikipedia.org www.torproject.org www.youtube.com x.com www.reddit.com}"
+XRAY_CENSOR_SWEEP_STATUS=""   # ok / skipped
+XRAY_CENSOR_SWEEP_TUNNEL=""   # 1 / 0 — whether the through-tunnel pass ran
+XRAY_CENSOR_SWEEP_RESULTS=""  # newline-joined "host|direct|tunnel|verdict" for JSON
 
 # ---- probe 17: held-session stability (delayed-RST / volumetric kill-shaping) ----
 # Short bursts (13/14) miss the censor tactic of letting the handshake through
@@ -2759,7 +2773,8 @@ probe_cover_scan() {
     code=${cw%% *}; httpver=${cw##* }
     if [ "${code:-000}" = "000" ]; then
       info "$(printf '%-26s unreachable / TLS failed' "$d")"
-      results="${results}${results:+ }${d}|no|no|no|no|unreachable"
+      results="${results}
+${d}|no|no|no|no|unreachable"
       continue
     fi
     case "$code" in 200) nr=yes; score=$((score+1)) ;; esac
@@ -2783,7 +2798,8 @@ probe_cover_scan() {
     else verdict="poor"; fi
     verdict="${verdict}${region_risk}"
     info "$(printf '%-26s tls1.3=%-3s h2=%-3s ca-valid=%-3s non-redirect=%-3s → %s' "$d" "$tls13" "$h2" "$cav" "$nr" "$verdict")"
-    results="${results}${results:+ }${d}|${tls13}|${h2}|${cav}|${nr}|${verdict}"
+    results="${results}
+${d}|${tls13}|${h2}|${cav}|${nr}|${verdict}"
     [ "$rank" -gt "$best_score" ] && { best_score=$rank; best="$d"; }
   done
   XRAY_COVER_SCAN_RESULTS="$results"
@@ -2794,7 +2810,61 @@ probe_cover_scan() {
   else
     warn "no strong cover among the candidates — none cleared TLSv1.3 + H2 + CA-valid; try a different list (--scan-covers d1,d2,...)"
   fi
+  info "this checks PROTOCOL suitability + region-risk only — it can't measure a site's traffic rank from here. A good cover is ALSO high-traffic/popular: blocking it then costs the censor collateral, and your tunnel's volume blends into the site's normal traffic (a low-traffic cover makes your throughput stick out — lots of TLS to a site that normally sees little). Pick a genuinely popular site."
+  info "the cover's OWN speed does not limit your tunnel — authenticated traffic goes to the proxy backend, not the cover, so throughput is set by the server + egress (probes 13/14), not by which cover you pick here"
   warn "scores are from THIS vantage only — a cover that's blocked/throttled in your TARGET region (e.g. Cloudflare in RU, Google in CN) is a dead cover there regardless of the score above; verify the chosen SNI is reachable FROM the region, and confirm the SERVER can reach it. For SNI↔IP stealth prefer a cover on the server's own network, or self-steal (a global CDN cover still mismatches the server's IP)"
+}
+
+# Censored-URL sweep (--censor-sweep) — OONI-web_connectivity-style reachability.
+# Fetches each host DIRECT and (when probe 12's tunnel is up) THROUGH it, then
+# classifies: does the tunnel unblock a censored host, or fail to carry one that
+# works direct? Reuses _url_reachable for both paths. Opt-in (external fetches).
+probe_censor_sweep() {
+  [ -n "$XRAY_CENSOR_SWEEP" ] || { XRAY_CENSOR_SWEEP_STATUS="skipped"; return 0; }
+  check_cmd curl || { XRAY_CENSOR_SWEEP_STATUS="skipped"; return 0; }
+  hdr "Censored-URL sweep (reachability: direct vs through the tunnel)"
+  local hosts via=0 sp=""
+  case "$XRAY_CENSOR_SWEEP" in
+    default|1) hosts="$XRAY_CENSOR_URLS" ;;
+    *)         hosts=$(printf '%s' "$XRAY_CENSOR_SWEEP" | tr ',' ' ') ;;
+  esac
+  if [ "${XRAY_JSON_STATUS:-}" = "ok" ] && [ -n "${XRAY_JSON_SOCKS_PORT:-}" ]; then
+    via=1; sp="127.0.0.1:${XRAY_JSON_SOCKS_PORT}"
+    info "each host fetched DIRECT and through the tunnel → does the tunnel carry a censored host (and not drop one that works direct)?"
+  else
+    info "no live tunnel (probe 12 not ok) — DIRECT reachability only (like probe 8, for your list)"
+  fi
+  XRAY_CENSOR_SWEEP_TUNNEL="$via"
+  local h dirok tunok verdict results="" unblocked=0 dropped=0
+  for h in $hosts; do
+    [ -n "$h" ] || continue
+    dirok=no; _url_reachable "https://$h/" "$TIMEOUT" && dirok=yes
+    if [ "$via" = "1" ]; then
+      tunok=no; _url_reachable "https://$h/" "$TIMEOUT" "$sp" && tunok=yes
+      if   [ "$dirok" = yes ] && [ "$tunok" = yes ]; then verdict="reachable (both)"
+      elif [ "$dirok" = no ]  && [ "$tunok" = yes ]; then verdict="blocked direct → tunnel carries it"; unblocked=$((unblocked+1))
+      elif [ "$dirok" = yes ] && [ "$tunok" = no ];  then verdict="direct only → tunnel does NOT carry it (routing/proxy fault)"; dropped=$((dropped+1))
+      else verdict="blocked both (tunnel doesn't help / host down)"; fi
+      info "$(printf '%-24s direct=%-3s tunnel=%-3s → %s' "$h" "$dirok" "$tunok" "$verdict")"
+      results="${results}
+${h}|${dirok}|${tunok}|${verdict}"
+    else
+      [ "$dirok" = yes ] && verdict="reachable direct" || verdict="blocked direct"
+      info "$(printf '%-24s direct=%-3s → %s' "$h" "$dirok" "$verdict")"
+      results="${results}
+${h}|${dirok}|na|${verdict}"
+    fi
+  done
+  XRAY_CENSOR_SWEEP_RESULTS="$results"
+  XRAY_CENSOR_SWEEP_STATUS="ok"
+  if [ "$via" = "1" ]; then
+    [ "$unblocked" -gt 0 ] && ok "tunnel unblocks ${unblocked} host(s) that are blocked direct — it's doing its job"
+    if [ "$dropped" -gt 0 ]; then
+      warn "${dropped} host(s) reachable direct but NOT carried through the tunnel — a routing/proxy fault (check the routing rules / outbound)"
+    elif [ "$unblocked" -eq 0 ]; then
+      info "nothing in the list is censored at this vantage — run from the affected region to see the tunnel unblock"
+    fi
+  fi
 }
 
 # Probe 16 — egress integrity (geo / reputation / DNS leak). Runs through the
@@ -4587,6 +4657,9 @@ _emit_json() {
     --arg cs_status         "$XRAY_COVER_SCAN_STATUS" \
     --arg cs_best           "$XRAY_COVER_SCAN_BEST" \
     --arg cs_results        "$XRAY_COVER_SCAN_RESULTS" \
+    --arg csw_status        "$XRAY_CENSOR_SWEEP_STATUS" \
+    --arg csw_tunnel        "$XRAY_CENSOR_SWEEP_TUNNEL" \
+    --arg csw_results       "$XRAY_CENSOR_SWEEP_RESULTS" \
     --arg xe_status         "$XRAY_EGRESS_STATUS" \
     --arg xe_country        "$XRAY_EGRESS_COUNTRY" \
     --arg xe_hosting        "$XRAY_EGRESS_HOSTING" \
@@ -4788,10 +4861,22 @@ _emit_json() {
           status: opt($cs_status),
           best: opt($cs_best),
           candidates: (
-            if $cs_results == "" then []
-            else ($cs_results | split(" ") | map(select(length > 0) | split("|")
+            if ($cs_results | gsub("^\\s+|\\s+$";"")) == "" then []
+            else ($cs_results | split("\n") | map(select(length > 0) | split("|")
                   | { domain: .[0], tls13: (.[1]=="yes"), h2: (.[2]=="yes"),
                       ca_valid: (.[3]=="yes"), non_redirect: (.[4]=="yes"), verdict: .[5] }))
+            end
+          )
+        },
+        censor_sweep: {
+          status: opt($csw_status),
+          tunnel_used: tri_bool(($csw_tunnel | tonumber? // -1)),
+          results: (
+            if ($csw_results | gsub("^\\s+|\\s+$";"")) == "" then []
+            else ($csw_results | split("\n") | map(select(length > 0) | split("|")
+                  | { host: .[0], direct: (.[1]=="yes"),
+                      tunnel: (if .[2]=="yes" then true elif .[2]=="no" then false else null end),
+                      verdict: .[3] }))
             end
           )
         },
@@ -5104,6 +5189,7 @@ _should_run xrayjson && probe_xray_stability
 { _should_run xray || _should_run xrayjson; } && probe_xray_active_probe
 _should_run xrayjson && probe_xray_fleet
 _should_run xrayjson && probe_xray_routing
+[ -n "$XRAY_CENSOR_SWEEP" ] && probe_censor_sweep
 _should_run xrayjson && probe_xray_bufferbloat
 { _should_run xray || _should_run xrayjson; } && probe_xray_mtu
 { _should_run xray || _should_run xrayjson; } && probe_xray_tls_parity

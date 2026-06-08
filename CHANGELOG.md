@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-06-08
+
+### Added
+
+- **Censored-URL sweep (`--censor-sweep[=LIST]`).** OONI-`web_connectivity`-style
+  reachability: fetches a list of commonly-censored hosts **direct** and (when the
+  tunnel is up) **through it**, classifying each — *reachable (both)* /
+  *blocked direct → tunnel carries it* (the tunnel is doing its job) /
+  *direct only → tunnel doesn't carry it* (routing/proxy fault) / *blocked both*.
+  Summarises how many the tunnel unblocks vs. drops. Reuses `_url_reachable` and
+  the SOCKS-through-tunnel path (no new deps); direct-only when there's no tunnel.
+  Opt-in. JSON `probes.censor_sweep`.
+- **Cover scanner: popularity/throughput guidance.** The scan now explains that
+  it checks *protocol suitability + region-risk only* — it can't measure a site's
+  traffic rank — and that a good cover must also be **high-traffic/popular** (for
+  collateral + volume-blending), while the **cover's own speed doesn't gate the
+  tunnel** (that's the proxy backend + egress, probes 13/14).
+
+### Fixed
+
+- **Cover-scan JSON.** `candidates[]` was space-split, but verdicts contain spaces
+  (`good cover [region-risk: …]`), so the JSON mis-parsed multi-word verdicts
+  (the test only exercised the one-word `unreachable`). Now newline-separated.
+
 ## [0.15.0] - 2026-06-05
 
 ### Added

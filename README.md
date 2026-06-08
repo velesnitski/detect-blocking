@@ -75,6 +75,7 @@ emits a clearly labelled verdict for each detected issue.
 | 25 | Cover-SNI region-throttle (auto) | Is the cover domain itself shaped in-region (which the tunnel silently inherits)? Direct fetch vs a neutral baseline; when the cover root is too small, cross-checks the tunnel throughput (which carries the cover SNI) |
 | 26 | Detectability score (synthesis, always last) | Folds **active** stealth (15/20/24) **and passive** structure into one 0-100 score + band: non-443 port, SNI↔IP mismatch + conjunction (the VLESS-Reality signature), **cover-SNI quality** (NXDOMAIN / circumvention keyword / **self-owned-obscure** cover on a hosting net vs a CDN), and **TLS-in-TLS exposure** — VLESS-REALITY without `flow=xtls-rprx-vision` (scored +15; the advanced-censor passive vector, [USENIX'23](https://github.com/net4people/bbs/issues/281)). The uTLS fp is reported as a **tradeoff, not scored**. Emits a share-safe **deployment fingerprint** (identifies the config *template*, not its health) |
 | — | Cover-SNI scanner (opt-in, `--scan-covers`) | Ranks candidate Reality `dest`/`serverName` covers by **TLSv1.3 + HTTP/2 + CA-valid cert + non-redirect** and names the best — the *pick-a-good-cover* counterpart to probe 26's *your-cover-is-weak*. Standalone (no config/tunnel). The cover-weak verdicts point you to it. (Only probe that reaches third-party sites, hence opt-in.) |
+| — | Censored-URL sweep (opt-in, `--censor-sweep`) | OONI-`web_connectivity`-style: fetches commonly-censored hosts **direct vs through the tunnel** and classifies each (reachable-both / **blocked-direct → tunnel-carries-it** / direct-only → not-carried / blocked-both) — does the tunnel actually unblock what's censored? Direct-only when there's no tunnel. |
 
 The verdict ends with the detected blocks plus a recommendation for each, each
 **tagged `[server-side]` / `[client-side]` / `[network]`** so you know what to
@@ -855,6 +856,9 @@ Options:
       --scan-covers[=LIST] Rank candidate Reality dest/serverName covers by
                           TLSv1.3 + H2 + CA-valid + non-redirect. LIST is
                           comma-separated; omit for a built-in set. Standalone.
+      --censor-sweep[=LIST] Reachability of commonly-censored hosts, direct vs
+                          through the tunnel (does the tunnel unblock them?).
+                          LIST comma-separated; omit for a built-in set. Opt-in.
       --skip LIST         Skip the listed probes (comma-separated).
       --watch SECONDS     Repeat probe every SECONDS until interrupted.
       --from-file PATH    Iterate over hosts in file (one per line, # comments).

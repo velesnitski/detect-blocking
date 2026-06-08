@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-06-05
+
+### Added
+
+- **Cover-SNI scanner (`--scan-covers[=LIST]`).** Ranks candidate Reality
+  `dest`/`serverName` covers by the properties that matter — **TLSv1.3 + HTTP/2 +
+  CA-valid cert + non-redirect (HTTP 200)** — and names the best. The diagnostic
+  counterpart to the "self-owned/obscure cover" finding: instead of only telling
+  you a cover is weak, it helps you pick a good one (the niche
+  [Hiddify-Reality-Scanner](https://github.com/hiddify/Hiddify-Reality-Scanner)
+  fills). `LIST` is comma-separated, or omit for a built-in set of neutral,
+  globally-popular CDN/cloud sites. Standalone (no config/tunnel needed); curl
+  bounds reachability so a dead candidate can't stall the scan. JSON
+  `probes.cover_scan` (`status`, `best`, `candidates[]`). Caveat surfaced in the
+  output: checked from the client, and a global-CDN cover still mismatches the
+  server's IP (prefer one on the server's own network, or self-steal). Scores are
+  **vantage-local**, so candidates commonly blocked/throttled in a censored region
+  (Cloudflare in RU, Google in CN, …) are flagged **`[region-risk]`** and
+  de-prioritised in the pick — a cover censored in-region is a dead cover there no
+  matter how it scores here. It stays **opt-in** (the only probe that reaches
+  third-party sites), but the cover-weak recommendations (self-signed / self-owned
+  cover / SNI↔IP mismatch) now **point to `--scan-covers`** so it's discoverable
+  exactly when it's useful.
+
+### Changed
+
+- **DNS-resolver line (probe 16) clarified.** It now states plainly that the
+  edns check confirms proxied lookups exit *through the tunnel* (resolved at the
+  egress), and that a client-side DNS leak shows up as the routing
+  `domainStrategy` finding instead — not here.
+
 ## [0.14.1] - 2026-06-05
 
 ### Changed

@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.14.1"
+readonly DETECT_BLOCKING_VERSION="0.15.0"
 
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
@@ -128,6 +128,8 @@ while [ $# -gt 0 ]; do
     --only)        ONLY_PROBES="${2:-}"; shift 2 ;;
     --only=*)      ONLY_PROBES="${1#--only=}"; shift ;;
     --xray-only)   ONLY_PROBES="xray,xrayjson"; XRAY_ONLY=1; shift ;;
+    --scan-covers) case "${2:-}" in ""|-*) XRAY_SCAN_COVERS=default; shift ;; *) XRAY_SCAN_COVERS="$2"; shift 2 ;; esac ;;
+    --scan-covers=*) XRAY_SCAN_COVERS="${1#--scan-covers=}"; shift ;;
     --skip)        SKIP_PROBES="${2:-}"; shift 2 ;;
     --skip=*)      SKIP_PROBES="${1#--skip=}"; shift ;;
     --watch)       WATCH_INTERVAL="${2:-}"; shift 2 ;;
@@ -174,6 +176,7 @@ while [ $# -gt 0 ]; do
       printf '  --log-file PATH     append timestamped entries to PATH\n'
       printf '  --only LIST         run only listed probes (comma-separated)\n'
       printf '  --xray-only         only the Xray-protocol probes (11-26 + routing/egress); skips transport probes 0-10 (alias for --only xray,xrayjson; needs --xray-config / --xray-config-json)\n'
+      printf '  --scan-covers[=LIST] rank candidate Reality dest/serverName covers (TLSv1.3 + H2 + CA-valid + non-redirect); LIST is comma-separated, or omit for a built-in set\n'
       printf '  --skip LIST         skip listed probes\n'
       printf '  --watch SECONDS     repeat probe every SECONDS, until interrupted\n'
       printf '  --from-file PATH    iterate over hosts in file (one per line, # comments)\n'
@@ -622,6 +625,18 @@ XRAY_EGRESS_ASN_HOSTING=""  # 1 / 0 — 2nd source: ASN/org looks like a hosting
 XRAY_EGRESS_DC=""           # 1 / 0 — 3rd source (fallback): datacenter / hosting-type ASN
 XRAY_EGRESS_COLOCATED=""    # same-/24 / same-ASN / different — is the egress co-located with the entry?
 XRAY_EGRESS_DNS_COUNTRY=""  # country of the DNS resolver seen through the tunnel (informational)
+
+# ---- cover-SNI scanner (--scan-covers): rank candidate Reality dest/serverNames ----
+# A good Reality cover is a foreign site that supports TLSv1.3 + HTTP/2, serves
+# real content (no redirect), and has a CA-valid cert. This scans a candidate
+# list for those properties so the operator can pick a dest — the diagnostic
+# counterpart to "your cover is self-owned/obscure". Opt-in (it probes the
+# candidates directly). Default list = neutral, globally-popular CDN/cloud sites.
+XRAY_SCAN_COVERS="${XRAY_SCAN_COVERS:-}"   # "" off; "default"/"1" built-in list; or a comma-separated list
+XRAY_COVER_CANDIDATES="${XRAY_COVER_CANDIDATES:-www.microsoft.com www.apple.com dl.google.com www.amazon.com www.cloudflare.com www.bing.com}"
+XRAY_COVER_SCAN_STATUS=""   # ok / skipped
+XRAY_COVER_SCAN_BEST=""     # best-ranked candidate domain
+XRAY_COVER_SCAN_RESULTS=""  # "domain|tls13|h2|cavalid|nonredirect|verdict ..." for JSON
 
 # ---- probe 17: held-session stability (delayed-RST / volumetric kill-shaping) ----
 # Short bursts (13/14) miss the censor tactic of letting the handshake through
@@ -2718,6 +2733,70 @@ _egress_asn() {
   return 0
 }
 
+# Cover-SNI scanner (--scan-covers) — rank candidate Reality dest/serverNames.
+# A good cover is a foreign site with TLSv1.3 + HTTP/2, a CA-valid cert, and no
+# redirect (serves real content). Probes each candidate directly (curl bounds
+# the TLS reachability via --max-time; openssl only runs on a candidate curl
+# could reach, so a dead/hanging host can't stall the loop). Standalone — does
+# not need a config or the tunnel.
+probe_cover_scan() {
+  [ -n "$XRAY_SCAN_COVERS" ] || { XRAY_COVER_SCAN_STATUS="skipped"; return 0; }
+  if ! check_cmd openssl || ! check_cmd curl; then XRAY_COVER_SCAN_STATUS="skipped"; return 0; fi
+  hdr "Cover-SNI scan (Reality dest / serverName candidates)"
+  local cands
+  case "$XRAY_SCAN_COVERS" in
+    default|1) cands="$XRAY_COVER_CANDIDATES" ;;
+    *)         cands=$(printf '%s' "$XRAY_SCAN_COVERS" | tr ',' ' ') ;;
+  esac
+  info "per candidate: TLSv1.3 + HTTP/2 (ALPN) + CA-valid cert + non-redirect (HTTP 200)"
+  local d best="" best_score=-1 results="" cw code httpver out vc
+  for d in $cands; do
+    [ -n "$d" ] || continue
+    local tls13=no h2=no cav=no nr=no score=0 verdict
+    # curl first (bounded) — gives the redirect status AND the negotiated HTTP
+    # version (h2 detection; openssl -brief omits the ALPN line). 000 = unreachable.
+    cw=$(curl -sS --http2 -o /dev/null -w '%{http_code} %{http_version}' --max-time "$TIMEOUT" "https://$d/" 2>/dev/null)
+    code=${cw%% *}; httpver=${cw##* }
+    if [ "${code:-000}" = "000" ]; then
+      info "$(printf '%-26s unreachable / TLS failed' "$d")"
+      results="${results}${results:+ }${d}|no|no|no|no|unreachable"
+      continue
+    fi
+    case "$code" in 200) nr=yes; score=$((score+1)) ;; esac
+    case "$httpver" in 2|2.0|2.*) h2=yes; score=$((score+1)) ;; esac
+    out=$(openssl s_client -connect "$d:443" -servername "$d" -brief </dev/null 2>&1)
+    printf '%s' "$out" | grep -qiE 'Protocol version: TLSv1.3' && { tls13=yes; score=$((score+1)); }
+    vc=$(printf '%s' "$out" | grep -iE 'Verification' | head -1)
+    case "$vc" in *OK*) cav=yes; score=$((score+1)) ;; esac
+    # Region-risk: a cover that's intrinsically great HERE but commonly
+    # blocked/throttled in a major censored region is a DEAD cover there (the
+    # cover SNI itself is censored → the whole Reality flow dies). We can't test
+    # from the target region (single vantage), so we flag the well-known cases
+    # and de-prioritise them in the pick — the operator must verify in-region.
+    local region_risk="" rank="$score"
+    case "$d" in
+      *cloudflare*|*google*|*gstatic*|*youtube*|*facebook*|*instagram*|*fbcdn*)
+        region_risk=" [region-risk: commonly blocked/throttled in RU/CN]"; rank=$((score-2)) ;;
+    esac
+    if   [ "$score" -ge 4 ]; then verdict="good cover"
+    elif [ "$score" -ge 2 ]; then verdict="usable"
+    else verdict="poor"; fi
+    verdict="${verdict}${region_risk}"
+    info "$(printf '%-26s tls1.3=%-3s h2=%-3s ca-valid=%-3s non-redirect=%-3s → %s' "$d" "$tls13" "$h2" "$cav" "$nr" "$verdict")"
+    results="${results}${results:+ }${d}|${tls13}|${h2}|${cav}|${nr}|${verdict}"
+    [ "$rank" -gt "$best_score" ] && { best_score=$rank; best="$d"; }
+  done
+  XRAY_COVER_SCAN_RESULTS="$results"
+  XRAY_COVER_SCAN_BEST="$best"
+  XRAY_COVER_SCAN_STATUS="ok"
+  if [ -n "$best" ] && [ "$best_score" -ge 2 ]; then
+    ok "best candidate: $best — set it as Reality 'dest'/'serverNames'"
+  else
+    warn "no strong cover among the candidates — none cleared TLSv1.3 + H2 + CA-valid; try a different list (--scan-covers d1,d2,...)"
+  fi
+  warn "scores are from THIS vantage only — a cover that's blocked/throttled in your TARGET region (e.g. Cloudflare in RU, Google in CN) is a dead cover there regardless of the score above; verify the chosen SNI is reachable FROM the region, and confirm the SERVER can reach it. For SNI↔IP stealth prefer a cover on the server's own network, or self-steal (a global CDN cover still mismatches the server's IP)"
+}
+
 # Probe 16 — egress integrity (geo / reputation / DNS leak). Runs through the
 # probe-12 tunnel. Tells you if the egress is already on the datacenter/proxy
 # lists that streaming & banking services block, and whether DNS resolves in a
@@ -2819,7 +2898,7 @@ probe_xray_egress() {
     if printf '%s' "$dns_json" | grep -q '"dns"' && command -v jq >/dev/null 2>&1; then
       XRAY_EGRESS_DNS_COUNTRY=$(printf '%s' "$dns_json" | jq -r '.dns.geo // empty' 2>/dev/null | sed -nE 's/^([A-Za-z ]+) -.*/\1/p')
       [ -z "$XRAY_EGRESS_DNS_COUNTRY" ] && XRAY_EGRESS_DNS_COUNTRY=$(printf '%s' "$dns_json" | jq -r '.dns.geo // empty' 2>/dev/null)
-      [ -n "$XRAY_EGRESS_DNS_COUNTRY" ] && info "DNS resolver (via tunnel): ${XRAY_EGRESS_DNS_COUNTRY}"
+      [ -n "$XRAY_EGRESS_DNS_COUNTRY" ] && info "DNS resolver (via tunnel): ${XRAY_EGRESS_DNS_COUNTRY} — proxied lookups exit through the tunnel (resolved at the egress), not your local resolver; a client-side DNS leak would instead show up as the routing 'domainStrategy' finding, not here"
     fi
   fi
 
@@ -4505,6 +4584,9 @@ _emit_json() {
     --arg xc_selfsigned     "$XRAY_COVER_SELFSIGNED" \
     --arg xc_chain          "$XRAY_COVER_CHAIN_VALID" \
     --arg xc_cnmatch        "$XRAY_COVER_CN_MATCH" \
+    --arg cs_status         "$XRAY_COVER_SCAN_STATUS" \
+    --arg cs_best           "$XRAY_COVER_SCAN_BEST" \
+    --arg cs_results        "$XRAY_COVER_SCAN_RESULTS" \
     --arg xe_status         "$XRAY_EGRESS_STATUS" \
     --arg xe_country        "$XRAY_EGRESS_COUNTRY" \
     --arg xe_hosting        "$XRAY_EGRESS_HOSTING" \
@@ -4701,6 +4783,17 @@ _emit_json() {
           self_signed: tri_bool(($xc_selfsigned | tonumber? // -1)),
           chain_valid: tri_bool(($xc_chain | tonumber? // -1)),
           cn_matches_servername: tri_bool(($xc_cnmatch | tonumber? // -1))
+        },
+        cover_scan: {
+          status: opt($cs_status),
+          best: opt($cs_best),
+          candidates: (
+            if $cs_results == "" then []
+            else ($cs_results | split(" ") | map(select(length > 0) | split("|")
+                  | { domain: .[0], tls13: (.[1]=="yes"), h2: (.[2]=="yes"),
+                      ca_valid: (.[3]=="yes"), non_redirect: (.[4]=="yes"), verdict: .[5] }))
+            end
+          )
         },
         xray_egress: {
           status: opt($xe_status),
@@ -4967,6 +5060,7 @@ fi
 unset _missing_optional
 
 _should_run env     && probe_environment
+[ -n "$XRAY_SCAN_COVERS" ] && probe_cover_scan
 _should_run dns     && { probe_dns || true; }
 _should_run tcp     && probe_tcp_reachability
 _should_run tls     && probe_tls_handshake
@@ -5087,7 +5181,7 @@ else
   _seen_recs=""   # de-dupe: distinct verdicts often map to the same fix
   for v in "${VERDICTS[@]}"; do
     case "$v" in
-      *"Detectability "*|*"Passive Reality/Xray fingerprint"*) rec="stealth/fingerprint finding, not a live block — make the server blend in: serve the cover SNI on 443, point Reality 'dest'/'serverNames' at a real CA-valid cover, and choose a cover hosted on the server's own network (or a large shared CDN). The structural fix for the SNI↔IP mismatch and entry/egress co-location tells is CDN-fronting: put the entry behind a CDN (e.g. Cloudflare) so the cover SNI resolves to the CDN's own IPs and the connection terminates on the CDN — eliminating both tells at the source. (Or a 'self-steal' REALITY setup: the server fronts its OWN real site via realitySettings.target + its own serverNames, so the cover resolves to the server itself — no mismatch.)" ;;
+      *"Detectability "*|*"Passive Reality/Xray fingerprint"*) rec="stealth/fingerprint finding, not a live block — make the server blend in: serve the cover SNI on 443, point Reality 'dest'/'serverNames' at a real CA-valid cover, and choose a cover hosted on the server's own network (or a large shared CDN). The structural fix for the SNI↔IP mismatch and entry/egress co-location tells is CDN-fronting: put the entry behind a CDN (e.g. Cloudflare) so the cover SNI resolves to the CDN's own IPs and the connection terminates on the CDN — eliminating both tells at the source. (Or a 'self-steal' REALITY setup: the server fronts its OWN real site via realitySettings.target + its own serverNames, so the cover resolves to the server itself — no mismatch.) Run with --scan-covers to rank candidate cover domains (TLSv1.3 + H2 + CA-valid + non-redirect)." ;;
       *"SNI"*)                    rec="try Reality / domain fronting / ECH-enabled client" ;;
       *"System DNS failure"*)     rec="use DoH inside the VPN client and check router/provider DNS" ;;
       *"DNS sinkhole"*)           rec="use DoH inside the VPN client, not system resolver" ;;
@@ -5135,7 +5229,7 @@ else
       *"Xray full-config tunnel fails while plain TLS"*) rec="protocol-fingerprint DPI on the tunnel — verify UUID/keys, try a different SNI front, or change flow= variant" ;;
       *"timed out (even at"*)     rec="raise TIMEOUT (high-RTT / multi-hop tunnel) or check the server's upstream/egress health — this is latency, not a fingerprint block" ;;
       *"rejected (reset / closed pipe)"*) rec="protocol-fingerprint DPI or config drift — verify UUID / keys / flow / target SNI" ;;
-      *"Reality cover is fake"*)  rec="server-side fix: point Reality 'dest' at the real cover host:443 and add it to 'serverNames' so unauthenticated probes get relayed to a genuine CA-valid cert. (For a non-REALITY VLESS+TLS inbound, the equivalent active-probe defense is a 'fallbacks' array routing unauthenticated clients to a real local web server.)" ;;
+      *"Reality cover is fake"*)  rec="server-side fix: point Reality 'dest' at the real cover host:443 and add it to 'serverNames' so unauthenticated probes get relayed to a genuine CA-valid cert (run --scan-covers to rank candidate covers). (For a non-REALITY VLESS+TLS inbound, the equivalent active-probe defense is a 'fallbacks' array routing unauthenticated clients to a real local web server.)" ;;
       *"Reality cover/serverName mismatch"*) rec="align the client 'serverName' with the server's Reality dest / serverNames" ;;
       *"Egress IP is on datacenter/proxy"*) rec="for streaming / payment / banking, route those flows through a residential or clean-IP egress; for censorship circumvention the current egress is fine" ;;
       *"delayed RST"*|*"kill-shaping"*) rec="rotate endpoint / cover SNI, shorten session reuse, or add traffic padding — the handshake is fine, the proven flow is being dropped" ;;

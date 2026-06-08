@@ -74,6 +74,7 @@ emits a clearly labelled verdict for each detected issue.
 | 24 | TLS-negotiation parity (auto) | Does the server negotiate the same TLS version / ALPN / cipher as the genuine cover? Stealth depth-3 (15 cert → 20 HTTP → 24 negotiation); a fake/wrong-`dest` server diverges |
 | 25 | Cover-SNI region-throttle (auto) | Is the cover domain itself shaped in-region (which the tunnel silently inherits)? Direct fetch vs a neutral baseline; when the cover root is too small, cross-checks the tunnel throughput (which carries the cover SNI) |
 | 26 | Detectability score (synthesis, always last) | Folds **active** stealth (15/20/24) **and passive** structure into one 0-100 score + band: non-443 port, SNI↔IP mismatch + conjunction (the VLESS-Reality signature), **cover-SNI quality** (NXDOMAIN / circumvention keyword / **self-owned-obscure** cover on a hosting net vs a CDN), and **TLS-in-TLS exposure** — VLESS-REALITY without `flow=xtls-rprx-vision` (scored +15; the advanced-censor passive vector, [USENIX'23](https://github.com/net4people/bbs/issues/281)). The uTLS fp is reported as a **tradeoff, not scored**. Emits a share-safe **deployment fingerprint** (identifies the config *template*, not its health) |
+| — | Cover-SNI scanner (opt-in, `--scan-covers`) | Ranks candidate Reality `dest`/`serverName` covers by **TLSv1.3 + HTTP/2 + CA-valid cert + non-redirect** and names the best — the *pick-a-good-cover* counterpart to probe 26's *your-cover-is-weak*. Standalone (no config/tunnel). The cover-weak verdicts point you to it. (Only probe that reaches third-party sites, hence opt-in.) |
 
 The verdict ends with the detected blocks plus a recommendation for each, each
 **tagged `[server-side]` / `[client-side]` / `[network]`** so you know what to
@@ -851,6 +852,9 @@ Options:
       --xray-only         Only the Xray-protocol probes (11-26 + routing/egress);
                           skips transport probes 0-10. Alias for
                           --only xray,xrayjson; needs --xray-config[-json].
+      --scan-covers[=LIST] Rank candidate Reality dest/serverName covers by
+                          TLSv1.3 + H2 + CA-valid + non-redirect. LIST is
+                          comma-separated; omit for a built-in set. Standalone.
       --skip LIST         Skip the listed probes (comma-separated).
       --watch SECONDS     Repeat probe every SECONDS until interrupted.
       --from-file PATH    Iterate over hosts in file (one per line, # comments).

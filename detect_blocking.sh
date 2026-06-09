@@ -42,6 +42,21 @@ set -u
 
 readonly DETECT_BLOCKING_VERSION="0.16.0"
 
+# ============================================================================
+# FILE MAP — single-file by design (copy & run, no install). Jump to a section
+# by searching its banner, e.g.  /^# ---------- Xray-protocol probes
+#   setup ...... early helpers · portability + deps · config file · CLI args
+#   drivers .... batch (--from-file) · watch (--watch)
+#   globals .... config defaults · state (per-probe result vars)
+#   helpers .... colors · log + emit · platform-aware (resolve / asn / synth / url)
+#   probes ..... transport probes (0-10): env,dns,tcp,tls,ua,rst,udp,openvpn,control,ipv6,compare
+#                Xray-protocol probes (11-26): protocol,json,throughput,capacity,cover,
+#                  egress,stability,lint,clock,active-probe,fleet,routing,bufferbloat,mtu,
+#                  tls-parity,cover-throttle,detectability(+deployment fingerprint)
+#                opt-in scanners: probe_cover_scan (--scan-covers), probe_censor_sweep (--censor-sweep)
+#   output ..... JSON emitter (--json) · main (probe dispatch) · summary (verdict + recommendations)
+# ============================================================================
+
 # Capture original CLI invocation before parsing — needed so --watch and
 # --from-file can re-invoke ourselves with the same flags minus the looping
 # flag (set via _WATCH_CHILD / _BATCH_CHILD to break recursion).
@@ -1380,7 +1395,7 @@ _ike_probe() {
   [ -n "$response" ]
 }
 
-# ---------- probes ----------
+# ---------- transport probes (0-10) ----------
 
 probe_environment() {
   hdr "0. Environment"
@@ -1999,6 +2014,8 @@ _classify_tunnel_failure() {
     printf 'other'
   fi
 }
+
+# ---------- Xray-protocol probes (11-26) + opt-in scanners ----------
 
 # Probe 11 — end-to-end Xray-protocol test via delegation to xray-knife
 # (or fallback to xray/sing-box if available). Only runs when --xray-config

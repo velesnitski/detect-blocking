@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.18.1"
+readonly DETECT_BLOCKING_VERSION="0.18.2"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -732,6 +732,7 @@ XRAY_STABILITY_TOTAL=""     # pulses attempted
 XRAY_STABILITY_OK=""        # pulses that succeeded
 XRAY_STABILITY_KILLED=""    # pulses dropped by a reset-class error (the real kill signal)
 XRAY_STABILITY_SLOW=""      # pulses that timed out (slow, not killed)
+XRAY_STABILITY_RETRIED=""   # pulses that reset once but PASSED on the inline retry (transient blips, not counted as kills)
 XRAY_STABILITY_KILL_BYTES="" # byte size of the first killed pulse
 XRAY_STABILITY_FIRST_FAIL_S=""  # seconds into the run when the first non-ok pulse hit
 XRAY_STABILITY_RTT_MIN=""   # ms (over ok pulses)
@@ -1032,6 +1033,15 @@ _contains_special_ipv4() {
     _is_special_ipv4 "$ip" && return 0
   done
   return 1
+}
+
+# True when $1 is a bare IPv4 or IPv6 literal (nothing to resolve). Mirrors the
+# short-circuit patterns in _resolve_a_records.
+_is_ip_literal() {
+  case "$1" in
+    *:*:*) case "$1" in *[!0-9A-Fa-f:]*) return 1 ;; *) return 0 ;; esac ;;
+  esac
+  printf '%s' "$1" | grep -qE '^[0-9]+(\.[0-9]+){3}$'
 }
 
 _resolve_a_records() {
@@ -1549,27 +1559,42 @@ probe_dns() {
       ;;
   esac
 
-  local sys_ips doh_json doh_ips
+  local sys_ips doh_json doh_ips is_ip=0
   sys_ips=$(_resolve_a_records "$VPN_HOST" | _join_words)
-  doh_json=$(curl -sf --max-time "$TIMEOUT" \
-    -H 'accept: application/dns-json' \
-    "$DOH_URL?name=$VPN_HOST&type=A" 2>/dev/null || true)
-  doh_ips=$(printf '%s' "$doh_json" | _parse_doh_ips | _join_words)
-
-  # If DoH is MITM'd, drop its answer — treating compromised data as ground
-  # truth would mask real DNS poisoning when system + DoH agree on a fake IP.
-  if [ "$DOH_INTEGRITY_STATE" = "compromised" ]; then
-    info "ignoring DoH answer for $VPN_HOST (was: ${doh_ips:-<empty>})"
+  _is_ip_literal "$VPN_HOST" && is_ip=1
+  if [ "$is_ip" = "1" ]; then
+    # Target is a bare IP — there is no name to DoH-resolve, so skip the lookup
+    # and the comparison entirely (otherwise it emits a spurious "DoH returned
+    # no A records" warning on every IP-literal target).
     doh_ips=""
+  else
+    doh_json=$(curl -sf --max-time "$TIMEOUT" \
+      -H 'accept: application/dns-json' \
+      "$DOH_URL?name=$VPN_HOST&type=A" 2>/dev/null || true)
+    doh_ips=$(printf '%s' "$doh_json" | _parse_doh_ips | _join_words)
+    # If DoH is MITM'd, drop its answer — treating compromised data as ground
+    # truth would mask real DNS poisoning when system + DoH agree on a fake IP.
+    if [ "$DOH_INTEGRITY_STATE" = "compromised" ]; then
+      info "ignoring DoH answer for $VPN_HOST (was: ${doh_ips:-<empty>})"
+      doh_ips=""
+    fi
   fi
 
   info "system resolver A: ${sys_ips:-<empty>}"
-  info "DoH resolver A:    ${doh_ips:-<empty>}"
+  if [ "$is_ip" = "1" ]; then
+    info "DoH resolver A:    n/a (target is an IP literal — no name to resolve)"
+  else
+    info "DoH resolver A:    ${doh_ips:-<empty>}"
+  fi
 
   DNS_SYS_IPS="$sys_ips"
   DNS_DOH_IPS="$doh_ips"
 
-  if [ -z "$sys_ips" ] && [ -n "$doh_ips" ]; then
+  if [ "$is_ip" = "1" ]; then
+    ok "target is an IP literal — DNS-leak / poisoning checks N/A"
+    RESOLVED_IP=$(printf '%s\n' "$sys_ips" | _first_word)
+    RESOLVED_SOURCE="IP literal"
+  elif [ -z "$sys_ips" ] && [ -n "$doh_ips" ]; then
     fail "system resolver returns no A records, but DoH works"
     add_verdict "System DNS failure while DoH works"
     RESOLVED_IP=$(printf '%s\n' "$doh_ips" | _first_word)
@@ -3224,10 +3249,37 @@ probe_xray_egress() {
   fi
 }
 
+# Pure classifier for the held-session pulse ladder (probe 17), split out from
+# the probe so the transient-vs-volumetric decision is unit-testable without a
+# live tunnel. Given the post-retry tallies it echoes one class token:
+#   none        no pulses ran
+#   ok          every pulse passed
+#   slow        some timed out, none reset
+#   volumetric  a pulse was reset and NOTHING larger survived → a monotonic byte
+#               threshold = volumetric kill-shaping
+#   transient   a pulse was reset but a LARGER pulse then succeeded → non-monotonic,
+#               so not a byte threshold (a path/size anomaly, not a clean block)
+#   reset       a reset fitting neither shape (the tiniest pulse, or none passed)
+# Args: total okc killc kill_bytes max_ok_bytes  (the *_bytes args may be empty).
+_classify_stability_ladder() {
+  local total="${1:-0}" okc="${2:-0}" killc="${3:-0}" kb="${4:-}" maxok="${5:-}"
+  [ "$total" -eq 0 ] && { printf 'none\n'; return; }
+  if [ "$killc" -gt 0 ]; then
+    if [ "$okc" -gt 0 ] && [ -n "$kb" ] && [ "$kb" != "0" ]; then
+      if [ -n "$maxok" ] && [ "$maxok" -gt "$kb" ]; then printf 'transient\n'; return; fi
+      printf 'volumetric\n'; return
+    fi
+    printf 'reset\n'; return
+  fi
+  [ "$okc" -eq "$total" ] && { printf 'ok\n'; return; }
+  printf 'slow\n'
+}
+
 # Probe 17 — held-session stability (delayed-RST / kill-shaping). Opt-in.
 # Holds the probe-12 tunnel and pulses small requests for a while, catching the
 # censor tactic of allowing the handshake then RST-ing the proven tunnel
-# seconds later — invisible to the short bursts in probes 13/14.
+# seconds later — invisible to the short bursts in probes 13/14. Each kill is
+# retried once inline (see the loop) so a single RST isn't mistaken for shaping.
 probe_xray_stability() {
   if [ "$XRAY_STABILITY" != "1" ]; then
     XRAY_STABILITY_STATUS="disabled"
@@ -3257,8 +3309,8 @@ probe_xray_stability() {
 
   local port="$XRAY_JSON_SOCKS_PORT"
   local cap="$XRAY_STABILITY_SECONDS" iv="$XRAY_STABILITY_INTERVAL"
-  local total=0 okc=0 killc=0 slowc=0 first_fail="" kill_bytes="" max_ok_bytes=""
-  local rtt rmin="" rmax="" t0 t1 start now size url mt rc state hsz
+  local total=0 okc=0 killc=0 slowc=0 first_fail="" kill_bytes="" max_ok_bytes="" retried_ok=0
+  local rtt rmin="" rmax="" t0 t1 start now size url mt rc state hsz retried_this note sclass
   # Each pulse is a fresh connection → its budget must clear the handshake
   # (≈ probe-12 RTT) plus a download window that grows with the pulse size.
   local hs
@@ -3280,6 +3332,18 @@ probe_xray_stability() {
     t0=$(_now_ms)
     curl -sS --max-time "$mt" --socks5-hostname "127.0.0.1:$port" -o /dev/null "$url" 2>/dev/null
     rc=$?
+    # A single RST is common (a transient blip / server hiccup). Before counting
+    # a kill, retry the SAME pulse once — only a reset that REPRODUCES is a real
+    # kill. (28 = timeout = slowness, not a reset → not retried.) This auto-
+    # confirms in one run what would otherwise need a manual re-run.
+    retried_this=0
+    if [ "$rc" != "0" ] && [ "$rc" != "28" ]; then
+      sleep 1
+      t0=$(_now_ms)
+      curl -sS --max-time "$mt" --socks5-hostname "127.0.0.1:$port" -o /dev/null "$url" 2>/dev/null
+      rc=$?; retried_this=1
+      [ "$rc" = "0" ] && retried_ok=$(( retried_ok + 1 ))
+    fi
     t1=$(_now_ms); rtt=$(( t1 - t0 ))
     # curl exit codes: 0 ok; 28 timeout (slow, not killed); anything else
     # (18/52/56/35/55/…) = the connection was reset / closed mid-stream = killed.
@@ -3295,7 +3359,11 @@ probe_xray_stability() {
       now=$(_now_ms); first_fail=$(( ( now - start ) / 1000 ))
     fi
     if [ "$size" = "0" ]; then hsz="tiny"; elif [ "$size" -ge 1048576 ]; then hsz="$(( size / 1048576 ))MB"; else hsz="$(( size / 1024 ))KB"; fi
-    info "  $(printf '%-5s' "$hsz") pulse: ${state}$([ "$state" = ok ] && echo " (${rtt} ms)")"
+    note=""
+    if [ "$retried_this" = "1" ]; then
+      [ "$state" = "ok" ] && note=" (reset once, recovered on retry)" || note=" (reset reproduced on retry)"
+    fi
+    info "  $(printf '%-5s' "$hsz") pulse: ${state}$([ "$state" = ok ] && echo " (${rtt} ms)")${note}"
     XRAY_STABILITY_RESULTS="${XRAY_STABILITY_RESULTS}${XRAY_STABILITY_RESULTS:+ }${size}|${state}|$([ "$state" = ok ] && echo "$rtt")"
     sleep "$iv"
   done
@@ -3317,35 +3385,36 @@ probe_xray_stability() {
     if [ "$max_ok_bytes" = "0" ]; then maxok_h="tiny"; elif [ "$max_ok_bytes" -ge 1048576 ]; then maxok_h="$(( max_ok_bytes / 1048576 ))MB"; else maxok_h="$(( max_ok_bytes / 1024 ))KB"; fi
   fi
 
-  if [ "$total" = "0" ]; then
-    warn "no pulses ran"
-    XRAY_STABILITY_STATUS="unstable"
-  elif [ "$killc" -gt 0 ] && [ "$okc" -gt 0 ] && [ "$kill_bytes" != "0" ] \
-       && { [ -z "$max_ok_bytes" ] || [ "$max_ok_bytes" -lt "$kill_bytes" ]; }; then
-    # Monotonic: every pulse below the reset passed, none at/above survived → a
-    # genuine byte threshold = volumetric kill-shaping.
-    fail "tunnel reset at the ${kb_h} pulse (smaller pulses passed, none larger survived) — volumetric kill-shaping"
-    XRAY_STABILITY_STATUS="killed"
-    add_verdict "Tunnel survives small flows but is reset once a transfer reaches ~${kb_h} — volumetric kill-shaping. The censor allows the handshake and trivial traffic, then drops the connection past a byte threshold; trace-only probes never see it. Mitigation: rotate endpoint / cover SNI, add padding, or switch transport"
-  elif [ "$killc" -gt 0 ] && [ "$okc" -gt 0 ] && [ -n "$max_ok_bytes" ] && [ "$max_ok_bytes" -gt "$kill_bytes" ]; then
-    # Non-monotonic: a pulse LARGER than the reset one later succeeded. That
-    # contradicts a byte threshold — the reset was a transient one-off (a stray
-    # RST / congestion blip), not volumetric shaping. Don't over-claim a block.
-    warn "tunnel reset at the ${kb_h} pulse but a larger ${maxok_h} pulse then succeeded — inconsistent with a byte threshold; likely a transient drop, not active shaping (re-run to confirm)"
-    XRAY_STABILITY_STATUS="transient"
-    add_verdict "Tunnel showed a single mid-ladder reset (~${kb_h}) but a larger ${maxok_h} pulse afterwards succeeded — non-monotonic, so this is a transient drop (stray RST / congestion), not a volumetric byte-threshold block. Re-run probe 17 (--stability) before treating it as active shaping"
-  elif [ "$killc" -gt 0 ]; then
-    fail "tunnel reset mid-session (${killc}/${total} pulses killed, first at ${kb_h:-tiny})"
-    XRAY_STABILITY_STATUS="killed"
-    add_verdict "Tunnel connection was reset mid-session (not a timeout) — post-detection kill-shaping / RST injection. Short connection tests miss this; rotate endpoint/cover or change transport"
-  elif [ "$okc" = "$total" ]; then
-    ok "tunnel stable across all ${total} pulses up to the largest size (RTT ${rmin:-?}-${rmax:-?} ms)"
-    XRAY_STABILITY_STATUS="ok"
-  else
-    warn "tunnel slow: ${slowc}/${total} pulses timed out (no resets — degraded, not killed)"
-    XRAY_STABILITY_STATUS="slow"
-    add_verdict "Tunnel is slow — ${slowc}/${total} size-ladder pulses timed out but none were reset, so this is degraded throughput / congestion, not active kill-shaping. See probes 13/14 for capacity"
-  fi
+  XRAY_STABILITY_RETRIED="$retried_ok"
+  [ "$retried_ok" -gt 0 ] && info "  ${retried_ok} pulse(s) reset once but passed on retry — transient blips, not counted as kills"
+
+  # Pure classification (kills here are already retry-confirmed: a pulse counts
+  # as killed only if its inline retry also failed).
+  sclass=$(_classify_stability_ladder "$total" "$okc" "$killc" "$kill_bytes" "$max_ok_bytes")
+  case "$sclass" in
+    none)
+      warn "no pulses ran"
+      XRAY_STABILITY_STATUS="unstable" ;;
+    volumetric)
+      fail "tunnel reset at the ${kb_h} pulse (smaller pulses passed, none larger survived; reset reproduced on retry) — volumetric kill-shaping"
+      XRAY_STABILITY_STATUS="killed"
+      add_verdict "Tunnel survives small flows but is reset once a transfer reaches ~${kb_h} (the reset reproduced on an immediate retry, so it is not a one-off) — volumetric kill-shaping. The censor allows the handshake and trivial traffic, then drops the connection past a byte threshold; trace-only probes never see it. Mitigation: rotate endpoint / cover SNI, add padding, or switch transport" ;;
+    transient)
+      warn "tunnel reset at the ${kb_h} pulse (reproduced on retry) but a larger ${maxok_h} pulse then succeeded — non-monotonic, inconsistent with a byte threshold; a size/path anomaly rather than active shaping"
+      XRAY_STABILITY_STATUS="transient"
+      add_verdict "Tunnel reset at ~${kb_h} (reproduced on an immediate retry) yet a larger ${maxok_h} pulse afterwards succeeded — non-monotonic, so this is not a volumetric byte-threshold block. It points to a size/path anomaly or intermittent loss, not active shaping; monitor (probes 13/14 for capacity) before treating it as a block" ;;
+    reset)
+      fail "tunnel reset mid-session (${killc}/${total} pulses killed, first at ${kb_h:-tiny}; reproduced on retry)"
+      XRAY_STABILITY_STATUS="killed"
+      add_verdict "Tunnel connection was reset mid-session (not a timeout, and reproduced on an immediate retry) — post-detection kill-shaping / RST injection. Short connection tests miss this; rotate endpoint/cover or change transport" ;;
+    ok)
+      ok "tunnel stable across all ${total} pulses up to the largest size (RTT ${rmin:-?}-${rmax:-?} ms)"
+      XRAY_STABILITY_STATUS="ok" ;;
+    *)
+      warn "tunnel slow: ${slowc}/${total} pulses timed out (no resets — degraded, not killed)"
+      XRAY_STABILITY_STATUS="slow"
+      add_verdict "Tunnel is slow — ${slowc}/${total} size-ladder pulses timed out but none were reset, so this is degraded throughput / congestion, not active kill-shaping. See probes 13/14 for capacity" ;;
+  esac
 }
 
 # Read a single config field by key. For a --xray-config URL, $1 is a query
@@ -4907,6 +4976,7 @@ _emit_json() {
     --arg xst_ok            "$XRAY_STABILITY_OK" \
     --arg xst_killed        "$XRAY_STABILITY_KILLED" \
     --arg xst_slow          "$XRAY_STABILITY_SLOW" \
+    --arg xst_retried       "$XRAY_STABILITY_RETRIED" \
     --arg xst_killbytes     "$XRAY_STABILITY_KILL_BYTES" \
     --arg xst_results       "$XRAY_STABILITY_RESULTS" \
     --arg xst_firstfail     "$XRAY_STABILITY_FIRST_FAIL_S" \
@@ -5140,6 +5210,7 @@ _emit_json() {
           pulses_ok: (if $xst_ok == "" then null else ($xst_ok | tonumber? // null) end),
           pulses_killed: (if $xst_killed == "" then null else ($xst_killed | tonumber? // null) end),
           pulses_slow: (if $xst_slow == "" then null else ($xst_slow | tonumber? // null) end),
+          pulses_retried_recovered: (if $xst_retried == "" then null else ($xst_retried | tonumber? // null) end),
           kill_at_bytes: (if $xst_killbytes == "" then null else ($xst_killbytes | tonumber? // null) end),
           first_failure_seconds: (if $xst_firstfail == "" then null else ($xst_firstfail | tonumber? // null) end),
           rtt_min_ms: (if $xst_rttmin == "" then null else ($xst_rttmin | tonumber? // null) end),

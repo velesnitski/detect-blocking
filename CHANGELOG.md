@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.2] - 2026-06-10
+
+### Changed
+
+- **Probe 17 (held-session stability) now auto-confirms a reset instead of
+  punting.** Each killed pulse is retried once inline — only a reset that
+  *reproduces* is counted as a kill, so a single stray RST / server hiccup no
+  longer trips a block verdict. A pulse that resets then passes on retry is
+  reported as a recovered transient blip (`pulses_retried_recovered` in JSON) and
+  not counted. The `transient` verdict (non-monotonic ladder) consequently means
+  a *retry-confirmed* reset that a larger pulse still cleared — a size/path
+  anomaly, stated as such rather than "re-run to confirm".
+- The kill-ladder classification is now a pure function
+  (`_classify_stability_ladder`) split out from the probe, unit-tested across
+  none/ok/slow/transient/volumetric/reset without needing a live tunnel
+  (`tests/test_stability_classifier.sh`).
+
+### Fixed
+
+- **Probe 1 (DNS) no longer emits a spurious "DoH returned no A records"
+  warning for an IP-literal target.** A bare IP has no name to DoH-resolve; the
+  probe now detects an IPv4/IPv6 literal (`_is_ip_literal`), skips the DoH lookup
+  and the poisoning/leak comparison, and notes the checks are N/A instead of
+  warning.
+
 ## [0.18.1] - 2026-06-10
 
 ### Fixed

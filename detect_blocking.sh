@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.18.0"
+readonly DETECT_BLOCKING_VERSION="0.18.1"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -727,7 +727,7 @@ XRAY_STABILITY_INTERVAL="${XRAY_STABILITY_INTERVAL:-2}"  # brief pause between p
 # Pulse size ladder (bytes; 0 = tiny trace request). Escalates to expose kills
 # that only trigger past a byte threshold.
 XRAY_STABILITY_SIZES="${XRAY_STABILITY_SIZES:-0 262144 1048576 4194304}"
-XRAY_STABILITY_STATUS=""    # ok, killed, slow, unstable, skipped, disabled, curl-missing
+XRAY_STABILITY_STATUS=""    # ok, killed, transient, slow, unstable, skipped, disabled, curl-missing
 XRAY_STABILITY_TOTAL=""     # pulses attempted
 XRAY_STABILITY_OK=""        # pulses that succeeded
 XRAY_STABILITY_KILLED=""    # pulses dropped by a reset-class error (the real kill signal)
@@ -3257,7 +3257,7 @@ probe_xray_stability() {
 
   local port="$XRAY_JSON_SOCKS_PORT"
   local cap="$XRAY_STABILITY_SECONDS" iv="$XRAY_STABILITY_INTERVAL"
-  local total=0 okc=0 killc=0 slowc=0 first_fail="" kill_bytes=""
+  local total=0 okc=0 killc=0 slowc=0 first_fail="" kill_bytes="" max_ok_bytes=""
   local rtt rmin="" rmax="" t0 t1 start now size url mt rc state hsz
   # Each pulse is a fresh connection → its budget must clear the handshake
   # (≈ probe-12 RTT) plus a download window that grows with the pulse size.
@@ -3285,6 +3285,7 @@ probe_xray_stability() {
     # (18/52/56/35/55/…) = the connection was reset / closed mid-stream = killed.
     case "$rc" in
       0)  state="ok"; okc=$(( okc + 1 ))
+          { [ -z "$max_ok_bytes" ] || [ "$size" -gt "$max_ok_bytes" ]; } && max_ok_bytes="$size"
           [ -z "$rmin" ] && rmin="$rtt"; [ "$rtt" -lt "$rmin" ] && rmin="$rtt"
           [ -z "$rmax" ] && rmax="$rtt"; [ "$rtt" -gt "$rmax" ] && rmax="$rtt" ;;
       28) state="slow"; slowc=$(( slowc + 1 )) ;;
@@ -3308,19 +3309,31 @@ probe_xray_stability() {
   XRAY_STABILITY_RTT_MIN="$rmin"
   XRAY_STABILITY_RTT_MAX="$rmax"
 
-  local kb_h=""
+  local kb_h="" maxok_h=""
   if [ -n "$kill_bytes" ]; then
     if [ "$kill_bytes" = "0" ]; then kb_h="tiny"; elif [ "$kill_bytes" -ge 1048576 ]; then kb_h="$(( kill_bytes / 1048576 ))MB"; else kb_h="$(( kill_bytes / 1024 ))KB"; fi
+  fi
+  if [ -n "$max_ok_bytes" ]; then
+    if [ "$max_ok_bytes" = "0" ]; then maxok_h="tiny"; elif [ "$max_ok_bytes" -ge 1048576 ]; then maxok_h="$(( max_ok_bytes / 1048576 ))MB"; else maxok_h="$(( max_ok_bytes / 1024 ))KB"; fi
   fi
 
   if [ "$total" = "0" ]; then
     warn "no pulses ran"
     XRAY_STABILITY_STATUS="unstable"
-  elif [ "$killc" -gt 0 ] && [ "$okc" -gt 0 ] && [ "$kill_bytes" != "0" ]; then
-    # Smaller pulses passed, a larger one was reset → volumetric kill-shaping.
-    fail "tunnel reset at the ${kb_h} pulse (smaller pulses passed) — volumetric kill-shaping"
+  elif [ "$killc" -gt 0 ] && [ "$okc" -gt 0 ] && [ "$kill_bytes" != "0" ] \
+       && { [ -z "$max_ok_bytes" ] || [ "$max_ok_bytes" -lt "$kill_bytes" ]; }; then
+    # Monotonic: every pulse below the reset passed, none at/above survived → a
+    # genuine byte threshold = volumetric kill-shaping.
+    fail "tunnel reset at the ${kb_h} pulse (smaller pulses passed, none larger survived) — volumetric kill-shaping"
     XRAY_STABILITY_STATUS="killed"
     add_verdict "Tunnel survives small flows but is reset once a transfer reaches ~${kb_h} — volumetric kill-shaping. The censor allows the handshake and trivial traffic, then drops the connection past a byte threshold; trace-only probes never see it. Mitigation: rotate endpoint / cover SNI, add padding, or switch transport"
+  elif [ "$killc" -gt 0 ] && [ "$okc" -gt 0 ] && [ -n "$max_ok_bytes" ] && [ "$max_ok_bytes" -gt "$kill_bytes" ]; then
+    # Non-monotonic: a pulse LARGER than the reset one later succeeded. That
+    # contradicts a byte threshold — the reset was a transient one-off (a stray
+    # RST / congestion blip), not volumetric shaping. Don't over-claim a block.
+    warn "tunnel reset at the ${kb_h} pulse but a larger ${maxok_h} pulse then succeeded — inconsistent with a byte threshold; likely a transient drop, not active shaping (re-run to confirm)"
+    XRAY_STABILITY_STATUS="transient"
+    add_verdict "Tunnel showed a single mid-ladder reset (~${kb_h}) but a larger ${maxok_h} pulse afterwards succeeded — non-monotonic, so this is a transient drop (stray RST / congestion), not a volumetric byte-threshold block. Re-run probe 17 (--stability) before treating it as active shaping"
   elif [ "$killc" -gt 0 ]; then
     fail "tunnel reset mid-session (${killc}/${total} pulses killed, first at ${kb_h:-tiny})"
     XRAY_STABILITY_STATUS="killed"
@@ -3516,10 +3529,14 @@ $1"
 # Convert an HTTP Date header value to epoch seconds (GNU and BSD date).
 _epoch_from_httpdate() {
   local s="$1"
+  # The HTTP Date header is always RFC-7231 English ("Wed, 10 Jun 2026 …"), so
+  # force LC_ALL=C — otherwise %a/%b are matched against the machine's LC_TIME
+  # month/day names and a non-English locale (e.g. ru_RU on the operator's mac)
+  # fails to parse it, leaving the clock-skew probe blind ("could not parse").
   if date -d "now" >/dev/null 2>&1; then
-    date -d "$s" +%s 2>/dev/null
+    LC_ALL=C date -d "$s" +%s 2>/dev/null
   else
-    TZ=UTC date -j -f "%a, %d %b %Y %H:%M:%S GMT" "$s" +%s 2>/dev/null
+    LC_ALL=C TZ=UTC date -j -f "%a, %d %b %Y %H:%M:%S GMT" "$s" +%s 2>/dev/null
   fi
 }
 

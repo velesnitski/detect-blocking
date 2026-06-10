@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-06-10
+
+### Fixed
+
+- **Probe 17 (held-session stability) no longer over-claims "volumetric
+  kill-shaping" on a transient reset.** The verdict required only `some kill +
+  some ok + first kill wasn't tiny` — it never checked that *no larger pulse
+  survived*. A real run showed the 1 MB pulse reset but the **4 MB pulse then
+  succeeded** (non-monotonic), yet it was reported as a volumetric byte-threshold
+  block. Now the hard "volumetric kill-shaping" FAIL fires only when the ladder
+  is **monotonic** (every pulse at/above the reset also failed); a larger pulse
+  succeeding after a smaller reset downgrades to a `transient` status with a
+  "re-run to confirm" note instead of a false block verdict.
+- **Probe 19 (clock skew) now parses the HTTP `Date` header under any locale.**
+  `_epoch_from_httpdate` parsed the (always-English) RFC-7231 date with `date`
+  without forcing the locale, so on a non-English machine (e.g. `ru_RU`) `%a`/`%b`
+  were matched against localized month/day names and failed — surfacing as
+  "could not parse reference time" and a blind clock-skew probe. Now forces
+  `LC_ALL=C` on the parse.
+
 ## [0.18.0] - 2026-06-10
 
 ### Added

@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.16.0"
+readonly DETECT_BLOCKING_VERSION="0.17.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -773,6 +773,12 @@ XRAY_TLSPAR_STATUS=""       # ok, mismatch, skipped, no-sni, openssl-missing, un
 XRAY_TLSPAR_VER_MATCH=""    # 1 / 0  TLS version parity
 XRAY_TLSPAR_ALPN_MATCH=""   # 1 / 0  ALPN parity
 XRAY_TLSPAR_CIPHER_MATCH="" # 1 / 0  cipher parity
+XRAY_TLSPAR_EXT_MATCH=""    # 1 / 0  ServerHello extension-set parity (JA3S-grade; -tlsextdebug)
+XRAY_TLSPAR_SERVER_FP=""    # short hash of server ServerHello shape (version|cipher|extensions)
+XRAY_TLSPAR_COVER_FP=""     # same, for the genuine cover (compare → does the server impersonate it at the JA3S level?)
+# ---- host exposure (whole-host disguise: does the server look like only a web host?) ----
+XRAY_HOSTEXP_STATUS=""      # ok / skipped
+XRAY_HOSTEXP_OPEN=""        # giveaway ports found open beyond 443 (e.g. "22(SSH), 54321(x-ui-panel)")
 
 # ---- probe 25: cover-SNI region-throttle ----
 # Automates the real incident: the cover domain itself being shaped in-region,
@@ -2884,6 +2890,41 @@ ${h}|${dirok}|na|${verdict}"
   fi
 }
 
+# Host exposure (whole-host disguise) — does the server answer anything beyond
+# :443? A real CDN edge (the cover it impersonates) answers ONLY 443. An open
+# proxy PANEL (x-ui/3x-ui) is both a takeover risk and a loud tell to any scanner
+# profiling the IP; open SSH/RDP is normal-for-admin but still un-CDN-like. Short
+# per-port timeout so a properly firewalled host (all-filtered) can't stall it.
+probe_host_exposure() {
+  { [ -n "$XRAY_CONFIG" ] || [ -n "$XRAY_JSON_CONFIG" ]; } || { XRAY_HOSTEXP_STATUS="skipped"; return 0; }
+  check_cmd nc || { XRAY_HOSTEXP_STATUS="skipped"; return 0; }
+  local ip="${RESOLVED_IP:-$VPN_HOST}"
+  { [ -n "$ip" ] && [ "$ip" != "www.example.com" ]; } || { XRAY_HOSTEXP_STATUS="skipped"; return 0; }
+  hdr "Host exposure (does the server look like only a web host?)"
+  local open="" panel=0 admin=0 spec p name hit
+  for spec in "22:SSH" "3389:RDP" "8080:panel/alt-http" "8081:panel" "2053:panel" "9000:panel" "54321:x-ui-panel"; do
+    p=${spec%%:*}; name=${spec#*:}
+    if [[ "$OSTYPE" == darwin* ]]; then nc -z -G 2 "$ip" "$p" 2>/dev/null && hit=1 || hit=0
+    else nc -z -w 2 "$ip" "$p" 2>/dev/null && hit=1 || hit=0; fi
+    if [ "$hit" = "1" ]; then
+      open="${open}${open:+, }${p}(${name})"
+      case "$name" in SSH|RDP) admin=1 ;; *) panel=1 ;; esac
+    fi
+  done
+  XRAY_HOSTEXP_OPEN="$open"
+  XRAY_HOSTEXP_STATUS="ok"
+  if [ -z "$open" ]; then
+    ok "no giveaway ports open beyond 443 — to a scanner the host looks like a plain web server (good disguise)"
+    return 0
+  fi
+  info "open beyond 443: ${open}"
+  if [ "$panel" = "1" ]; then
+    warn "server exposes a likely proxy-PANEL port to the internet — a takeover risk AND a strong tell (a host impersonating a CDN cover should answer only 443; a scanner profiling the IP sees a proxy panel instead)"
+    add_verdict "Server exposes a proxy-panel port (e.g. x-ui/3x-ui) to the internet — a takeover risk and a detectability tell: a host that impersonates a CDN cover should expose only 443. Bind the panel to localhost (reach it over an SSH tunnel) or firewall it to an admin allowlist"
+  fi
+  [ "$admin" = "1" ] && info "SSH/RDP reachable — normal for admin, but a real CDN edge doesn't answer it; restricting management to a jump host / firewall allowlist sharpens the host's web-only profile"
+}
+
 # Probe 16 — egress integrity (geo / reputation / DNS leak). Runs through the
 # probe-12 tunnel. Tells you if the egress is already on the datacenter/proxy
 # lists that streaming & banking services block, and whether DNS resolves in a
@@ -4026,11 +4067,16 @@ probe_xray_tls_parity() {
   fi
 
   # Negotiate against the server (the IP) and the genuine cover, same SNI/ALPN.
-  local s_out c_out s_ver c_ver s_alpn c_alpn s_ciph c_ciph
+  # -tlsextdebug dumps the ServerHello EXTENSION list — the discriminating part
+  # of a JA3S fingerprint that version/ALPN/cipher alone miss. A correctly
+  # relaying Reality server splices us to the real dest, so its ServerHello
+  # (incl. extensions) should be byte-identical to the cover's; a broken/own-TLS
+  # server diverges at the extension level even when version/cipher happen to align.
+  local s_out c_out s_ver c_ver s_alpn c_alpn s_ciph c_ciph s_ext c_ext
   s_out=$(echo Q | openssl s_client -connect "$VPN_HOST:$VPN_PORT_TCP" \
-          -servername "$sni" -alpn h2,http/1.1 2>/dev/null)
+          -servername "$sni" -alpn h2,http/1.1 -tlsextdebug 2>/dev/null)
   c_out=$(echo Q | openssl s_client -connect "$sni:443" \
-          -servername "$sni" -alpn h2,http/1.1 2>/dev/null)
+          -servername "$sni" -alpn h2,http/1.1 -tlsextdebug 2>/dev/null)
 
   if [ -z "$s_out" ] || [ -z "$c_out" ]; then
     warn "could not complete both TLS negotiations (server or cover unreachable)"
@@ -4046,19 +4092,40 @@ probe_xray_tls_parity() {
   s_ciph=$(printf '%s' "$s_out" | sed -nE 's/^[[:space:]]*Cipher[[:space:]]*:[[:space:]]*(.*)/\1/p' | head -1)
   c_ciph=$(printf '%s' "$c_out" | sed -nE 's/^[[:space:]]*Cipher[[:space:]]*:[[:space:]]*(.*)/\1/p' | head -1)
 
+  # ServerHello extension list (ordered ids), the JA3S-discriminating part.
+  s_ext=$(printf '%s' "$s_out" | sed -nE 's/.*server extension.*\(id=([0-9]+)\).*/\1/p' | tr '\n' '-' | sed 's/-$//')
+  c_ext=$(printf '%s' "$c_out" | sed -nE 's/.*server extension.*\(id=([0-9]+)\).*/\1/p' | tr '\n' '-' | sed 's/-$//')
+
   [ -n "$s_ver" ] && [ "$s_ver" = "$c_ver" ] && XRAY_TLSPAR_VER_MATCH=1 || XRAY_TLSPAR_VER_MATCH=0
   [ "$s_alpn" = "$c_alpn" ] && XRAY_TLSPAR_ALPN_MATCH=1 || XRAY_TLSPAR_ALPN_MATCH=0
   [ -n "$s_ciph" ] && [ "$s_ciph" = "$c_ciph" ] && XRAY_TLSPAR_CIPHER_MATCH=1 || XRAY_TLSPAR_CIPHER_MATCH=0
+  [ -n "$s_ext" ] && [ "$s_ext" = "$c_ext" ] && XRAY_TLSPAR_EXT_MATCH=1 || XRAY_TLSPAR_EXT_MATCH=0
 
-  info "negotiation: version-match=${XRAY_TLSPAR_VER_MATCH}, ALPN-match=${XRAY_TLSPAR_ALPN_MATCH}, cipher-match=${XRAY_TLSPAR_CIPHER_MATCH} (server ${s_ver:-?}/${s_alpn:-none}, cover ${c_ver:-?}/${c_alpn:-none})"
+  # JA3S-grade fingerprint: hash(version|cipher|extension-ids) for each side. Same
+  # inputs as JA3S (openssl's names rather than the canonical numeric encoding, but
+  # apples-to-apples since both sides use the same tool). Share-safe (a shape hash).
+  if check_cmd openssl; then
+    XRAY_TLSPAR_SERVER_FP=$(printf '%s|%s|%s' "$s_ver" "$s_ciph" "$s_ext" | openssl dgst -sha256 2>/dev/null | sed -nE 's/.*([0-9a-f]{64}).*/\1/p' | cut -c1-12)
+    XRAY_TLSPAR_COVER_FP=$(printf '%s|%s|%s' "$c_ver" "$c_ciph" "$c_ext" | openssl dgst -sha256 2>/dev/null | sed -nE 's/.*([0-9a-f]{64}).*/\1/p' | cut -c1-12)
+  fi
+
+  info "negotiation: version-match=${XRAY_TLSPAR_VER_MATCH}, ALPN-match=${XRAY_TLSPAR_ALPN_MATCH}, cipher-match=${XRAY_TLSPAR_CIPHER_MATCH}, ext-match=${XRAY_TLSPAR_EXT_MATCH} (server ${s_ver:-?}/${s_alpn:-none}, cover ${c_ver:-?}/${c_alpn:-none})"
+  info "ServerHello fingerprint (JA3S-grade): server ${XRAY_TLSPAR_SERVER_FP:-?} vs cover ${XRAY_TLSPAR_COVER_FP:-?}$( [ -n "$XRAY_TLSPAR_SERVER_FP" ] && [ "$XRAY_TLSPAR_SERVER_FP" = "$XRAY_TLSPAR_COVER_FP" ] && echo ' (match)' || echo ' (DIFFER)' )"
 
   if [ "$XRAY_TLSPAR_VER_MATCH" = "1" ] && [ "$XRAY_TLSPAR_ALPN_MATCH" = "1" ] && [ "$XRAY_TLSPAR_CIPHER_MATCH" = "1" ]; then
-    ok "TLS negotiation matches the genuine cover (version + ALPN + cipher) → relays cleanly"
-    XRAY_TLSPAR_STATUS="ok"
+    XRAY_TLSPAR_STATUS="ok"   # decision stays on version+ALPN+cipher (reliable; feeds probe 26)
+    if [ "$XRAY_TLSPAR_EXT_MATCH" = "0" ]; then
+      # Version/ALPN/cipher align but the ServerHello extension SET diverges — a
+      # finer (JA3S-grade) tell. Not scored (can be benign relay/openssl variance),
+      # but a JA3S/JA4S fingerprinter could still distinguish server from cover.
+      warn "version/ALPN/cipher match the cover, but the ServerHello EXTENSION set differs (JA3S-grade fingerprint ${XRAY_TLSPAR_SERVER_FP:-?} ≠ ${XRAY_TLSPAR_COVER_FP:-?}) — a JA3S/JA4S fingerprinter could still tell the server from the cover it impersonates (often benign relay/openssl variance; matters against a censor that does ServerHello fingerprinting)"
+    else
+      ok "TLS negotiation matches the genuine cover (version + ALPN + cipher + ServerHello extensions) → relays cleanly"
+    fi
   else
     warn "TLS negotiation differs from the genuine cover"
     XRAY_TLSPAR_STATUS="mismatch"
-    add_verdict "Server's TLS negotiation (version/ALPN/cipher) does not match the genuine cover site — it doesn't fully impersonate the host its serverName claims, a fingerprint an active prober can use. Point Reality 'dest' at the exact cover the client's serverName expects (and confirm probes 15/20)"
+    add_verdict "Server's TLS negotiation does not match the genuine cover site (version/ALPN/cipher$( [ "$XRAY_TLSPAR_EXT_MATCH" = "0" ] && echo '/ServerHello extensions' ); JA3S-grade fingerprint ${XRAY_TLSPAR_SERVER_FP:-?} vs cover ${XRAY_TLSPAR_COVER_FP:-?}) — it doesn't fully impersonate the host its serverName claims, a fingerprint an active prober or a JA3S/JA4S fingerprinter can use. Point Reality 'dest' at the exact cover the client's serverName expects (and confirm probes 15/20)"
   fi
 }
 
@@ -4732,6 +4799,11 @@ _emit_json() {
     --arg xtp_ver           "$XRAY_TLSPAR_VER_MATCH" \
     --arg xtp_alpn          "$XRAY_TLSPAR_ALPN_MATCH" \
     --arg xtp_cipher        "$XRAY_TLSPAR_CIPHER_MATCH" \
+    --arg xtp_ext           "$XRAY_TLSPAR_EXT_MATCH" \
+    --arg xtp_sfp           "$XRAY_TLSPAR_SERVER_FP" \
+    --arg xtp_cfp           "$XRAY_TLSPAR_COVER_FP" \
+    --arg hx_status         "$XRAY_HOSTEXP_STATUS" \
+    --arg hx_open           "$XRAY_HOSTEXP_OPEN" \
     --arg xct_status        "$XRAY_COVERTHR_STATUS" \
     --arg xct_cover         "$XRAY_COVERTHR_COVER_BPS" \
     --arg xct_base          "$XRAY_COVERTHR_BASE_BPS" \
@@ -4986,7 +5058,14 @@ _emit_json() {
           status: opt($xtp_status),
           version_match: tri_bool(($xtp_ver | tonumber? // -1)),
           alpn_match: tri_bool(($xtp_alpn | tonumber? // -1)),
-          cipher_match: tri_bool(($xtp_cipher | tonumber? // -1))
+          cipher_match: tri_bool(($xtp_cipher | tonumber? // -1)),
+          ext_match: tri_bool(($xtp_ext | tonumber? // -1)),
+          server_fingerprint: opt($xtp_sfp),
+          cover_fingerprint: opt($xtp_cfp)
+        },
+        host_exposure: {
+          status: opt($hx_status),
+          open_ports: (if $hx_open == "" then [] else ($hx_open | split(", ") | map(select(length > 0))) end)
         },
         xray_cover_throttle: {
           status: opt($xct_status),
@@ -5197,6 +5276,7 @@ _should_run xrayjson && probe_xray_json
 _should_run xrayjson && probe_xray_throughput
 _should_run xrayjson && probe_xray_speedtest
 { _should_run xray || _should_run xrayjson; } && probe_xray_cover
+{ _should_run xray || _should_run xrayjson; } && probe_host_exposure
 _should_run xrayjson && probe_xray_egress
 _should_run xrayjson && probe_xray_stability
 # Lint + clock-skew run in numeric position (after 17, before 20). They're

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-06-09
+
+### Added
+
+- **Probe 24 → JA3S-grade.** TLS-parity now compares the **ServerHello extension
+  set** (via `openssl -tlsextdebug`) — the discriminating part of a JA3S/JA4S
+  fingerprint that version/ALPN/cipher alone miss — and emits a comparable
+  **fingerprint hash** for the server vs the genuine cover. A correctly-relaying
+  Reality server is byte-identical to the cover; a broken/own-TLS one diverges at
+  the extension level even when version/cipher align. The pass/fail decision still
+  rests on version+ALPN+cipher (reliable, feeds probe 26), but an extension-only
+  divergence is surfaced as a finer tell. JSON `xray_tls_parity.{ext_match,
+  server_fingerprint, cover_fingerprint}`. (Server-side fingerprinting is fully
+  observable from our own connection — no `tshark` needed, unlike the *client*
+  fingerprint.)
+- **Host-exposure probe (whole-host disguise).** Checks the server for giveaway
+  ports beyond 443 (SSH/RDP, and proxy-**panel** ports like x-ui/3x-ui). A real
+  CDN edge answers only 443; an open panel is both a takeover risk and a loud tell
+  to any scanner profiling the IP. Auto (with a config); short per-port timeout so
+  a firewalled host can't stall it. JSON `probes.host_exposure`.
+
 ## [0.16.0] - 2026-06-08
 
 ### Added

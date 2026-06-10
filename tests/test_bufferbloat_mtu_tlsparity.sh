@@ -26,7 +26,7 @@ out=$(VPN_HOST=www.example.com TIMEOUT=2 \
 printf '%s' "$out" | jq -e '
   (.probes.xray_bufferbloat | has("idle_rtt_ms") and has("loaded_rtt_ms") and has("inflation_ms") and has("jitter_ms"))
   and (.probes.xray_mtu | has("path_mtu"))
-  and (.probes.xray_tls_parity | has("version_match") and has("alpn_match") and has("cipher_match"))
+  and (.probes.xray_tls_parity | has("version_match") and has("alpn_match") and has("cipher_match") and has("ext_match") and has("server_fingerprint") and has("cover_fingerprint"))
 ' >/dev/null || fail "probes 22-24 schema missing keys"
 
 # --- Case B: --no-bufferbloat disables probe 22. ---

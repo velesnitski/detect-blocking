@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.17.0"
+readonly DETECT_BLOCKING_VERSION="0.18.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -54,6 +54,7 @@ readonly DETECT_BLOCKING_VERSION="0.17.0"
 #                  egress,stability,lint,clock,active-probe,fleet,routing,bufferbloat,mtu,
 #                  tls-parity,cover-throttle,detectability(+deployment fingerprint)
 #                opt-in scanners: probe_cover_scan (--scan-covers), probe_censor_sweep (--censor-sweep)
+#                non-Xray: probe_hysteria (static Hysteria2/QUIC analysis; auto on a Hysteria2 config)
 #   output ..... JSON emitter (--json) · main (probe dispatch) · summary (verdict + recommendations)
 # ============================================================================
 
@@ -206,6 +207,8 @@ while [ $# -gt 0 ]; do
       printf '                      accepts vless://, vmess://, trojan://, ss://, hysteria2:// URLs\n'
       printf '  --xray-config-json FILE  full-config probe via xray-core + SOCKS5 (covers fragment,\n'
       printf '                      dialerProxy, chained outbounds; needs xray + jq)\n'
+      printf '                      also accepts a Hysteria2 client config (YAML or JSON) — runs the\n'
+      printf '                      static Hysteria2 analyzer (SNI tell, obfs, QUIC-SNI, UDP/443)\n'
       printf '  --speedtest         force probe 14 (multi-stream capacity) even inside --watch/--from-file\n'
       printf '  --no-speedtest      disable probe 14 (it runs by default when probe 12 succeeds)\n'
       printf '  --no-egress-check   disable probe 16 (egress geo/reputation; avoids a 3rd-party IP-info call)\n'
@@ -314,6 +317,48 @@ if [ -n "${XRAY_JSON_CONFIG:-}" ] && [ ! -f "$XRAY_JSON_CONFIG" ]; then
   elif [ "$XRAY_JSON_CONFIG" = "-" ]; then
     printf 'error: --xray-config-json - got empty stdin\n' >&2; exit 1
   fi
+fi
+
+# Hysteria2? A QUIC/UDP protocol — a different stack from Xray (no Reality cover,
+# no TLS-in-TLS, lives on UDP/443). Accept a YAML or JSON client config via
+# --xray-config-json, or a hysteria2:// URI via --xray-config, and route it to the
+# static Hysteria2 analyzer (probe_hysteria) instead of the Xray-protocol probes —
+# a TCP/TLS probe against a UDP/443 server would falsely read "unreachable".
+HYSTERIA_DETECTED=""; HYSTERIA_SRC=""
+case "${XRAY_CONFIG:-}" in
+  hysteria2://*|hy2://*|hysteria://*) HYSTERIA_DETECTED=1; HYSTERIA_SRC="$XRAY_CONFIG" ;;
+esac
+if [ -z "$HYSTERIA_DETECTED" ] && [ -n "${XRAY_JSON_CONFIG:-}" ] && [ -r "$XRAY_JSON_CONFIG" ]; then
+  if command -v jq >/dev/null 2>&1 && jq empty "$XRAY_JSON_CONFIG" >/dev/null 2>&1; then
+    # valid JSON: a Hysteria2 JSON client config has top-level server + auth/obfs
+    # and no Xray "outbounds".
+    if jq -e '(.server != null) and ((.auth != null) or (.obfs != null)) and (.outbounds == null)' \
+         "$XRAY_JSON_CONFIG" >/dev/null 2>&1; then
+      HYSTERIA_DETECTED=1; HYSTERIA_SRC="$XRAY_JSON_CONFIG"
+    fi
+  elif grep -qiE '^[[:space:]]*server:[[:space:]]*[^[:space:]]' "$XRAY_JSON_CONFIG" 2>/dev/null \
+       && grep -qiE '^[[:space:]]*(auth|obfs|socks5|http|tls|bandwidth|transport):' "$XRAY_JSON_CONFIG" 2>/dev/null; then
+    # not valid JSON → a YAML Hysteria2 client config (server:/auth:/socks5:/…)
+    HYSTERIA_DETECTED=1; HYSTERIA_SRC="$XRAY_JSON_CONFIG"
+  fi
+fi
+if [ -n "$HYSTERIA_DETECTED" ]; then
+  # Derive the server host so DNS (and the egress note) line up with the tunnel.
+  if [ -z "${VPN_HOST:-}" ]; then
+    case "$HYSTERIA_SRC" in
+      hysteria2://*|hy2://*|hysteria://*)
+        _hy_hp=${HYSTERIA_SRC#*://}; _hy_hp=${_hy_hp#*@}; _hy_hp=${_hy_hp%%[/?]*} ;;
+      *)
+        _hy_hp=$(grep -iE '^[[:space:]]*server:' "$HYSTERIA_SRC" 2>/dev/null | head -1 \
+                 | sed -E 's/.*server:[[:space:]]*//; s/^["'\'']//; s/["'\'']$//; s/[[:space:]]*#.*$//') ;;
+    esac
+    _hy_hp=${_hy_hp#*://}; VPN_HOST=${_hy_hp%%:*}; unset _hy_hp
+  fi
+  # The Xray probes don't apply — clear the configs so they skip cleanly, and keep
+  # the standard suite to the non-misleading probes (TCP/TLS on a UDP/443 server
+  # would falsely read "unreachable"). probe_hysteria does the rest.
+  XRAY_JSON_CONFIG=""; XRAY_CONFIG=""
+  [ -z "${ONLY_PROBES:-}" ] && ONLY_PROBES="env,dns"
 fi
 
 # Is --xray-config-json actually an Xray-core config? Xray outbounds carry a
@@ -779,6 +824,12 @@ XRAY_TLSPAR_COVER_FP=""     # same, for the genuine cover (compare → does the 
 # ---- host exposure (whole-host disguise: does the server look like only a web host?) ----
 XRAY_HOSTEXP_STATUS=""      # ok / skipped
 XRAY_HOSTEXP_OPEN=""        # giveaway ports found open beyond 443 (e.g. "22(SSH), 54321(x-ui-panel)")
+# ---- Hysteria2 static analysis (QUIC/UDP — set by probe_hysteria) ----
+HYSTERIA_STATUS=""          # ok / skipped
+HYSTERIA_SNI_KEYWORD=""     # 1/0 — effective TLS SNI carries a protocol/circumvention keyword
+HYSTERIA_SNI_EXPLICIT=""    # 1/0 — an explicit tls.sni is set (vs defaulting to the server hostname)
+HYSTERIA_OBFS=""            # 1/0 — obfs (salamander) present in the client config
+HYSTERIA_INSECURE=""        # 1/0 — tls.insecure=true (cert verification off)
 
 # ---- probe 25: cover-SNI region-throttle ----
 # Automates the real incident: the cover domain itself being shaped in-region,
@@ -2925,6 +2976,87 @@ probe_host_exposure() {
   [ "$admin" = "1" ] && info "SSH/RDP reachable — normal for admin, but a real CDN edge doesn't answer it; restricting management to a jump host / firewall allowlist sharpens the host's web-only profile"
 }
 
+# Hysteria2 static config analysis. Hysteria2 is QUIC over UDP/443 — a different
+# stack from Xray/Reality (no cover relay, no TLS-in-TLS), so the Xray probes
+# don't apply and a TCP/TLS probe against it would falsely read "unreachable".
+# Instead we apply the tool's detection PRINCIPLES to what a client config
+# exposes: the cleartext SNI carried in the QUIC Initial (the #1 tell), whether
+# obfs/cert hardening is set, and the UDP/443-single-point + QUIC-SNI risks. What
+# actually dominates detectability — the server's masquerade / cert / enforced
+# obfs — lives in the SERVER config a client file can't see; we say so plainly.
+probe_hysteria() {
+  [ -n "${HYSTERIA_DETECTED:-}" ] || { HYSTERIA_STATUS="skipped"; return 0; }
+  local src="$HYSTERIA_SRC" host="" sni="" eff_sni="" from_uri=0 q=""
+  case "$src" in hysteria2://*|hy2://*|hysteria://*) from_uri=1 ;; esac
+  if [ "$from_uri" = "1" ]; then
+    case "$src" in *\?*) q=${src#*\?}; q=${q%%#*} ;; esac
+    host=${src#*://}; host=${host#*@}; host=${host%%[/?]*}; host=${host%%:*}
+    sni=$(_qp "$q" sni); [ -z "$sni" ] && sni=$(_qp "$q" peer)
+    case "$(_qp "$q" obfs)" in ?*) HYSTERIA_OBFS=1 ;; *) HYSTERIA_OBFS=0 ;; esac
+    case "$(_qp "$q" insecure)" in 1|true) HYSTERIA_INSECURE=1 ;; *) HYSTERIA_INSECURE=0 ;; esac
+  else
+    host=$(grep -iE '^[[:space:]]*server:' "$src" 2>/dev/null | head -1 \
+           | sed -E 's/.*server:[[:space:]]*//; s/^["'\'']//; s/["'\'']$//; s/[[:space:]]*#.*$//')
+    host=${host#*://}; host=${host%%:*}
+    sni=$(grep -iE '^[[:space:]]*sni:' "$src" 2>/dev/null | head -1 \
+          | sed -E 's/.*sni:[[:space:]]*//; s/["'\'']//g; s/[[:space:]]*#.*$//; s/[[:space:]]*$//')
+    if grep -qiE '^[[:space:]]*obfs:|salamander' "$src" 2>/dev/null; then HYSTERIA_OBFS=1; else HYSTERIA_OBFS=0; fi
+    if grep -qiE '^[[:space:]]*insecure:[[:space:]]*true' "$src" 2>/dev/null; then HYSTERIA_INSECURE=1; else HYSTERIA_INSECURE=0; fi
+  fi
+  [ -z "$host" ] && host="$VPN_HOST"
+  if [ -n "$sni" ]; then HYSTERIA_SNI_EXPLICIT=1; eff_sni="$sni"; else HYSTERIA_SNI_EXPLICIT=0; eff_sni="$host"; fi
+  HYSTERIA_STATUS="ok"
+
+  hdr "Hysteria2 config analysis (QUIC/UDP — static)"
+  info "Hysteria2 detected — QUIC over UDP/443. The Xray/Reality probes (TCP, TLS-in-TLS, cover relay) don't apply; this is a static read of what the client config exposes."
+
+  # 1. The headline tell: a protocol/circumvention keyword in the cleartext SNI.
+  #    Hysteria2's QUIC Initial carries the SNI, which the GFW decrypts and reads
+  #    (since 2024) — a keyword there is one-glance identification.
+  local sni_lc kw=0
+  sni_lc=$(printf '%s' "$eff_sni" | tr '[:upper:]' '[:lower:]')
+  case "$sni_lc" in
+    *hysteria*|*hy2*|*vpn*|*proxy*|*xray*|*v2ray*|*reality*|*shadowsock*|*trojan*|*wireguard*|*outline*|*tuic*|*vless*|*vmess*|*censor*|*unblock*|*bypass*|*-rkn*|*rkn-*)
+      kw=1 ;;
+  esac
+  HYSTERIA_SNI_KEYWORD="$kw"
+  if [ "$kw" = "1" ]; then
+    warn "the TLS SNI carries a protocol/circumvention keyword — sent in cleartext in the QUIC Initial, which the GFW decrypts and reads (since 2024); a censor identifies and blocklists it at a glance"
+    reveal "  effective SNI: $eff_sni"
+    add_verdict "Hysteria2 TLS SNI carries a protocol/circumvention keyword (e.g. 'hysteria' / 'vpn'). QUIC sends the SNI in the Initial packet, which the GFW decrypts and reads — one-glance identification. Set tls.sni to an innocuous, popular domain, independent of the connect host [client-side]"
+  else
+    ok "no protocol/circumvention keyword in the SNI"
+  fi
+
+  # 2. SNI defaults to the server hostname when tls.sni is unset → the dedicated
+  #    host itself is what rides in the QUIC Initial.
+  if [ "$HYSTERIA_SNI_EXPLICIT" = "0" ]; then
+    info "no explicit tls.sni — the QUIC Initial SNI defaults to the server hostname, so the dedicated host is what a censor sees; set tls.sni to an innocuous, popular domain (independent of the connect address)"
+  fi
+
+  # 3. obfs (salamander) — without it the QUIC/Hysteria handshake is
+  #    fingerprintable. (Must be enabled on BOTH ends; absent here = none.)
+  if [ "$HYSTERIA_OBFS" = "0" ]; then
+    warn "no obfs (salamander) in the client config — the QUIC handshake is fingerprintable; enable 'obfs: salamander' on BOTH the client and server to randomize the wire shape"
+    add_verdict "Hysteria2 has no obfs (salamander) configured — the QUIC handshake is fingerprintable by a DPI profiling QUIC. Enable 'obfs: salamander' (shared password) on both client and server [client-side]"
+  else
+    ok "obfs (salamander) present — the QUIC handshake is obfuscated"
+  fi
+
+  # 4. Cert verification disabled.
+  if [ "$HYSTERIA_INSECURE" = "1" ]; then
+    warn "tls.insecure=true — the client does not verify the server cert (MITM risk, and it can't confirm the masquerade cert is genuine)"
+    add_verdict "Hysteria2 client has tls.insecure=true — disables cert verification (MITM exposure; also defeats masquerade-cert validation). Set insecure:false and pin the cert (pinSHA256) instead [client-side]"
+  fi
+
+  # 5. UDP/443 single point + the QUIC-SNI advisory.
+  info "Hysteria2 lives on UDP/443 with no TCP fallback — a censor that blocks or throttles UDP/443 wholesale (common in RU/CN) takes it down; consider port-hopping (a UDP port range) and/or a TCP-based fallback transport"
+  _quic_sni_note
+
+  # 6. What a client config can't show.
+  info "detectability is dominated by SERVER-side settings absent from a client config — the masquerade target (what an HTTP prober sees on 443), the TLS cert, and whether obfs is enforced; verify those on the server"
+}
+
 # Probe 16 — egress integrity (geo / reputation / DNS leak). Runs through the
 # probe-12 tunnel. Tells you if the egress is already on the datacenter/proxy
 # lists that streaming & banking services block, and whether DNS resolves in a
@@ -4804,6 +4936,11 @@ _emit_json() {
     --arg xtp_cfp           "$XRAY_TLSPAR_COVER_FP" \
     --arg hx_status         "$XRAY_HOSTEXP_STATUS" \
     --arg hx_open           "$XRAY_HOSTEXP_OPEN" \
+    --arg hy_status         "$HYSTERIA_STATUS" \
+    --arg hy_sni_keyword    "$HYSTERIA_SNI_KEYWORD" \
+    --arg hy_sni_explicit   "$HYSTERIA_SNI_EXPLICIT" \
+    --arg hy_obfs           "$HYSTERIA_OBFS" \
+    --arg hy_insecure       "$HYSTERIA_INSECURE" \
     --arg xct_status        "$XRAY_COVERTHR_STATUS" \
     --arg xct_cover         "$XRAY_COVERTHR_COVER_BPS" \
     --arg xct_base          "$XRAY_COVERTHR_BASE_BPS" \
@@ -5067,6 +5204,13 @@ _emit_json() {
           status: opt($hx_status),
           open_ports: (if $hx_open == "" then [] else ($hx_open | split(", ") | map(select(length > 0))) end)
         },
+        hysteria: {
+          status: opt($hy_status),
+          sni_keyword: tri_bool(($hy_sni_keyword | tonumber? // -1)),
+          sni_explicit: tri_bool(($hy_sni_explicit | tonumber? // -1)),
+          obfs: tri_bool(($hy_obfs | tonumber? // -1)),
+          insecure: tri_bool(($hy_insecure | tonumber? // -1))
+        },
         xray_cover_throttle: {
           status: opt($xct_status),
           cover_bytes_per_second: (if $xct_cover == "" then null else ($xct_cover | tonumber? // null) end),
@@ -5252,6 +5396,10 @@ _should_run openvpn && probe_openvpn
 _should_run control && probe_known_blocked
 _should_run ipv6    && probe_ipv6
 _should_run compare && probe_compare_matrix
+
+# Hysteria2 (QUIC/UDP) static analysis — runs in place of the Xray probes when a
+# Hysteria2 config was detected (which already cleared the Xray config vars).
+[ -n "${HYSTERIA_DETECTED:-}" ] && probe_hysteria
 
 # A non-Xray JSON config (e.g. sing-box) can't be parsed by the Xray-protocol
 # probes — say so plainly once and skip them. Transport probes (0-10) above

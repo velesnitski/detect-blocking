@@ -409,6 +409,39 @@ JSON output records `probes.xray_full_config.status == "xray-missing"`, so
 monitoring stacks can branch on "did we run the full-fidelity probe yet?"
 deterministically.
 
+### Hysteria2 configs — static analysis (QUIC/UDP)
+
+Hysteria2 is **QUIC over UDP/443** — a different stack from Xray/Reality (no
+cover relay, no TLS-in-TLS). The Xray probes don't apply, and a TCP/TLS probe
+against a UDP/443 server would falsely read "unreachable". Pass a Hysteria2
+**client config** — YAML or JSON to `--xray-config-json`, or a `hysteria2://`
+URI to `--xray-config` — and the script auto-detects it and runs a static
+analyzer instead:
+
+```
+./detect_blocking.sh --xray-config-json hysteria-config.yml
+```
+
+```
+== Hysteria2 config analysis (QUIC/UDP — static) ==
+          Hysteria2 detected — QUIC over UDP/443. The Xray/Reality probes don't apply; static read.
+  [WARN]  the TLS SNI carries a protocol/circumvention keyword — sent in cleartext in the QUIC Initial,
+          which the GFW decrypts and reads (since 2024); a censor identifies and blocklists it at a glance
+          no explicit tls.sni — the QUIC Initial SNI defaults to the server hostname …
+  [WARN]  no obfs (salamander) in the client config — the QUIC handshake is fingerprintable …
+          Hysteria2 lives on UDP/443 with no TCP fallback — wholesale UDP/443 blocking takes it down …
+```
+
+It checks the **cleartext SNI** (QUIC carries it in the Initial, which the GFW
+reads — a protocol/circumvention keyword there, or a dedicated host SNI when no
+innocuous `tls.sni` is set, is one-glance identification), whether **obfs
+(salamander)** and cert verification are in place, and the **UDP/443
+single-point + QUIC-SNI** risks. It also says plainly that what dominates
+detectability — the **server's** masquerade target, cert, and enforced obfs —
+isn't visible in a client config. JSON: `probes.hysteria.{status, sni_keyword,
+sni_explicit, obfs, insecure}` (booleans only — share-safe; the raw SNI prints
+only under `--reveal`).
+
 ### Probe 13 — data-plane throughput (catches cover-SNI shaping)
 
 Probe 12 confirms the Reality / VLESS handshake succeeds, but says nothing

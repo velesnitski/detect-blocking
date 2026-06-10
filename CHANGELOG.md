@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-06-10
+
+### Added
+
+- **Hysteria2 config analysis (`probe_hysteria`).** Hysteria2 is QUIC over
+  UDP/443 — a different stack from Xray/Reality (no cover relay, no TLS-in-TLS),
+  so the Xray probes don't apply and a TCP/TLS probe against it would falsely
+  read "unreachable". The tool now **auto-detects a Hysteria2 client config** —
+  YAML or JSON via `--xray-config-json`, or a `hysteria2://` URI via
+  `--xray-config` — and runs a static analyzer that applies the same detection
+  principles to what the client config exposes:
+  - **Cleartext SNI tell (the #1 risk).** QUIC carries the SNI in the Initial
+    packet, which the GFW decrypts and reads (since 2024). A protocol /
+    circumvention keyword in `tls.sni` (or in the server hostname, when no
+    explicit `tls.sni` is set and the SNI defaults to it) is one-glance
+    identification — flagged with a fix (set an innocuous, popular SNI).
+  - **obfs (salamander)** present? Without it the QUIC handshake is
+    fingerprintable.
+  - **`tls.insecure`** — cert verification disabled (MITM + can't validate the
+    masquerade cert).
+  - **UDP/443 single-point + QUIC-SNI advisory** — no TCP fallback; wholesale
+    UDP/443 blocking takes it down (port-hopping / fallback suggested).
+  - Says plainly that what dominates detectability — the **server's** masquerade
+    target, cert, and enforced obfs — isn't visible in a client config.
+  JSON: `probes.hysteria.{status, sni_keyword, sni_explicit, obfs, insecure}`
+  (booleans only — share-safe; the raw SNI prints only under `--reveal`).
+
 ## [0.17.0] - 2026-06-09
 
 ### Added

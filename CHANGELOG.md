@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-06-11
+
+### Added
+
+- **Happ deep-link input adapter.** [Happ](https://happ.su) `happ://` links are
+  now accepted via `--xray-config`, in three forms:
+  - **`happ://import/<scheme://…>`** — unwraps the inner config URL
+    (vless/vmess/trojan/ss/hy2/…) and runs it through the normal pipeline (a
+    `hy2://` inner flows into the Hysteria2 analyzer for free). Tolerates a plain,
+    percent-encoded, or base64-wrapped inner URL.
+  - **`happ://routing/add/<base64-json>`** — recognised as a **routing profile**
+    (no server to tunnel-test). It's decoded, summarised (name, `DomainStrategy`,
+    `RouteOrder`, `GlobalProxy`, `FakeDns`, remote DNS), and **linted** with the
+    tool's existing reasoning: the `IPOnDemand`/`IPIfNonMatch` DNS-leak vector
+    (noting `FakeDns: true` as the mitigation), and a remote DoH resolver whose
+    own domain is region-blocked (e.g. `cloudflare-dns.com` in RU).
+  - **`happ://crypt…`** — detected as an **RSA-encrypted** link that can't be
+    opened without the operator's key; says so instead of choking.
+  An unrecognised `happ://` variant exits with a clear message. New
+  `tests/test_happ.sh`.
+
 ## [0.18.2] - 2026-06-10
 
 ### Changed

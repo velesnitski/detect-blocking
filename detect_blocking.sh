@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.18.2"
+readonly DETECT_BLOCKING_VERSION="0.19.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -55,6 +55,7 @@ readonly DETECT_BLOCKING_VERSION="0.18.2"
 #                  tls-parity,cover-throttle,detectability(+deployment fingerprint)
 #                opt-in scanners: probe_cover_scan (--scan-covers), probe_censor_sweep (--censor-sweep)
 #                non-Xray: probe_hysteria (static Hysteria2/QUIC analysis; auto on a Hysteria2 config)
+#                happ://: import→unwrap, probe_happ_routing (routing-profile lint), probe_happ_crypt (encrypted)
 #   output ..... JSON emitter (--json) · main (probe dispatch) · summary (verdict + recommendations)
 # ============================================================================
 
@@ -205,6 +206,8 @@ while [ $# -gt 0 ]; do
       printf '  --port-survey       scan common alternative VPN/proxy ports (8443, 2083, 2087, ...)\n'
       printf '  --xray-config URL   delegate end-to-end protocol test to xray-knife (optional dep)\n'
       printf '                      accepts vless://, vmess://, trojan://, ss://, hysteria2:// URLs\n'
+      printf '                      also accepts a Happ deep link: happ://import/<config-url> (unwrapped\n'
+      printf '                      and tested), happ://routing/add/<b64> (routing profile — recognised + linted)\n'
       printf '  --xray-config-json FILE  full-config probe via xray-core + SOCKS5 (covers fragment,\n'
       printf '                      dialerProxy, chained outbounds; needs xray + jq)\n'
       printf '                      also accepts a Hysteria2 client config (YAML or JSON) — runs the\n'
@@ -235,6 +238,10 @@ if [ "$JSON_MODE" = "1" ]; then
   check_cmd jq || die "--json requires jq (install: brew install jq / apt-get install jq)"
 fi
 
+# Happ deep-link flags (set during normalization below; declared here so they
+# exist under `set -u` regardless of the config type).
+HAPP_ROUTING=""; HAPP_ROUTING_SRC=""; HAPP_CRYPT=""
+
 # Sanitise --xray-config: terminal paste-wrap is a common source of embedded
 # newlines / spaces. Strip all whitespace; if anything was removed, warn
 # (to stderr only, not LOG_QUIET-gated) so the operator notices. Then
@@ -246,6 +253,37 @@ if [ -n "$XRAY_CONFIG" ]; then
     printf '%s\n' "warning: --xray-config contained whitespace (terminal paste-wrap?); stripped before use" >&2
   fi
   unset _xray_orig
+
+  # Happ deep-link normalization (BEFORE the scheme check). happ://import/<url>
+  # unwraps to the inner config URL so it flows through the normal handlers;
+  # happ://routing/add and happ://crypt carry no server, so flag them and clear
+  # XRAY_CONFIG (the scheme check + URL derivation below then skip). Helpers
+  # aren't defined this early, so base64 / percent-decode is inlined.
+  case "$XRAY_CONFIG" in
+    happ://import/*)
+      _hinner=${XRAY_CONFIG#happ://import/}
+      case "$_hinner" in
+        *://*) : ;;                                            # already a scheme URL
+        *%3[Aa]*) _hinner=$(printf '%b' "${_hinner//%/\\x}") ;; # percent-encoded URL
+        *)                                                     # maybe base64-wrapped
+          _hdec=$(printf '%s' "$_hinner" | base64 -d 2>/dev/null || printf '%s' "$_hinner" | base64 -D 2>/dev/null)
+          case "$_hdec" in *://*) _hinner="$_hdec" ;; esac ;;
+      esac
+      XRAY_CONFIG="$_hinner"
+      printf '%s\n' "note: unwrapped happ://import/ → ${_hinner%%://*}:// config" >&2 ;;
+    happ://routing/add/*)
+      HAPP_ROUTING=1
+      HAPP_ROUTING_SRC=$(printf '%s' "${XRAY_CONFIG#happ://routing/add/}" | base64 -d 2>/dev/null \
+                         || printf '%s' "${XRAY_CONFIG#happ://routing/add/}" | base64 -D 2>/dev/null)
+      XRAY_CONFIG=""; [ -z "${ONLY_PROBES:-}" ] && ONLY_PROBES="env" ;;
+    happ://crypt*)
+      HAPP_CRYPT=1; XRAY_CONFIG=""; [ -z "${ONLY_PROBES:-}" ] && ONLY_PROBES="env" ;;
+    happ://*)
+      die "unrecognized happ:// link — supported: happ://import/<config-url>, happ://routing/add/<b64>, or happ://crypt… (encrypted; paste the decrypted vless:// or sub URL instead)" ;;
+  esac
+fi
+
+if [ -n "$XRAY_CONFIG" ]; then
   case "$XRAY_CONFIG" in
     vless://*|vmess://*|trojan://*|ss://*|hysteria://*|hysteria2://*|tuic://*) ;;
     *) die "--xray-config: unrecognised scheme; expected one of vless://, vmess://, trojan://, ss://, hysteria://, hysteria2://, tuic:// (got: $(printf '%s' "$XRAY_CONFIG" | head -c 20))" ;;
@@ -3001,6 +3039,52 @@ probe_host_exposure() {
   [ "$admin" = "1" ] && info "SSH/RDP reachable — normal for admin, but a real CDN edge doesn't answer it; restricting management to a jump host / firewall allowlist sharpens the host's web-only profile"
 }
 
+# Happ routing-profile recognition. A happ://routing/add/ link carries a
+# routing + DNS ruleset, NOT a server — so there's nothing to tunnel-test. We
+# decode it, summarise it, and lint the parts the tool already reasons about
+# (the IPOnDemand DNS-leak vector, and a remote DoH resolver that's itself
+# region-blocked) so the user gets something useful instead of a dead end.
+probe_happ_routing() {
+  [ -n "${HAPP_ROUTING:-}" ] || return 0
+  hdr "Happ routing profile (no server — informational)"
+  if ! command -v jq >/dev/null 2>&1 || ! printf '%s' "$HAPP_ROUTING_SRC" | jq empty >/dev/null 2>&1; then
+    warn "could not decode the routing profile (not valid JSON)"
+    return 0
+  fi
+  local name strat fakedns remote_dns route_order global
+  name=$(printf '%s' "$HAPP_ROUTING_SRC" | jq -r '.Name // "(unnamed)"')
+  strat=$(printf '%s' "$HAPP_ROUTING_SRC" | jq -r '.DomainStrategy // "?"')
+  fakedns=$(printf '%s' "$HAPP_ROUTING_SRC" | jq -r 'if .FakeDns then "on" else "off" end')
+  remote_dns=$(printf '%s' "$HAPP_ROUTING_SRC" | jq -r '.RemoteDNSDomain // .RemoteDNSIp // "?"')
+  route_order=$(printf '%s' "$HAPP_ROUTING_SRC" | jq -r '.RouteOrder // "?"')
+  global=$(printf '%s' "$HAPP_ROUTING_SRC" | jq -r 'if .GlobalProxy then "on" else "off" end')
+  info "profile \"${name}\" — a routing/DNS ruleset, not a server (no address / id / cover here, so nothing to tunnel-test)"
+  info "DomainStrategy=${strat}, RouteOrder=${route_order}, GlobalProxy=${global}, FakeDns=${fakedns}, remote DNS=${remote_dns}"
+  case "$strat" in
+    IPOnDemand|IPIfNonMatch)
+      if [ "$fakedns" = "on" ]; then
+        info "DomainStrategy=${strat} resolves destination domains to evaluate geoip rules (a DNS-leak vector) — FakeDns=on here mitigates it: the engine matches on synthetic IPs instead of doing real lookups"
+      else
+        warn "DomainStrategy=${strat} resolves destination domains via the configured DNS to evaluate geoip rules — a DNS-leak vector; enable FakeDns, or use domainStrategy=AsIs"
+      fi ;;
+  esac
+  case "$remote_dns" in
+    *cloudflare*|*dns.google*|*google*)
+      info "remote DNS is ${remote_dns} — note this resolver's own domain is blocked in some regions (e.g. cloudflare-dns.com / dns.google in RU); a DoH resolver that's unreachable in-region silently breaks resolution there (resolver-agnostic: prefer one reachable from the target region)" ;;
+  esac
+  info "to test the tunnel itself, pass the VLESS/Reality config this profile is paired with"
+}
+
+# Happ encrypted deep link. happ://crypt… wraps the server/subscription with RSA
+# (PKCS#1) — only the Happ app holding the private key can open it. We detect it
+# and say so rather than failing on an undecodable blob.
+probe_happ_crypt() {
+  [ -n "${HAPP_CRYPT:-}" ] || return 0
+  hdr "Happ encrypted deep link (crypt)"
+  warn "this is an RSA-encrypted Happ link — the server/subscription is hidden and only the Happ app with the private key can open it; it cannot be decoded here"
+  info "paste the decrypted vless:// (or the plain subscription URL) to test the server"
+}
+
 # Hysteria2 static config analysis. Hysteria2 is QUIC over UDP/443 — a different
 # stack from Xray/Reality (no cover relay, no TLS-in-TLS), so the Xray probes
 # don't apply and a TCP/TLS probe against it would falsely read "unreachable".
@@ -5488,6 +5572,8 @@ _should_run compare && probe_compare_matrix
 # Hysteria2 (QUIC/UDP) static analysis — runs in place of the Xray probes when a
 # Hysteria2 config was detected (which already cleared the Xray config vars).
 [ -n "${HYSTERIA_DETECTED:-}" ] && probe_hysteria
+[ -n "${HAPP_ROUTING:-}" ] && probe_happ_routing
+[ -n "${HAPP_CRYPT:-}" ] && probe_happ_crypt
 
 # A non-Xray JSON config (e.g. sing-box) can't be parsed by the Xray-protocol
 # probes — say so plainly once and skip them. Transport probes (0-10) above

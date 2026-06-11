@@ -442,6 +442,32 @@ isn't visible in a client config. JSON: `probes.hysteria.{status, sni_keyword,
 sni_explicit, obfs, insecure}` (booleans only — share-safe; the raw SNI prints
 only under `--reveal`).
 
+### Happ deep links (`happ://`)
+
+[Happ](https://happ.su) is a popular client whose `happ://` deep links wrap
+configs. Pass one straight to `--xray-config`:
+
+```
+# a single config wrapped in an import link → unwrapped and tested
+./detect_blocking.sh --xray-config 'happ://import/vless://…@host:443?security=reality&…'
+
+# a routing profile → recognised + linted (no server to tunnel-test)
+./detect_blocking.sh --xray-config 'happ://routing/add/<base64-json>'
+```
+
+- **`happ://import/<url>`** unwraps the inner share-link (vless/vmess/trojan/ss/
+  hy2/…) and runs the normal probes against it — including the Hysteria2 analyzer
+  for a `hy2://` inner. The inner URL may be plain, percent-encoded, or base64.
+- **`happ://routing/add/<b64>`** is a **routing/DNS profile, not a server**. It's
+  decoded and summarised, and linted with the same reasoning the routing/egress
+  probes use — the `IPOnDemand` DNS-leak vector (and whether `FakeDns` mitigates
+  it), and a remote DoH resolver whose domain is itself region-blocked (e.g.
+  `cloudflare-dns.com` in RU). There's no tunnel to test; pass the VLESS/Reality
+  config the profile is paired with for that.
+- **`happ://crypt…`** is **RSA-encrypted** — only the Happ app with the private
+  key can open it. The tool detects it and asks for the decrypted `vless://` or
+  the plain subscription URL instead.
+
 ### Probe 13 — data-plane throughput (catches cover-SNI shaping)
 
 Probe 12 confirms the Reality / VLESS handshake succeeds, but says nothing

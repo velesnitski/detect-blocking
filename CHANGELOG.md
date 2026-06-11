@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-06-11
+
+### Added
+
+- **`--outbound TAG` — target one server in a multi-outbound config.** An Xray
+  JSON config can hold several proxy outbounds (split-tunnel routing, balancer
+  fleets); the full-config probe (12) runs them all with routing intact, but the
+  single-server fingerprint probes (host, cover cert, active-probe, TLS-parity,
+  detectability) need one. `--outbound TAG` narrows the config to that outbound
+  (the chosen outbound + a `freedom` direct, with `routing`/`balancers` dropped)
+  and tests that server **standalone**. Without the flag, behaviour is unchanged —
+  the full config is tested, the first proxy outbound feeds the single-server
+  probes, and a note reports how many proxy outbounds there are and their tags so
+  you know there's more to target. Narrowing is implemented by reordering the
+  chosen outbound to index 0, so every existing read path targets it with no
+  per-field changes. A `--outbound` tag that isn't a proxy outbound, or doesn't
+  exist, exits with the list of valid tags. Chained configs (`dialerProxy`) warn
+  that a standalone test won't reflect the chain (use the full config instead).
+  New `tests/test_outbound_select.sh`.
+
 ## [0.19.0] - 2026-06-11
 
 ### Added

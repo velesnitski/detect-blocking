@@ -309,6 +309,31 @@ no routing logic. Probe 12 spawns `xray run` against your **actual
 > `vmess://` (base64), `ss://`, `hysteria*` or `tuic://`, or for any
 > chained / balancer / fragment setup, pass a real `--xray-config-json`.
 
+#### Multi-outbound configs — `--outbound TAG`
+
+A config can carry several proxy outbounds — split-tunnel routing (e.g.
+`proxy-ru` vs `proxy-foreign`), or a balancer fleet. The full-config probe (12)
+runs them all with routing intact; the single-server fingerprint probes (host,
+cover cert, active-probe, TLS-parity, detectability) target **one** of them. By
+default that's the first proxy outbound, and a note tells you how many there are:
+
+```
+note: config has 2 proxy outbounds (proxy-ru, proxy-foreign); the full config is
+tested as-is (routing intact), and the single-server probes target the first —
+pass --outbound TAG to focus another
+```
+
+```
+# fingerprint the foreign endpoint specifically
+./detect_blocking.sh --xray-config-json cfg.json --outbound proxy-foreign
+```
+
+`--outbound TAG` narrows the config to that outbound (chosen + a `freedom`
+direct, `routing`/`balancers` dropped) and tests that server standalone. An
+unknown tag, or one that isn't a proxy outbound, errors with the valid tags. For
+**chained** outbounds (`dialerProxy`) it warns — a hop isn't a standalone server,
+so test the full config (no `--outbound`) instead, which probe 12 runs end-to-end.
+
 #### High-RTT tunnels: automatic slow-handshake retry
 
 Multi-hop paths (e.g. a RU-ingress → EU-egress chain) often need 5-8s to

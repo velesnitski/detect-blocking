@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.19.0"
+readonly DETECT_BLOCKING_VERSION="0.20.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -116,6 +116,7 @@ fi
 LOG_FILE="${LOG_FILE:-}"
 LOG_QUIET="${LOG_QUIET:-0}"
 ONLY_PROBES="${ONLY_PROBES:-}"
+OUTBOUND_TAG="${OUTBOUND_TAG:-}"   # --outbound TAG: narrow a multi-outbound JSON to one server
 XRAY_ONLY="${XRAY_ONLY:-}"   # 1 = --xray-only (run only the Xray-protocol probes 11-26 + routing/egress)
 SKIP_PROBES="${SKIP_PROBES:-}"
 JSON_MODE="${JSON_MODE:-0}"
@@ -164,6 +165,8 @@ while [ $# -gt 0 ]; do
     --port-survey)    PORT_SURVEY=1; shift ;;
     --xray-config)    XRAY_CONFIG="${2:-}"; shift 2 ;;
     --xray-config=*)  XRAY_CONFIG="${1#--xray-config=}"; shift ;;
+    --outbound)    OUTBOUND_TAG="${2:-}"; shift 2 ;;
+    --outbound=*)  OUTBOUND_TAG="${1#--outbound=}"; shift ;;
     --xray-config-json)    XRAY_JSON_CONFIG="${2:-}"; shift 2 ;;
     --xray-config-json=*)  XRAY_JSON_CONFIG="${1#--xray-config-json=}"; shift ;;
     --speedtest)    XRAY_SPEEDTEST=1; XRAY_SPEEDTEST_FORCE=1; shift ;;
@@ -212,6 +215,9 @@ while [ $# -gt 0 ]; do
       printf '                      dialerProxy, chained outbounds; needs xray + jq)\n'
       printf '                      also accepts a Hysteria2 client config (YAML or JSON) — runs the\n'
       printf '                      static Hysteria2 analyzer (SNI tell, obfs, QUIC-SNI, UDP/443)\n'
+      printf '  --outbound TAG      for a multi-outbound JSON config, narrow to the outbound with this\n'
+      printf '                      tag and test that server standalone (routing dropped); without it the\n'
+      printf '                      full config is tested and the first proxy outbound feeds the probes\n'
       printf '  --speedtest         force probe 14 (multi-stream capacity) even inside --watch/--from-file\n'
       printf '  --no-speedtest      disable probe 14 (it runs by default when probe 12 succeeds)\n'
       printf '  --no-egress-check   disable probe 16 (egress geo/reputation; avoids a 3rd-party IP-info call)\n'
@@ -416,6 +422,43 @@ if [ -n "${XRAY_JSON_CONFIG:-}" ] && [ -r "$XRAY_JSON_CONFIG" ] && command -v jq
     fi
   fi
   unset _xouts _alouts
+fi
+
+# Multi-outbound configs: a config can hold several proxy outbounds (split-tunnel
+# routing, balancer fleets). The full-config probe (12) runs them all with routing
+# intact; the single-server fingerprint probes (host, cover cert, active-probe,
+# TLS-parity, detectability) target ONE. --outbound TAG narrows the config to that
+# outbound (chosen + a freedom direct, routing/balancers dropped) so it's tested
+# standalone; without it we leave the full config and just hint that there's more
+# than one server. Narrowing puts the chosen outbound at index 0, so every existing
+# `.outbounds[0]` read and the first-proxy derivation below target it unchanged.
+if [ -n "${XRAY_JSON_CONFIG:-}" ] && [ -r "$XRAY_JSON_CONFIG" ] && command -v jq >/dev/null 2>&1 \
+   && [ -z "${XRAY_JSON_FORMAT:-}" ] && jq empty "$XRAY_JSON_CONFIG" >/dev/null 2>&1; then
+  _proxy_tags=$(jq -r '[.outbounds[]? | select(.settings.vnext != null or .settings.servers != null) | .tag // "(untagged)"] | join(", ")' "$XRAY_JSON_CONFIG" 2>/dev/null)
+  _proxy_n=$(jq -r '[.outbounds[]? | select(.settings.vnext != null or .settings.servers != null)] | length' "$XRAY_JSON_CONFIG" 2>/dev/null)
+  _chained=$(jq -r 'if ([.outbounds[]? | select(.streamSettings.sockopt.dialerProxy != null or .proxySettings != null)] | length) > 0 then 1 else 0 end' "$XRAY_JSON_CONFIG" 2>/dev/null)
+  if [ -n "$OUTBOUND_TAG" ]; then
+    if ! jq -e --arg t "$OUTBOUND_TAG" 'any(.outbounds[]?; .tag == $t and (.settings.vnext != null or .settings.servers != null))' "$XRAY_JSON_CONFIG" >/dev/null 2>&1; then
+      die "--outbound '$OUTBOUND_TAG' is not a proxy outbound in this config. Proxy outbounds: ${_proxy_tags:-<none>}"
+    fi
+    [ "${_chained:-0}" = "1" ] && printf '%s\n' "note: this config chains outbounds (dialerProxy) — testing '${OUTBOUND_TAG}' standalone may not reflect the chain; omit --outbound to test the full chain via probe 12" >&2
+    XRAY_OUTBOUND_PATH=$(mktemp -t detect_blocking.obsel.XXXXXX) \
+      || die "could not create a temp file for --outbound"
+    chmod 600 "$XRAY_OUTBOUND_PATH" 2>/dev/null || true
+    if jq --arg t "$OUTBOUND_TAG" '
+          .outbounds = ([ .outbounds[] | select(.tag == $t) ] + [ {protocol:"freedom", tag:"direct"} ])
+          | del(.routing) | del(.balancers)
+        ' "$XRAY_JSON_CONFIG" > "$XRAY_OUTBOUND_PATH" 2>/dev/null && [ -s "$XRAY_OUTBOUND_PATH" ]; then
+      XRAY_JSON_CONFIG="$XRAY_OUTBOUND_PATH"
+      printf '%s\n' "note: --outbound ${OUTBOUND_TAG} — narrowed the config to that outbound (routing dropped) for a standalone test" >&2
+    else
+      rm -f "$XRAY_OUTBOUND_PATH"; XRAY_OUTBOUND_PATH=""
+      die "--outbound: failed to extract outbound '$OUTBOUND_TAG'"
+    fi
+  elif [ "${_proxy_n:-0}" -gt 1 ]; then
+    printf '%s\n' "note: config has ${_proxy_n} proxy outbounds (${_proxy_tags}); the full config is tested as-is (routing intact), and the single-server probes target the first — pass --outbound TAG to focus another" >&2
+  fi
+  unset _proxy_tags _proxy_n _chained
 fi
 
 # Auto-derive VPN_HOST from --xray-config-json when no positional was given.
@@ -665,6 +708,7 @@ XRAY_JSON_RTT_MS=""      # round-trip via the SOCKS tunnel
 XRAY_JSON_FAIL_KIND=""   # on failure: timeout | reset | other (drives verdict)
 XRAY_JSON_RETRY_USED=0   # 1 if the slow-handshake auto-retry ran
 XRAY_JSON_SYNTH_PATH=""  # temp config synthesized from --xray-config URL (cleaned on exit)
+XRAY_OUTBOUND_PATH=""    # temp config narrowed to one outbound by --outbound (cleaned on exit)
 XRAY_JSON_FROM_URL=0     # 1 when probe 12 ran off a synthesized share-link config
 
 # ---- probe 13: data-plane throughput through the same SOCKS inbound ----
@@ -5501,6 +5545,8 @@ _cleanup() {
   [ -n "$XRAY_JSON_SYNTH_PATH" ] && rm -f "$XRAY_JSON_SYNTH_PATH" 2>/dev/null
   # Inline / stdin JSON we wrote to a temp file holds live credentials — remove it.
   [ -n "$XRAY_INLINE_JSON_PATH" ] && rm -f "$XRAY_INLINE_JSON_PATH" 2>/dev/null
+  # --outbound narrowed config holds live credentials too — remove it.
+  [ -n "$XRAY_OUTBOUND_PATH" ] && rm -f "$XRAY_OUTBOUND_PATH" 2>/dev/null
   # Routing-probe xray instance (live split-tunnel test) — don't orphan it.
   [ -n "$XRAY_ROUTING_PID" ] && kill "$XRAY_ROUTING_PID" 2>/dev/null
 }

@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.20.0"
+readonly DETECT_BLOCKING_VERSION="0.20.1"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -4557,6 +4557,43 @@ probe_xray_coverthrottle() {
   fi
 }
 
+# Pure scorers for two probe-26 active signals, split out so the "don't score
+# what you couldn't observe" rule is unit-testable without a live (un)reachable
+# server. Each echoes "points|description".
+#
+# Cover certificate (probe 15). KEY: an UNREACHABLE cover means we never saw a
+# cert — so it's UNVERIFIED (+5), not "authentic" (+0). The old code keyed only on
+# the cert fields, so an unreachable cover fell through to "authentic, matches
+# serverName" — a false-clean. Mirrors the +5 unverified path probes 20/24 use.
+_score_cover_cert() {            # status selfsigned chainvalid cnmatch
+  local st="$1" ss="${2:-0}" cv="${3:-1}" cn="${4:-1}" pts=0 desc=""
+  if [ "$st" = "unreachable" ]; then
+    printf '5|UNVERIFIED (cover unreachable — cert not seen)'; return
+  fi
+  if   [ "$ss" = "1" ]; then pts=40; desc="self-signed"
+  elif [ "$cv" = "0" ]; then pts=15; desc="not CA-valid"; fi
+  if [ "$cn" = "0" ]; then pts=$(( pts + 10 )); desc="${desc:+$desc + }CN≠serverName"; fi
+  [ -z "$desc" ] && desc="authentic, matches serverName"
+  printf '%d|%s' "$pts" "$desc"
+}
+
+# Active-probe behaviour (probe 20). KEY: "exposed" (relay-code=000, no coherent
+# HTTP) is a +25 tell ONLY if the server's TLS was actually reachable. If the
+# cover was unreachable too, the silence is the blackhole, not a relay refusal —
+# so downgrade to UNVERIFIED (+5): you can't tell "won't relay" from "can't reach".
+_score_active() {                # status cover_status nxnote
+  local st="$1" cst="${2:-}" nx="${3:-}"
+  case "$st" in
+    ok)       printf '0|relays unauth probes to the real cover' ;;
+    exposed)  if [ "$cst" = "unreachable" ]; then
+                printf '5|UNVERIFIED (server unreachable — cannot tell relay-refusal from blackhole)'
+              else printf '25|no coherent HTTP to an unauth prober'; fi ;;
+    mismatch) printf '15|unauth response differs from cover' ;;
+    no-baseline) printf '5|UNVERIFIED%s' "${nx:- (no genuine cover to baseline)}" ;;
+    *)        printf '0|not evaluated (%s)' "${st:-skipped}" ;;
+  esac
+}
+
 # Probe 26 — detectability score. THE FINAL SYNTHESIS: folds every detection
 # signal — ACTIVE probing (15 cover cert / 20 active-probe / 24 TLS parity) AND
 # PASSIVE structure (cover served on a non-443 port; server IP not on the cover
@@ -4597,34 +4634,20 @@ probe_xray_detectability() {
   [ "$sni_resolves" = "0" ] && nxnote=" — cover SNI is NXDOMAIN"
 
   # Each input is scored AND described, so the total is explainable even at 0.
-  # --- cover certificate (probe 15) ---
-  local cover_pts=0 cover_desc=""
-  if [ "${XRAY_COVER_SELFSIGNED:-0}" = "1" ]; then
-    cover_pts=40; cover_desc="self-signed"
-  elif [ "${XRAY_COVER_CHAIN_VALID:-1}" = "0" ]; then
-    cover_pts=15; cover_desc="not CA-valid"
-  fi
-  if [ "${XRAY_COVER_CN_MATCH:-1}" = "0" ]; then
-    cover_pts=$(( cover_pts + 10 ))
-    cover_desc="${cover_desc:+$cover_desc + }CN≠serverName"
-  fi
-  [ -z "$cover_desc" ] && cover_desc="authentic, matches serverName"
+  # --- cover certificate (probe 15) --- (UNVERIFIED +5 when the cover was
+  # unreachable: a cert we never saw must NOT default to "authentic").
+  local cover_pts cover_desc _r
+  _r=$(_score_cover_cert "$XRAY_COVER_STATUS" "${XRAY_COVER_SELFSIGNED:-0}" "${XRAY_COVER_CHAIN_VALID:-1}" "${XRAY_COVER_CN_MATCH:-1}")
+  cover_pts=${_r%%|*}; cover_desc=${_r#*|}
   score=$(( score + cover_pts ))
 
-  # --- active-probe behaviour (probe 20) ---
-  local active_pts=0 active_desc
-  # "couldn't baseline" (no-baseline) is scored as a small UNVERIFIED risk, not
-  # +0: an unconfirmed stealth dimension is an open risk, not a clean pass. It's
-  # weighted well below a confirmed tell (absence of evidence ≠ evidence of bad),
-  # and applies ONLY to a cover/server-side failure — a missing local tool stays
-  # +0 (our limitation, not the server's risk).
-  case "$XRAY_ACTIVE_STATUS" in
-    ok)          active_desc="relays unauth probes to the real cover" ;;
-    exposed)     active_pts=25; active_desc="no coherent HTTP to an unauth prober" ;;
-    mismatch)    active_pts=15; active_desc="unauth response differs from cover" ;;
-    no-baseline) active_pts=5;  active_desc="UNVERIFIED${nxnote:- (no genuine cover to baseline)}" ;;
-    *)           active_desc="not evaluated (${XRAY_ACTIVE_STATUS:-skipped})" ;;
-  esac
+  # --- active-probe behaviour (probe 20) --- ("couldn't baseline"/no-baseline and
+  # "exposed-but-server-unreachable" both score a small UNVERIFIED risk, not a
+  # confirmed +25 tell: an unconfirmed/unobservable stealth dimension is an open
+  # risk, not a clean pass and not proof. A missing local tool stays +0.)
+  local active_pts active_desc
+  _r=$(_score_active "$XRAY_ACTIVE_STATUS" "$XRAY_COVER_STATUS" "$nxnote")
+  active_pts=${_r%%|*}; active_desc=${_r#*|}
   score=$(( score + active_pts ))
 
   # --- TLS-negotiation parity (probe 24) ---

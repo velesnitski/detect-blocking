@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-06-12
+
+### Fixed
+
+- **Probe 26 no longer scores an unreachable cover as "authentic" (false-clean).**
+  When the Reality cover is unreachable (probe 15 gets no cert), the detectability
+  synthesis used to fall through to `cover cert (15): authentic, matches
+  serverName +0` — asserting a clean cover it never actually saw. It now scores
+  **UNVERIFIED (+5)**, mirroring the existing unverified path for probes 20/24.
+- **Probe 26 no longer counts "no coherent HTTP" as a confirmed +25 tell when the
+  server is unreachable.** If the active-probe sees silence (`relay-code=000`)
+  *and* the cover was unreachable, that silence is the blackhole, not a relay
+  refusal — you can't tell "won't relay" from "can't reach". It's now scored
+  **UNVERIFIED (+5)** instead of `exposed (+25)`. (Both surfaced by a real run
+  against a blackholed in-region node, where the old logic reported a confident
+  50/100 built partly on artifacts of unreachability.)
+- The cover-cert and active-probe scoring are now pure functions
+  (`_score_cover_cert`, `_score_active`), unit-tested across reachable and
+  unreachable cases without a live server (`tests/test_detect_scoring.sh`).
+
 ## [0.20.0] - 2026-06-11
 
 ### Added

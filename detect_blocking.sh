@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.20.1"
+readonly DETECT_BLOCKING_VERSION="0.21.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -150,6 +150,15 @@ while [ $# -gt 0 ]; do
     --scan-covers=*) XRAY_SCAN_COVERS="${1#--scan-covers=}"; shift ;;
     --censor-sweep) case "${2:-}" in ""|-*) XRAY_CENSOR_SWEEP=default; shift ;; *) XRAY_CENSOR_SWEEP="$2"; shift 2 ;; esac ;;
     --censor-sweep=*) XRAY_CENSOR_SWEEP="${1#--censor-sweep=}"; shift ;;
+    --full|--thorough)
+      # Umbrella: turn on the two opt-in scanners (everything else already runs by
+      # default for a config). Explicit by design — --censor-sweep fetches
+      # known-censored sites from THIS machine, so it must be the operator's call,
+      # not a silent default. Doesn't clobber an explicit --scan-covers=LIST etc.
+      [ -z "${XRAY_SCAN_COVERS:-}" ]  && XRAY_SCAN_COVERS=default
+      [ -z "${XRAY_CENSOR_SWEEP:-}" ] && XRAY_CENSOR_SWEEP=default
+      printf '%s\n' "note: --full also runs --censor-sweep (fetches known-censored sites from THIS machine to test reachability) — fine on a test box, reconsider on a sensitive / in-region one" >&2
+      shift ;;
     --skip)        SKIP_PROBES="${2:-}"; shift 2 ;;
     --skip=*)      SKIP_PROBES="${1#--skip=}"; shift ;;
     --watch)       WATCH_INTERVAL="${2:-}"; shift 2 ;;
@@ -200,6 +209,8 @@ while [ $# -gt 0 ]; do
       printf '  --xray-only         only the Xray-protocol probes (11-26 + routing/egress); skips transport probes 0-10 (alias for --only xray,xrayjson; needs --xray-config / --xray-config-json)\n'
       printf '  --scan-covers[=LIST] rank candidate Reality dest/serverName covers (TLSv1.3 + H2 + CA-valid + non-redirect); LIST is comma-separated, or omit for a built-in set\n'
       printf '  --censor-sweep[=LIST] reachability of commonly-censored hosts, direct vs through the tunnel (does the tunnel unblock them?); LIST is comma-separated, or omit for a built-in set\n'
+      printf '  --full, --thorough  comprehensive run: enable the opt-in scanners (--scan-covers + --censor-sweep);\n'
+      printf '                      everything else already runs by default. NOTE: --censor-sweep fetches censored sites from THIS machine\n'
       printf '  --skip LIST         skip listed probes\n'
       printf '  --watch SECONDS     repeat probe every SECONDS, until interrupted\n'
       printf '  --from-file PATH    iterate over hosts in file (one per line, # comments)\n'
@@ -930,6 +941,7 @@ XRAY_COVERTHR_BASE_BPS=""   # bytes/sec fetching the neutral baseline
 XRAY_DETECT_STATUS=""       # ok, skipped
 XRAY_DETECT_SCORE=""        # 0-100 (higher = more detectable)
 XRAY_DETECT_BAND=""         # low | moderate | high | critical
+XRAY_VOLUME_THROTTLE_HINT="" # 1/0 — cross-probe: tunnel worked early but degraded after the heavy pull (possible volume-triggered throttling)
 
 # Passive structural signals folded into probe 26's score (set there): the
 # cover SNI served on a non-443 port, and the server IP not on the cover
@@ -4594,6 +4606,44 @@ _score_active() {                # status cover_status nxnote
   esac
 }
 
+# Cross-probe TEMPORAL synthesis (pure, so it's unit-testable). Did the tunnel
+# carry real data EARLY (probe 12 up + a successful data-plane pull in 13/14) but
+# then degrade on EVERY later sustained use (16 egress / 17 stability / 22
+# bufferbloat)? That ordering — fast early, fails after the throughput pull — is
+# the in-region signature of cumulative-VOLUME throttling, and it's the one such
+# effect a single run can hint at, because the tool itself generates the load
+# (probe 14 pulls up to ~50 MB) so there's a natural before/after-load boundary.
+# Requires >=2 independent late degradations (one alone is too FP-prone). HEDGED
+# and never scored: also consistent with transient congestion. Echoes 1 / 0.
+# Args: json_status throughput_status speedtest_status egress_status stability_status bufferbloat_status
+_volume_throttle_suspected() {
+  local js="$1" tp="$2" sp="$3" eg="$4" st="$5" bb="$6" early_ok=0 n=0
+  [ "$js" = "ok" ] || { printf 0; return; }              # tunnel must have worked
+  case "$tp" in ok|throttled-severe|throttled-mild) early_ok=1 ;; esac  # 13 moved data
+  [ "$sp" = "ok" ] && early_ok=1                          # or 14 pulled the big multi-stream
+  [ "$early_ok" = "1" ] || { printf 0; return; }
+  [ "$eg" = "no-data" ] && n=$(( n + 1 ))                 # 16: all egress lookups failed thru tunnel
+  case "$st" in slow|killed|unstable) n=$(( n + 1 )) ;; esac  # 17: pulses degraded
+  [ "$bb" = "no-data" ] && n=$(( n + 1 ))                 # 22: couldn't measure thru tunnel
+  [ "$n" -ge 2 ] && printf 1 || printf 0
+}
+
+# Emits the volume-throttle advisory when the pattern holds. Advisory only — not
+# folded into the detectability score; the cause is unproven, so it points at the
+# disambiguating re-run rather than asserting a block.
+probe_volume_synthesis() {
+  [ "$XRAY_JSON_STATUS" = "ok" ] || return 0
+  XRAY_VOLUME_THROTTLE_HINT=$(_volume_throttle_suspected \
+    "$XRAY_JSON_STATUS" "$XRAY_THROUGHPUT_STATUS" "$XRAY_SPEEDTEST_STATUS" \
+    "$XRAY_EGRESS_STATUS" "$XRAY_STABILITY_STATUS" "$XRAY_BUFFERBLOAT_STATUS")
+  [ "$XRAY_VOLUME_THROTTLE_HINT" = "1" ] || return 0
+  hdr "Cross-probe synthesis (load ordering)"
+  warn "the tunnel carried data early (probes 12-14) but degraded on every later sustained use (egress / stability / bufferbloat) — ordering consistent with VOLUME-triggered throttling (a cumulative byte/time threshold crossed mid-run)"
+  info "this is a HINT, not a verdict — equally consistent with transient congestion or a flaky egress. The tool generates the load itself (probe 14 pulls up to ~50 MB), so the 'after heavy pull' boundary is real, but the cause is not proven"
+  info "disambiguate: re-run with a small pull — XRAY_SPEEDTEST_MAX_BYTES=2097152 and/or --no-speedtest. If the later probes then pass, it's volume-triggered; if they still fail, it's path congestion / server health"
+  add_verdict "Possible volume-triggered throttling: the tunnel worked early (probes 12-14) then degraded on all later sustained use (egress/stability/bufferbloat) — a cumulative-load pattern a single clean vantage usually can't see. UNPROVEN (also consistent with transient congestion); re-run with a small XRAY_SPEEDTEST_MAX_BYTES / --no-speedtest to confirm"
+}
+
 # Probe 26 — detectability score. THE FINAL SYNTHESIS: folds every detection
 # signal — ACTIVE probing (15 cover cert / 20 active-probe / 24 TLS parity) AND
 # PASSIVE structure (cover served on a non-443 port; server IP not on the cover
@@ -5185,6 +5235,7 @@ _emit_json() {
     --arg xd_status         "$XRAY_DETECT_STATUS" \
     --arg xd_score          "$XRAY_DETECT_SCORE" \
     --arg xd_band           "$XRAY_DETECT_BAND" \
+    --arg xd_voltht         "$XRAY_VOLUME_THROTTLE_HINT" \
     --arg xpf_port_std      "$XRAY_PASSIVE_PORT_STD" \
     --arg xpf_asn_match     "$XRAY_PASSIVE_ASN_MATCH" \
     --arg xpf_fp_strong     "$XRAY_PASSIVE_FP_STRONG" \
@@ -5468,6 +5519,7 @@ _emit_json() {
           utls_fp_uncommon: tri_bool(($xpf_utls_rare | tonumber? // -1)),
           tls_in_tls_protected: (($xpf_vision | tonumber? // -1) as $v | if $v == 1 then true elif $v == 0 then false else null end),
           mux_enabled: tri_bool(($xtr_mux | tonumber? // -1)),
+          volume_throttle_suspected: tri_bool(($xd_voltht | tonumber? // -1)),
           deployment_fingerprint: opt($xd_deployfp)
         }
       },
@@ -5685,6 +5737,9 @@ _should_run xrayjson && probe_xray_bufferbloat
 # Detectability is the FINAL synthesis (active probes 15/20/24 + passive
 # port / SNI↔IP signals) — always run it last.
 { _should_run xray || _should_run xrayjson; } && probe_xray_detectability
+# Cross-probe temporal synthesis — runs after the data-plane + sustained-use
+# probes so it can compare early-vs-late tunnel behaviour. Advisory only.
+_should_run xrayjson && probe_volume_synthesis
 
 # ---- cross-reference: drop severe verdicts the rest of the run disproves ----
 # A single early/single-stream probe can fire a SEVERE verdict that later probes

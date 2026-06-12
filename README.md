@@ -944,6 +944,10 @@ Options:
       --censor-sweep[=LIST] Reachability of commonly-censored hosts, direct vs
                           through the tunnel (does the tunnel unblock them?).
                           LIST comma-separated; omit for a built-in set. Opt-in.
+      --full, --thorough  Comprehensive run: enable both opt-in scanners
+                          (--scan-covers + --censor-sweep). Everything else
+                          already runs by default. Explicit on purpose —
+                          --censor-sweep fetches censored sites from THIS machine.
       --skip LIST         Skip the listed probes (comma-separated).
       --watch SECONDS     Repeat probe every SECONDS until interrupted.
       --from-file PATH    Iterate over hosts in file (one per line, # comments).

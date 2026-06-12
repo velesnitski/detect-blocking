@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-06-12
+
+### Added
+
+- **Cross-probe temporal synthesis — a volume-triggered-throttling hint.** A new
+  advisory folds the *ordering* of the tunnel probes: if the tunnel carried data
+  early (probe 12 up + a successful data-plane pull in 13/14) but then degraded on
+  **every** later sustained use (16 egress / 17 stability / 22 bufferbloat), that
+  early-pass/late-fail shape is the in-region signature of **cumulative-volume
+  throttling** — and it's the one such effect a single run can hint at, because
+  the tool itself generates the load (probe 14 pulls up to ~50 MB), creating a
+  natural before/after-load boundary. Requires **≥2** independent late
+  degradations (one alone is too FP-prone). It is **advisory only — never folded
+  into the detectability score** — and explicitly hedged: equally consistent with
+  transient congestion, so it points at the disambiguating re-run
+  (`XRAY_SPEEDTEST_MAX_BYTES=<small>` / `--no-speedtest`) rather than asserting a
+  block. JSON: `probes.xray_detectability.volume_throttle_suspected`. The decision
+  is a pure function (`_volume_throttle_suspected`), unit-tested across the firing
+  pattern and the healthy / dead-tunnel / single-failure / skipped cases
+  (`tests/test_volume_synthesis.sh`).
+- **`--full` / `--thorough` — a comprehensive-run umbrella.** Turns on the two
+  opt-in scanners (`--scan-covers` + `--censor-sweep`) in one flag; everything
+  else already runs by default for a config. It's an **explicit** opt-in by
+  design, not a silent default — `--censor-sweep` actively fetches known-censored
+  sites from the operator's own machine (a risk in a censored region), so that
+  stays the operator's deliberate call. Doesn't clobber an explicit
+  `--scan-covers=LIST` / `--censor-sweep=LIST`, and prints a one-line note that
+  the censored-site sweep is running. `tests/test_full_flag.sh`.
+
 ## [0.20.1] - 2026-06-12
 
 ### Fixed

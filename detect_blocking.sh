@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.21.0"
+readonly DETECT_BLOCKING_VERSION="0.21.1"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -3827,12 +3827,17 @@ probe_xray_active_probe() {
     ''|000) warn "genuine cover site unreachable from here — cannot baseline"; XRAY_ACTIVE_STATUS="no-baseline"; return 0 ;;
   esac
 
-  # Same request, but forced to the VPN server IP with the cover SNI/Host.
+  # Same request, but forced to the VPN server IP:PORT with the cover SNI/Host.
+  # MUST use the server's actual Reality port (VPN_PORT_TCP), not 443 — a server
+  # on a non-standard port (e.g. 56443) isn't listening on 443, so probing 443
+  # would falsely read "no coherent HTTP" and over-score the active-probe tell.
+  # (Probes 15/24 already connect on VPN_PORT_TCP; this aligns probe 20 with them.)
+  # The genuine-cover baseline above stays on the cover's real :443.
   # -k because a (broken) server may present a self-signed cert; we care about
   # whether a coherent HTTP response comes back, not cert validity here.
   XRAY_ACTIVE_RELAY_CODE=$(curl -sS -k --max-time "$TIMEOUT" -o /dev/null \
-    --resolve "$sni:443:$VPN_HOST" \
-    -w '%{http_code}' "https://$sni/" 2>/dev/null)
+    --resolve "$sni:${VPN_PORT_TCP:-443}:$VPN_HOST" \
+    -w '%{http_code}' "https://$sni:${VPN_PORT_TCP:-443}/" 2>/dev/null)
   [ -z "$XRAY_ACTIVE_RELAY_CODE" ] && XRAY_ACTIVE_RELAY_CODE=000
 
   info "cover behaviour: relay-code=${XRAY_ACTIVE_RELAY_CODE}, genuine-code=${XRAY_ACTIVE_REAL_CODE}"
@@ -4869,9 +4874,14 @@ probe_xray_detectability() {
   v_flow=$(_xray_cfg_field flow    '.outbounds[0].settings.vnext[0].users[0].flow')
   [ -z "$v_net" ] && v_net=tcp
   if [ "$v_sec" = "reality" ]; then   # REALITY is VLESS-only → vision applies on raw TCP
-    if [ "$v_flow" = "xtls-rprx-vision" ]; then
-      XRAY_PASSIVE_VISION=1; vis_desc="xtls-rprx-vision present (anti TLS-in-TLS)"
-    else
+    # Match the whole vision FAMILY, not just the bare value: xtls-rprx-vision-udp443
+    # (which additionally lets UDP/443 through) splices/pads the stream against
+    # TLS-in-TLS identically, so an exact "= xtls-rprx-vision" test wrongly reads a
+    # valid -udp443 config as "no vision" and over-scores +15.
+    case "$v_flow" in
+      xtls-rprx-vision|xtls-rprx-vision-udp443)
+        XRAY_PASSIVE_VISION=1; vis_desc="${v_flow} present (anti TLS-in-TLS)" ;;
+      *)
       case "$v_net" in
         tcp|raw)
           # Raw TCP and no vision = a clear, available mitigation left unused.
@@ -4886,7 +4896,8 @@ probe_xray_detectability() {
           XRAY_PASSIVE_VISION=2
           vis_desc="REALITY over ${v_net} — vision N/A on a non-raw transport (tradeoff, not scored)" ;;
       esac
-    fi
+      ;;
+    esac
   fi
   score=$(( score + vis_pts ))
   # mux.cool state (traffic-shape note, not scored): generally unnecessary with

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.1] - 2026-06-15
+
+### Fixed
+
+- **Probe 20 (active-probe) now probes the server's actual port, not 443.** The
+  unauthenticated relay probe hardcoded the port in its `curl --resolve`
+  (`"$sni:443:$VPN_HOST"` + `https://$sni/`), so for a Reality server on a
+  non-standard port (e.g. `:56443`) it connected to `:443` — where the server
+  isn't listening — and read `relay-code=000` → a false "+25, not relaying to the
+  cover," which also inflated the detectability score. It now uses
+  `VPN_PORT_TCP` for both the `--resolve` mapping and the URL, matching probes
+  15/24 (which already connected on the configured port). The genuine-cover
+  baseline still uses the cover's real `:443`. (Reported by an operator running
+  Reality on `:56443`.) Regression guard: `tests/test_active_probe_port.sh`.
+- **Probe 26 now recognises `xtls-rprx-vision-udp443` as a vision flow.** The
+  TLS-in-TLS check matched the flow by exact string (`= "xtls-rprx-vision"`), so
+  the valid `-udp443` variant (same vision splicing, additionally passes UDP/443)
+  read as "no vision" and was wrongly scored `+15 (TLS-in-TLS exposure)`. It now
+  matches the whole vision family. (Same operator's config used the `-udp443`
+  flow, so it was hit by both this and the probe-20 port bug.)
+
 ## [0.21.0] - 2026-06-12
 
 ### Added

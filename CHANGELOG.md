@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-06-15
+
+### Added
+
+- **Probe 6 now actually tests UDP/443 + QUIC reachability** instead of skipping
+  when curl lacks HTTP/3 (the common case on macOS). A dependency-free **QUIC
+  Version-Negotiation probe** (perl UDP — the same soft-dep the IKEv2 probe uses)
+  sends a long-header packet with an unsupported version; an RFC-9000 server must
+  reply with a VN packet, so a reply proves UDP/443 + QUIC are reachable with no
+  crypto. It baselines a **known QUIC host** (`cloudflare-quic.com`, override
+  `XRAY_QUIC_BASELINE`) — so silence means *this network blocks UDP/443*, not "the
+  host has no QUIC" (most sites run QUIC now, so an arbitrary host can't be a
+  no-QUIC control). For a **Hysteria2** config it also probes the server's own UDP
+  port. Verdicts: `net-blocked` (UDP/443 blocked here → Hysteria2 / QUIC covers /
+  `xtls-rprx-vision-udp443` passthrough won't work), `net-ok`, `target-quic`,
+  `net-ok-target-silent` (UDP/443 fine but the target gave no QUIC reply —
+  expected for an obfs'd Hysteria2 or a TCP server). Hedged + single-vantage-aware.
+  curl `--http3` is kept as a fallback baseline where present. JSON:
+  `probes.udp.{quic_baseline, quic_target, quic_verdict}`. The verdict logic is a
+  pure function (`_classify_udp_quic`), unit-tested offline
+  (`tests/test_udp_quic.sh`).
+
 ## [0.21.1] - 2026-06-15
 
 ### Fixed

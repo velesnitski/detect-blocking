@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.21.1"
+readonly DETECT_BLOCKING_VERSION="0.22.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -636,6 +636,7 @@ OPENVPN_PORT_UDP="${OPENVPN_PORT_UDP:-1194}"
 OPENVPN_PORT_TCP="${OPENVPN_PORT_TCP:-1194}"
 
 BASELINE_DOMAIN="${BASELINE_DOMAIN:-cloudflare.com}"
+XRAY_QUIC_BASELINE="${XRAY_QUIC_BASELINE:-cloudflare-quic.com}"   # known QUIC host for the UDP/443 reachability baseline
 BASELINE_IPS="${BASELINE_IPS:-${BASELINE_IP:-1.1.1.1} 8.8.8.8 9.9.9.9}"
 
 FAKE_SNI="${FAKE_SNI:-www.microsoft.com}"
@@ -693,6 +694,9 @@ RST_RC=0
 UDP_IKE500_OK=0
 UDP_IKE4500_OK=0
 UDP_QUIC_CODE=""
+UDP_QUIC_BASELINE=""    # QUIC VN result for the known baseline host (vn/response/silent/error/no-perl)
+UDP_QUIC_TARGET=""      # QUIC VN result for the target (Hysteria2 server); "" when no UDP endpoint to test
+UDP_QUIC_VERDICT=""     # net-blocked / net-ok / target-quic / net-ok-target-silent
 OPENVPN_HANDSHAKE=""     # raw 2-hex-byte response or empty
 CONTROL_PASS=0
 CONTROL_TOTAL=0
@@ -1540,6 +1544,47 @@ _synthesize_xray_json_from_url() {
   printf '%s' "$out"
 }
 
+# QUIC Version-Negotiation reachability probe (dependency-free, perl UDP). Sends a
+# long-header packet with an UNSUPPORTED version; an RFC-9000 server MUST reply
+# with a Version Negotiation packet (version field == 0) — so a reply proves
+# UDP/443 + a QUIC server are reachable, with no QUIC crypto. The 1200-byte pad
+# satisfies QUIC's anti-amplification minimum. Echoes: vn | response | silent |
+# error | no-perl.
+_quic_vn_probe() {              # host port [timeout]
+  check_cmd perl || { printf 'no-perl\n'; return 0; }
+  perl - "$1" "$2" "${3:-2}" 2>/dev/null <<'PERL'
+use strict; use warnings; use IO::Socket::INET; use IO::Select;
+my ($host,$port,$to)=@ARGV; $to||=2;
+my $s=IO::Socket::INET->new(Proto=>'udp',PeerHost=>$host,PeerPort=>$port) or do{print "error\n";exit 0};
+my $dcid=join('',map{chr(int(rand(256)))}1..8);
+my $p=chr(0xC0).pack('N',0x1a2a3a4a).chr(8).$dcid.chr(0); $p.="\x00"x(1200-length($p));
+$s->send($p);
+my $sel=IO::Select->new($s);
+if($sel->can_read($to)){
+  my $r=''; $s->recv($r,2048);
+  if(length($r)>=5){
+    my $b0=ord(substr($r,0,1)); my $v=unpack('N',substr($r,1,4));
+    if(($b0&0x80)&&$v==0){print "vn\n"}else{print "response\n"}
+    exit 0;
+  }
+  print "response\n"; exit 0;
+}
+print "silent\n";
+PERL
+}
+
+# Pure classifier for the QUIC / UDP-443 probe (unit-testable, no network). The
+# baseline is a KNOWN QUIC host's VN result, so its silence = this network blocks
+# UDP/443 (not "the host has no QUIC" — most sites run QUIC now). target = the
+# server's result, or "" when there is no server UDP endpoint to test.
+_classify_udp_quic() {         # baseline target → net-blocked|net-ok|target-quic|net-ok-target-silent
+  local b="$1" t="${2:-}"
+  [ "$b" = "vn" ] || { printf 'net-blocked\n'; return; }
+  [ -n "$t" ] || { printf 'net-ok\n'; return; }
+  [ "$t" = "vn" ] && { printf 'target-quic\n'; return; }
+  printf 'net-ok-target-silent\n'
+}
+
 # Send a minimal-but-valid IKE_SA_INIT initiator header (RFC 7296 §3.1)
 # and wait up to TIMEOUT seconds for any reply. Even an INVALID_SYNTAX
 # notify proves the service is reachable / not silently filtered.
@@ -1989,20 +2034,51 @@ probe_udp_protocols() {
     info "UDP 4500 silent – DPI block, no service, or no perl available"
   fi
 
-  if curl --version 2>/dev/null | grep -qiE 'HTTP3|HTTP/3'; then
+  # QUIC / UDP-443 reachability. Primary path is a dependency-free Version-
+  # Negotiation probe (perl UDP): a long-header packet with an unsupported version
+  # → an RFC-9000 server MUST reply with a VN packet, proving UDP/443 + QUIC reach
+  # with no crypto. The baseline is a KNOWN QUIC host, so silence = this network
+  # blocks UDP/443 (an arbitrary host can't be a "no-QUIC" control — most run it).
+  # A Hysteria2 server is itself a QUIC endpoint → probe it too; a Reality/TCP
+  # server has no UDP listener, so only the network baseline applies there.
+  if check_cmd perl; then
+    local qbase qtarget="" qport=""
+    qbase=$(_quic_vn_probe "$XRAY_QUIC_BASELINE" 443 "$TIMEOUT")
+    if [ -n "${HYSTERIA_DETECTED:-}" ] && [ -n "${VPN_HOST:-}" ] && [ "$VPN_HOST" != "www.example.com" ]; then
+      qport="${VPN_PORT_TCP:-443}"
+      qtarget=$(_quic_vn_probe "$VPN_HOST" "$qport" "$TIMEOUT")
+    fi
+    UDP_QUIC_BASELINE="$qbase"; UDP_QUIC_TARGET="$qtarget"
+    UDP_QUIC_VERDICT=$(_classify_udp_quic "$qbase" "$qtarget")
+    case "$UDP_QUIC_VERDICT" in
+      net-blocked)
+        warn "UDP/443 + QUIC unreachable even to the known baseline (${XRAY_QUIC_BASELINE}: ${qbase}) — UDP/443 looks blocked or throttled in this network"
+        add_verdict "UDP/443 appears blocked in this network — QUIC-based transports (Hysteria2, QUIC covers, and Reality's xtls-rprx-vision-udp443 passthrough) won't work here. Single-vantage: re-test from the target region to confirm it's the network, not a one-off" ;;
+      target-quic)
+        ok "UDP/443 reachable — QUIC baseline replies and the target answers QUIC on ${qport}" ;;
+      net-ok-target-silent)
+        ok "UDP/443 usable here (QUIC baseline replies)"
+        info "target gave no QUIC reply on ${qport} — expected for an obfs'd Hysteria2 (salamander ignores unauth packets) or a TCP server; not a block" ;;
+      net-ok)
+        ok "UDP/443 usable here (QUIC baseline replies) — relevant to QUIC covers and the -udp443 passthrough" ;;
+    esac
+  elif curl --version 2>/dev/null | grep -qiE 'HTTP3|HTTP/3'; then
+    # Fallback: a real HTTP/3 GET (baseline only) when there's no perl but curl
+    # has h3 — rarer, but a stronger positive signal where available.
     local quic_code
-    quic_code=$(curl -sk --max-time "$TIMEOUT" --http3 \
-      -o /dev/null -w '%{http_code}' \
-      "https://$BASELINE_DOMAIN/" 2>/dev/null || echo "000")
+    quic_code=$(curl -sk --max-time "$TIMEOUT" --http3 -o /dev/null -w '%{http_code}' \
+      "https://${XRAY_QUIC_BASELINE}/" 2>/dev/null || echo "000")
     UDP_QUIC_CODE="$quic_code"
     if [ "$quic_code" != "000" ]; then
-      ok "UDP 443 (QUIC/HTTP3) to baseline works"
+      UDP_QUIC_BASELINE="vn"; ok "UDP 443 (QUIC/HTTP3) to baseline works"
     else
+      UDP_QUIC_BASELINE="silent"
       warn "UDP 443 (QUIC) to baseline fails – QUIC may be blocked network-wide"
       add_verdict "UDP 443 / QUIC blocked – common in restrictive networks"
     fi
+    UDP_QUIC_VERDICT=$(_classify_udp_quic "$UDP_QUIC_BASELINE" "")
   else
-    info "curl without HTTP/3 support – skipping QUIC probe"
+    info "no perl and no curl HTTP/3 — skipping QUIC / UDP-443 probe"
   fi
 }
 
@@ -5128,6 +5204,9 @@ _emit_json() {
     --argjson udp_ike500    "${UDP_IKE500_OK:-0}" \
     --argjson udp_ike4500   "${UDP_IKE4500_OK:-0}" \
     --arg udp_quic          "$UDP_QUIC_CODE" \
+    --arg udp_quic_base     "$UDP_QUIC_BASELINE" \
+    --arg udp_quic_target   "$UDP_QUIC_TARGET" \
+    --arg udp_quic_verdict  "$UDP_QUIC_VERDICT" \
     --argjson openvpn_udp   "${OPENVPN_UDP_OK:-0}" \
     --argjson openvpn_tcp   "${OPENVPN_TCP_OK:-0}" \
     --arg openvpn_hs        "$OPENVPN_HANDSHAKE" \
@@ -5318,7 +5397,10 @@ _emit_json() {
         udp: {
           ike500_responsive: bool_int($udp_ike500),
           ike4500_responsive: bool_int($udp_ike4500),
-          quic_baseline_code: opt($udp_quic)
+          quic_baseline_code: opt($udp_quic),
+          quic_baseline: opt($udp_quic_base),
+          quic_target: opt($udp_quic_target),
+          quic_verdict: opt($udp_quic_verdict)
         },
         openvpn: {
           udp_port_accessible: bool_int($openvpn_udp),

@@ -52,7 +52,7 @@ emits a clearly labelled verdict for each detected issue.
 | 3 | TLS handshake | SNI-based DPI (proper SNI dies, no-SNI works); auto-runs **64-byte record-fragmentation probe** when SNI is blocked. For a Reality config it probes the **cover serverName** (not the bare-IP host) and judges the block on that — so Reality's by-design drop of non-matching SNIs isn't misread as DPI |
 | 4 | UA / TLS-fp filtering | User-Agent filtering; **real JA3 via `curl-impersonate`** when installed |
 | 5 | Mid-handshake RST | Active DPI reset (<1s) vs silent drop (full timeout) |
-| 6 | UDP protocols | IKEv2 (valid IKE\_SA\_INIT probe) + QUIC/HTTP3 over UDP 443 |
+| 6 | UDP protocols | IKEv2 (valid IKE\_SA\_INIT probe) + **QUIC / UDP-443 reachability** via a dependency-free Version-Negotiation probe (baselines a known QUIC host → detects wholesale UDP/443 blocking; also probes a Hysteria2 server's own port). curl `--http3` used as a fallback |
 | 7 | OpenVPN handshake | Random-SID `0x38` initiator, expects `0x40` server reset |
 | 8 | Control sites | Broad vs targeted censorship (Tor/Proton/Discord reachability) |
 | 9 | IPv6 reachability | AAAA resolution + IPv6 TCP/HTTPS; detects "IPv4-only block" cases |

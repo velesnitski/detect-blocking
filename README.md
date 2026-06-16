@@ -77,6 +77,7 @@ emits a clearly labelled verdict for each detected issue.
 | — | Cover-SNI scanner (opt-in, `--scan-covers`) | Ranks candidate Reality `dest`/`serverName` covers by **TLSv1.3 + HTTP/2 + CA-valid cert + non-redirect** and names the best — the *pick-a-good-cover* counterpart to probe 26's *your-cover-is-weak*. Standalone (no config/tunnel). The cover-weak verdicts point you to it. (Only probe that reaches third-party sites, hence opt-in.) |
 | — | Censored-URL sweep (opt-in, `--censor-sweep`) | OONI-`web_connectivity`-style: fetches commonly-censored hosts **direct vs through the tunnel** and classifies each (reachable-both / **blocked-direct → tunnel-carries-it** / direct-only → not-carried / blocked-both) — does the tunnel actually unblock what's censored? Direct-only when there's no tunnel. |
 | — | Host exposure (auto with a config) | Does the server answer anything **beyond 443**? Checks giveaway ports (SSH/RDP, proxy-**panel** ports like x-ui/3x-ui). A real CDN edge exposes only 443 — an open panel is both a takeover risk and a loud tell to a scanner profiling the IP. |
+| — | Volume-throttle hint (auto with 12) | Cross-probe **temporal** synthesis: if the tunnel carried data early (12-14) but every later sustained-use probe (egress/stability/bufferbloat) then degraded, flags possible **cumulative-volume throttling** — the one in-region effect a single run can hint at, since probe 14 generates the load. Advisory only (**never scored**), hedged; points at a small-pull re-test (`XRAY_SPEEDTEST_MAX_BYTES` small / `--no-speedtest`) to confirm |
 
 The verdict ends with the detected blocks plus a recommendation for each, each
 **tagged `[server-side]` / `[client-side]` / `[network]`** so you know what to
@@ -998,7 +999,9 @@ Top-level keys: `schema_version`, `version`, `timestamp` (ISO-8601 UTC),
 adds the `xray_*` set (`xray_json`, `xray_egress`, `xray_lint`, `xray_routing`,
 `xray_detectability`, …) — run `--json | jq '.probes | keys'` for the full list.
 Notable fields: `xray_lint.fet_exposed`/`id_uuid`, `xray_routing.dns_leak_risk`/
-`dns_split_horizon`, `xray_detectability.tls_in_tls_protected`/`deployment_fingerprint`.
+`dns_split_horizon`, `xray_detectability.tls_in_tls_protected`/`volume_throttle_suspected`/
+`deployment_fingerprint`, `udp.quic_verdict`/`quic_baseline`, `host_exposure.status`,
+`hysteria.sni_keyword`.
 
 ### Environment variables
 
@@ -1010,7 +1013,8 @@ Notable fields: `xray_lint.fet_exposed`/`id_uuid`, `xray_routing.dns_leak_risk`/
 | `OPENVPN_HOST` | `$VPN_HOST` | Separate OpenVPN host |
 | `OPENVPN_PORT_UDP` / `OPENVPN_PORT_TCP` | `1194` | OpenVPN ports |
 | `BASELINE_IPS` | `1.1.1.1 8.8.8.8 9.9.9.9` | Baseline reachability chain (any one passes) |
-| `BASELINE_DOMAIN` | `cloudflare.com` | Used for QUIC probe |
+| `BASELINE_DOMAIN` | `cloudflare.com` | Reference host for the clock-skew `Date` fetch |
+| `XRAY_QUIC_BASELINE` | `cloudflare-quic.com` | Known QUIC host for the UDP/443 reachability baseline (probe 6) |
 | `FAKE_SNI` | `www.microsoft.com` | Innocent SNI for SNI-DPI test |
 | `CONTROL_SITES` | `www.protonvpn.com www.torproject.org www.discord.com` | Broad-censorship control set |
 | `DOH_URL` | `https://1.1.1.1/dns-query` | DoH endpoint |

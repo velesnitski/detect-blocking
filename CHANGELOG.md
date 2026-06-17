@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.1] - 2026-06-16
+
+### Security
+
+- **Control-char / ANSI-escape sanitization of config-derived values (`_safe`).**
+  Attacker-influenced fields (host, cover SNI) were printed and logged raw — a
+  crafted config with terminal escape sequences could execute them when the output
+  or `--log-file` was viewed (terminal-escape injection). Values are now stripped
+  of control chars (incl. `ESC`) before printing — at the source for `VPN_HOST` and
+  the cover SNI (`_xray_cover_sni`), and in `reveal()`. No-op on legitimate
+  hosts/SNIs.
+- **HTTPS-first IP reputation (MITM resistance).** The geo/ASN/datacenter lookups
+  used plain-HTTP `ip-api`, which the very on-path adversary being profiled can
+  spoof to skew the verdict. `_asn_of` and the cover-popularity check now query an
+  HTTPS source (`ipinfo.io`) first and fall back to `ip-api` (HTTP) only if it
+  fails; the egress probe prints a caveat when geo/flags came over plain HTTP and
+  notes the HTTPS cross-checks (`ipwho.is` / `ipapi.is`). `XRAY_EGRESS_INFO_URL`
+  can be pointed at an HTTPS endpoint to harden further.
+
 ## [0.23.0] - 2026-06-16
 
 ### Security

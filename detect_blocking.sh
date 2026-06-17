@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.23.0"
+readonly DETECT_BLOCKING_VERSION="0.23.1"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -255,6 +255,14 @@ if [ "$JSON_MODE" = "1" ]; then
   check_cmd jq || die "--json requires jq (install: brew install jq / apt-get install jq)"
 fi
 
+# Strip control characters (incl. ESC) from a string before it is printed or
+# logged. Config-derived values — host, SNI, tag — are attacker-influenced; a
+# crafted value with ANSI/terminal escapes would otherwise execute when the
+# output or --log-file is viewed (terminal-escape injection). Defined early so the
+# auto-derive notes below can use it. Legit hosts/SNIs have no control chars, so
+# this is a no-op on real input.
+_safe() { LC_ALL=C printf '%s' "${1-}" | LC_ALL=C tr -d '[:cntrl:]'; }
+
 # Happ deep-link flags (set during normalization below; declared here so they
 # exist under `set -u` regardless of the config type).
 HAPP_ROUTING=""; HAPP_ROUTING_SRC=""; HAPP_CRYPT=""
@@ -327,7 +335,7 @@ if [ -n "$XRAY_CONFIG" ]; then
         case "$_derived_port" in *[!0-9]*) _derived_port="" ;; esac
         unset _auth
         if [ -n "$_derived_host" ]; then
-          VPN_HOST="$_derived_host"
+          _derived_host=$(_safe "$_derived_host"); VPN_HOST="$_derived_host"
           if [ -n "$_derived_port" ] && [ -z "${VPN_PORT_TCP:-}" ]; then
             VPN_PORT_TCP="$_derived_port"
             printf '%s\n' "note: VPN_HOST + VPN_PORT_TCP auto-derived from --xray-config → ${_derived_host}:${_derived_port}" >&2
@@ -407,7 +415,7 @@ if [ -n "$HYSTERIA_DETECTED" ]; then
         _hy_hp=$(grep -iE '^[[:space:]]*server:' "$HYSTERIA_SRC" 2>/dev/null | head -1 \
                  | sed -E 's/.*server:[[:space:]]*//; s/^["'\'']//; s/["'\'']$//; s/[[:space:]]*#.*$//') ;;
     esac
-    _hy_hp=${_hy_hp#*://}; VPN_HOST=${_hy_hp%%:*}; unset _hy_hp
+    _hy_hp=${_hy_hp#*://}; VPN_HOST=$(_safe "${_hy_hp%%:*}"); unset _hy_hp
   fi
   # The Xray probes don't apply — clear the configs so they skip cleanly, and keep
   # the standard suite to the non-misleading probes (TCP/TLS on a UDP/443 server
@@ -511,7 +519,7 @@ if [ -n "${XRAY_JSON_CONFIG:-}" ] && [ -z "${VPN_HOST:-}" ] && [ -r "$XRAY_JSON_
     _derived_port=$(jq -r '.outbounds // [] | map(select(.server != null)) | first | .server_port // empty' "$XRAY_JSON_CONFIG" 2>/dev/null)
   fi
   if [ -n "$_derived_host" ]; then
-    VPN_HOST="$_derived_host"
+    _derived_host=$(_safe "$_derived_host"); VPN_HOST="$_derived_host"
     if [ -n "$_derived_port" ] && [ -z "${VPN_PORT_TCP:-}" ]; then
       VPN_PORT_TCP="$_derived_port"
       printf '%s\n' "note: VPN_HOST + VPN_PORT_TCP auto-derived from --xray-config-json → ${_derived_host}:${_derived_port}" >&2
@@ -1047,7 +1055,7 @@ _rec_side() {
 reveal() {
   [ "${REVEAL:-0}" = "1" ] || return 0
   [ "$LOG_QUIET" = "1" ] && return 0
-  printf "          ${DIM}↳ reveal:${RST} %s\n" "$1"
+  printf "          ${DIM}↳ reveal:${RST} %s\n" "$(_safe "$1")"
 }
 
 # ---------- platform-aware helpers ----------
@@ -2871,17 +2879,18 @@ _xray_cover_sni() {
   if [ -n "$XRAY_CONFIG" ]; then
     case "$XRAY_CONFIG" in
       *security=reality*)
-        printf '%s' "$XRAY_CONFIG" \
-          | sed -nE 's|.*[?&]sni=([^&#]*).*|\1|p' | head -1
+        _safe "$(printf '%s' "$XRAY_CONFIG" | sed -nE 's|.*[?&]sni=([^&#]*).*|\1|p' | head -1)"
         return 0 ;;
     esac
   fi
   if [ -n "$XRAY_JSON_CONFIG" ] && [ -r "$XRAY_JSON_CONFIG" ] && command -v jq >/dev/null 2>&1; then
-    jq -r '
+    # sanitise: the serverName is attacker-influenced and feeds both printed output
+    # (reveal / SNI-quality) and openssl/curl args — strip control chars.
+    _safe "$(jq -r '
       .outbounds // []
       | map(select(.streamSettings.security == "reality"))
       | first | .streamSettings.realitySettings.serverName // empty
-    ' "$XRAY_JSON_CONFIG" 2>/dev/null
+    ' "$XRAY_JSON_CONFIG" 2>/dev/null)"
   fi
 }
 
@@ -3407,6 +3416,9 @@ probe_xray_egress() {
   info "ip-api:  country=${XRAY_EGRESS_COUNTRY:-?}, hosting=${XRAY_EGRESS_HOSTING:-n/a}, proxy=${XRAY_EGRESS_PROXY:-n/a}, mobile=${XRAY_EGRESS_MOBILE:-n/a}"
   info "2nd src: ASN/org looks like a hosting provider = ${XRAY_EGRESS_ASN_HOSTING:-n/a}"
   [ -n "$XRAY_EGRESS_DC" ] && info "3rd src: datacenter/hosting-type ASN = ${XRAY_EGRESS_DC} (fallback — used because ip-api gave no flags)"
+  case "$XRAY_EGRESS_INFO_URL" in
+    http://*) info "note: ip-api geo/flags come over plain HTTP — an on-path adversary (the censor being profiled) can spoof them; cross-check against the HTTPS 2nd/3rd sources, treat as indicative on a hostile network, or set XRAY_EGRESS_INFO_URL to an HTTPS endpoint" ;;
+  esac
 
   # Entry↔egress co-location — a deployment-topology tell. Most providers egress
   # on a DIFFERENT network than the entry; a deployment that exits from the SAME
@@ -4869,7 +4881,10 @@ probe_xray_detectability() {
        && [ -n "${cov_ips:-}" ] && check_cmd curl; then
       local cov_ip1 cov_info cov_dc=""
       cov_ip1=$(printf '%s' "$cov_ips" | _first_word)
-      cov_info=$(curl -sS --max-time "$TIMEOUT" "http://ip-api.com/json/${cov_ip1}?fields=status,hosting,org,isp,as" 2>/dev/null)
+      # HTTPS-first for the cover's org (the CDN-keyword match); ip-api (HTTP) only
+      # as a fallback — see _asn_of on why plaintext reputation is MITM-spoofable.
+      cov_info=$(curl -sS --max-time "$TIMEOUT" "https://ipinfo.io/${cov_ip1}/json" 2>/dev/null)
+      [ -z "$cov_info" ] && cov_info=$(curl -sS --max-time "$TIMEOUT" "http://ip-api.com/json/${cov_ip1}?fields=status,hosting,org,isp,as" 2>/dev/null)
       if printf '%s' "$cov_info" | tr '[:upper:]' '[:lower:]' | grep -qiE 'cloudflare|akamai|fastly|google|amazon|aws|cloudfront|microsoft|azure|apple|edgecast|verizon|limelight|lumen|level ?3|g.?core|bunny|stackpath|cdn77|incapsula|sucuri|netlify|vercel|github'; then
         XRAY_PASSIVE_COVER_OBSCURE=0   # popular CDN/cloud cover — blends, good
       else
@@ -5099,10 +5114,13 @@ probe_xray_detectability() {
 _asn_of() {
   local ip="$1" a=""
   [ -n "$ip" ] || return 0
-  a=$(curl -sS --max-time "$TIMEOUT" "http://ip-api.com/json/${ip}?fields=as" 2>/dev/null \
-      | sed -nE 's/.*"as":"(AS[0-9]+).*/\1/p' | head -1)
-  [ -z "$a" ] && a=$(curl -sS --max-time "$TIMEOUT" "https://ipinfo.io/${ip}/json" 2>/dev/null \
+  # HTTPS-first (MITM-resistant): an on-path adversary — the censor we're profiling —
+  # could spoof a plaintext ip-api response and skew the SNI↔IP ASN comparison.
+  # ip-api (HTTP) stays only as a fallback (its free tier is HTTP-only).
+  a=$(curl -sS --max-time "$TIMEOUT" "https://ipinfo.io/${ip}/json" 2>/dev/null \
       | sed -nE 's/.*"org":[[:space:]]*"(AS[0-9]+).*/\1/p' | head -1)
+  [ -z "$a" ] && a=$(curl -sS --max-time "$TIMEOUT" "http://ip-api.com/json/${ip}?fields=as" 2>/dev/null \
+      | sed -nE 's/.*"as":"(AS[0-9]+).*/\1/p' | head -1)
   printf '%s' "$a"
 }
 

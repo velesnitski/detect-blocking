@@ -1214,6 +1214,10 @@ The CI workflow runs shellcheck plus smoke tests on macOS and Ubuntu.
   for real JA3.
 - UDP IKE probe needs `perl`; missing → that probe is skipped.
 - Some macOS VPN clients hijack DNS in ways that confuse Section 0 detection.
+- IP reputation/geo is queried HTTPS-first (`ipinfo.io`/`ipwho.is`/`ipapi.is`) but
+  falls back to plain-HTTP `ip-api` (its free tier is HTTP-only), which an on-path
+  adversary can spoof — treat reputation as indicative on a hostile network, or set
+  `XRAY_EGRESS_INFO_URL` to an HTTPS endpoint.
 
 ---
 

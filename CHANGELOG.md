@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-06-16
+
+### Security
+
+- **Automated secret scanner + CI gate (`scripts/secret-scan.sh`).** A SecOps
+  pass found that test fixtures had hardcoded *real* values — a live VLESS id and
+  the production Reality cover — and that the pre-commit discipline was a manual,
+  known-strings `grep` that a *new* real credential would slip past. The scanner
+  closes that class: it checks (1) an explicit banned-string list (known fleet
+  infra) **and** (2) generic credential patterns in config context — real UUIDs,
+  43-char Reality public keys, and public server IPs in `"address"`/`@host`
+  position — with obvious placeholders (all-zero UUID, all-`A`/`TEST` keys,
+  RFC1918 / TEST-NET / loopback / DNS-baseline IPs) allowlisted. Wired as a **CI
+  job** (blocks merge) and an opt-in **pre-commit hook** (`scripts/install-hooks.sh`).
+- **Scrubbed the live values from the working tree** — the real VLESS id and the
+  production cover SNI in `tests/test_fet.sh` / `tests/test_routing.sh` (and a
+  CHANGELOG example) are now generic placeholders. (History still contains them;
+  the real remediation for that is server-side credential rotation — a leaked
+  id/cover in a public repo can't be un-published.)
+
 ## [0.22.0] - 2026-06-15
 
 ### Added
@@ -451,7 +471,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider tell). Detected via the **datacenter flag** (ip-api `hosting`, then
   ipapi.is `is_datacenter`/ASN-type) — not just the org name, so it catches small
   hosts an org-keyword list misses. Scored `+10` and named; a CDN-hosted cover
-  (e.g. `example.net`) is not flagged. JSON `xray_detectability.cover_obscure`.
+  (e.g. `www.microsoft.com`) is not flagged. JSON `xray_detectability.cover_obscure`.
 
 ## [0.9.3] - 2026-06-04
 

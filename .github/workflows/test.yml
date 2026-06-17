@@ -22,6 +22,14 @@ jobs:
         with:
           ignore_paths: tests
 
+  secret-scan:
+    name: secret-scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan for leaked credentials / fleet infra (banned strings + generic creds)
+        run: bash scripts/secret-scan.sh
+
   syntax-and-smoke:
     name: syntax + smoke (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

@@ -1303,6 +1303,18 @@ locally, no telemetry, focused on rapid root-cause diagnosis.
 See [CONTRIBUTING.md](CONTRIBUTING.md). All shell code must pass
 `shellcheck -S warning` and `bash -n`, and the test suite must pass.
 
+**Never commit real server data.** Use placeholders in tests and docs — all-zero
+UUIDs, `www.example.com`/`www.microsoft.com` cover SNIs, and TEST-NET
+(`192.0.2.0/24`) or loopback IPs. A secret scanner enforces this: it runs in CI
+(`scripts/secret-scan.sh`) and blocks anything that looks like a real credential
+or fleet infra — a real UUID, a 43-char Reality public key, or a public server IP
+in `"address"`/`@host` position — on top of an explicit banned-string list.
+Install it locally so leaks are caught before they're even committed:
+
+```bash
+./scripts/install-hooks.sh    # adds a pre-commit hook → secret-scan.sh --staged
+```
+
 ## License
 
 [MIT](LICENSE).

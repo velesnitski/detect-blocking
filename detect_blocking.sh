@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.34.0"
+readonly DETECT_BLOCKING_VERSION="0.35.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -3533,7 +3533,7 @@ probe_subscription_walk() {
 
   # Render the row files in index order and tally as we go.
   local rf idx kind remarks server cover detect fp tells band
-  local crit=0 high=0 mod=0 low=0 dead=0 plan_lines=""
+  local crit=0 high=0 mod=0 low=0 dead=0 plan_lines="" fp_counts=""
   for rf in "$SUB_DIR"/[0-9][0-9][0-9].row; do
     [ -f "$rf" ] || continue
     IFS=$'\t' read -r idx kind remarks server cover detect fp tells band < "$rf"
@@ -3543,6 +3543,7 @@ probe_subscription_walk() {
       dead) dead=$((dead+1)) ;;
       scored)
         case "$band" in critical) crit=$((crit+1)) ;; high) high=$((high+1)) ;; moderate) mod=$((mod+1)) ;; low) low=$((low+1)) ;; esac
+        [ "$fp" != "-" ] && fp_counts="${fp_counts}${fp}"$'\n'
         # Accumulate "<base-signal> <node-idx>" pairs (value suffix after ':'
         # stripped, so no-relay:403 / no-relay:noresp group as "no-relay") — drives
         # the signal matrix and the per-fix node lists in the remediation plan.
@@ -3601,6 +3602,26 @@ probe_subscription_walk() {
     printf '%s' "$_planout" | sort -t"$(printf '\t')" -k1,1nr -k2,2n | awk -F"$(printf '\t')" 'NF>=3{n++; printf "%d. %s\n", n, $3}' | while IFS= read -r _l; do
       info "  $_l"
     done
+  fi
+  # Bottom line: a short, COMPUTED synthesis (all grounded in the measured signals) —
+  # how uniform the fleet is, how cheaply a censor identifies it, and what exposure
+  # remains after the #1 fix (so the plan's payoff and its limits are explicit).
+  if [ "$scored" -gt 0 ] && [ -n "$plan_lines" ]; then
+    info "bottom line:"
+    local _distinct _dom _domc _domfp _ccbad _res
+    _distinct=$(printf '%s' "$fp_counts" | grep -v '^$' | sort -u | grep -c .)
+    _dom=$(printf '%s' "$fp_counts" | grep -v '^$' | sort | uniq -c | sort -rn | head -1)
+    _domc=$(printf '%s' "$_dom" | awk '{print $1}'); _domfp=$(printf '%s' "$_dom" | awk '{print $2}')
+    [ -n "$_domfp" ] && info "  · uniformity: ${_distinct} deployment template(s); ${_domfp} covers ${_domc}/${scored} scored nodes — a server-side template fix touches most of the fleet at once"
+    # cover-cert-bad = an active prober is served a cert that isn't the cover's
+    _ccbad=$(printf '%s' "$plan_lines" | awk '$1=="self-signed"||$1=="cover-mismatch"{print $2}' | sort -u | grep -c .)
+    [ "${_ccbad:-0}" -gt 0 ] && info "  · single-probe identifiable: ${_ccbad}/${scored} present a self-signed/mismatched cover cert — one unauthenticated TLS connection to the listener is enough to flag the IP"
+    # residual exposure after the #1 (cover-relay) fix: signals it does NOT clear
+    # (utls-rare / mux are tradeoffs, not scored — excluded from the residual).
+    _res=$(printf '%s' "$plan_lines" | awk '
+      BEGIN{split("self-signed cover-mismatch chain-invalid cn!=sni no-relay tls-parity sni!=ip utls-rare mux",x," "); for(i in x) cl[x[i]]=1}
+      !cl[$1]{n[$1]++} END{for(s in n) print n[s], s}' | sort -rn | awk '{printf "%s(%s) ", $2, $1}')
+    [ -n "$_res" ] && info "  · residual after fix #1 (relay the cover): ${_res}— cleared by fixes #2+"
   fi
   info "deep-test any server (tunnel + throughput + stability) with: --sub-test N"
 }

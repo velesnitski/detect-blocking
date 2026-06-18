@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-06-18
+
+### Added
+
+- **`bottom line` synthesis below the fleet grid** — a short, fully computed
+  summary (every number derived from the measured signals): **uniformity** (how
+  many deployment templates, and the dominant one's coverage — a template fix
+  touches most of the fleet at once), **single-probe identifiability** (how many
+  nodes serve a self-signed/mismatched cover cert, i.e. one unauthenticated TLS
+  connection flags the IP), and **residual exposure after the #1 fix** (the signals
+  relaying the cover does *not* clear — `exposed`, `cover-obscure`, `non443`, … —
+  so the plan's payoff and limits are explicit). uTLS-rare / mux are excluded from
+  the residual (tradeoffs, not scored).
+
 ## [0.34.0] - 2026-06-18
 
 ### Changed

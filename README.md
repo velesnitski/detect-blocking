@@ -529,8 +529,17 @@ no data pull, so a whole fleet is just TLS handshakes, probed **concurrently**
     2. [28 node(s): 0-27] Management/SSH port(s) open on the VPN IP — firewall so only 443 is reachable from outside
     3. [4 node(s): 7,9,16,22] Cover SNI does not resolve or is a low-quality/self-owned domain — use a real, resolvable, popular HTTPS cover the server relays to
     4. [1 node(s): 9] Listener on a non-standard port — move it to 443
+  bottom line:
+    · uniformity: 2 deployment template(s); abcdef01 covers 27/28 scored nodes — a server-side template fix touches most of the fleet at once
+    · single-probe identifiable: 28/28 present a self-signed/mismatched cover cert — one unauthenticated TLS connection to the listener is enough to flag the IP
+    · residual after fix #1 (relay the cover): exposed(28) cover-obscure(27) non443(1) — cleared by fixes #2+
   deep-test any server (tunnel + throughput + stability) with: --sub-test N
 ```
+
+The closing **bottom line** is a short, computed synthesis: how *uniform* the fleet
+is (templates), how *cheaply* a censor identifies it (single-probe), and the
+*residual* exposure left after the #1 fix — so the plan's payoff and its limits are
+explicit. Every number is derived from the measured signals.
 
 The table stays a clean, fixed-width row per server (it never wraps); the per-node
 **signals are a `signal matrix`** — a grid with signals as fixed columns and nodes

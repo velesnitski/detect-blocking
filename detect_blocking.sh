@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.23.1"
+readonly DETECT_BLOCKING_VERSION="0.24.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -117,6 +117,11 @@ LOG_FILE="${LOG_FILE:-}"
 LOG_QUIET="${LOG_QUIET:-0}"
 ONLY_PROBES="${ONLY_PROBES:-}"
 OUTBOUND_TAG="${OUTBOUND_TAG:-}"   # --outbound TAG: narrow a multi-outbound JSON to one server
+SUB_URL="${SUB_URL:-}"             # --subscription URL: fetch a sub (JSON-array / single / base64), inventory it, test one
+SUB_TEST="${SUB_TEST:-0}"          # which config index from the sub to run the full suite on (default 0)
+SUB_UA="${SUB_UA:-Happ/2.6.0}"     # client User-Agent for the sub fetch (many panels gate on it)
+SUB_DIR=""                         # temp dir holding the extracted per-config files (EXIT-cleaned)
+SUB_COUNT=""                       # number of configs found in the sub
 XRAY_ONLY="${XRAY_ONLY:-}"   # 1 = --xray-only (run only the Xray-protocol probes 11-26 + routing/egress)
 SKIP_PROBES="${SKIP_PROBES:-}"
 JSON_MODE="${JSON_MODE:-0}"
@@ -174,6 +179,12 @@ while [ $# -gt 0 ]; do
     --port-survey)    PORT_SURVEY=1; shift ;;
     --xray-config)    XRAY_CONFIG="${2:-}"; shift 2 ;;
     --xray-config=*)  XRAY_CONFIG="${1#--xray-config=}"; shift ;;
+    --subscription|--sub) SUB_URL="${2:-}"; shift 2 ;;
+    --subscription=*)     SUB_URL="${1#--subscription=}"; shift ;;
+    --sub-test)    SUB_TEST="${2:-}"; shift 2 ;;
+    --sub-test=*)  SUB_TEST="${1#--sub-test=}"; shift ;;
+    --sub-ua)      SUB_UA="${2:-}"; shift 2 ;;
+    --sub-ua=*)    SUB_UA="${1#--sub-ua=}"; shift ;;
     --outbound)    OUTBOUND_TAG="${2:-}"; shift 2 ;;
     --outbound=*)  OUTBOUND_TAG="${1#--outbound=}"; shift ;;
     --xray-config-json)    XRAY_JSON_CONFIG="${2:-}"; shift 2 ;;
@@ -226,6 +237,9 @@ while [ $# -gt 0 ]; do
       printf '                      dialerProxy, chained outbounds; needs xray + jq)\n'
       printf '                      also accepts a Hysteria2 client config (YAML or JSON) — runs the\n'
       printf '                      static Hysteria2 analyzer (SNI tell, obfs, QUIC-SNI, UDP/443)\n'
+      printf '  --subscription URL  fetch a subscription (cookie-jar + client UA), decode it (JSON array of\n'
+      printf '                      Xray configs / single config / base64), inventory the fleet, and run the\n'
+      printf '                      full suite on one config (--sub-test N, default 0; --sub-ua to set the UA)\n'
       printf '  --outbound TAG      for a multi-outbound JSON config, narrow to the outbound with this\n'
       printf '                      tag and test that server standalone (routing dropped); without it the\n'
       printf '                      full config is tested and the first proxy outbound feeds the probes\n'
@@ -350,6 +364,49 @@ if [ -n "$XRAY_CONFIG" ]; then
         ;;
     esac
   fi
+fi
+
+# --subscription URL: fetch a sub, decode it, inventory the fleet, and run the full
+# suite on one selected config. Sub panels commonly 302-to-self with a Set-Cookie
+# challenge and gate on the client User-Agent, so we fetch with a cookie jar + a
+# Happ-like UA. The response may be a JSON array of full Xray configs, a single
+# config object, or a base64 blob wrapping either. Each extracted config is written
+# 0600 into a 0700 temp dir (live creds) and EXIT-cleaned. The selected one becomes
+# --xray-config-json so it flows through the normal detection + probe pipeline.
+if [ -n "$SUB_URL" ]; then
+  command -v curl >/dev/null 2>&1 || { printf 'error: --subscription needs curl\n' >&2; exit 1; }
+  command -v jq   >/dev/null 2>&1 || { printf 'error: --subscription needs jq\n' >&2; exit 1; }
+  SUB_DIR=$(mktemp -d -t detect_blocking.sub.XXXXXX) || { printf 'error: could not create a sub temp dir\n' >&2; exit 1; }
+  chmod 700 "$SUB_DIR" 2>/dev/null || true
+  _sub_jar="$SUB_DIR/jar"; _sub_raw="$SUB_DIR/raw"
+  curl -sS -L -c "$_sub_jar" -b "$_sub_jar" --max-time 30 -A "$SUB_UA" -o "$_sub_raw" "$SUB_URL" 2>/dev/null \
+    || { printf 'error: --subscription fetch failed: %s\n' "$SUB_URL" >&2; exit 1; }
+  rm -f "$_sub_jar"
+  _sub_body=$(cat "$_sub_raw" 2>/dev/null); rm -f "$_sub_raw"
+  case "$_sub_body" in
+    \[*|\{*) : ;;                                          # already JSON
+    *) _sub_dec=$(printf '%s' "$_sub_body" | base64 -d 2>/dev/null || printf '%s' "$_sub_body" | base64 -D 2>/dev/null)
+       case "$_sub_dec" in \[*|\{*) _sub_body="$_sub_dec" ;; esac ;;
+  esac
+  if printf '%s' "$_sub_body" | jq -e 'type=="array"' >/dev/null 2>&1; then
+    SUB_COUNT=$(printf '%s' "$_sub_body" | jq 'length' 2>/dev/null)
+    _i=0; while [ "$_i" -lt "${SUB_COUNT:-0}" ]; do
+      printf '%s' "$_sub_body" | jq -c ".[$_i]" > "$SUB_DIR/$(printf '%03d' "$_i").json" 2>/dev/null
+      chmod 600 "$SUB_DIR/$(printf '%03d' "$_i").json" 2>/dev/null || true
+      _i=$((_i+1))
+    done
+  elif printf '%s' "$_sub_body" | jq -e 'type=="object" and (.outbounds!=null)' >/dev/null 2>&1; then
+    SUB_COUNT=1; printf '%s' "$_sub_body" | jq -c '.' > "$SUB_DIR/000.json" 2>/dev/null
+    chmod 600 "$SUB_DIR/000.json" 2>/dev/null || true
+  else
+    printf 'error: --subscription: response is not a JSON array/object of Xray configs (a base64 vless:// list is not walked yet — pass one server to --xray-config)\n' >&2
+    exit 1
+  fi
+  [ "${SUB_COUNT:-0}" -ge 1 ] 2>/dev/null || { printf 'error: --subscription: no configs found in the response\n' >&2; exit 1; }
+  case "$SUB_TEST" in ''|*[!0-9]*) SUB_TEST=0 ;; esac
+  [ "$SUB_TEST" -ge "$SUB_COUNT" ] && SUB_TEST=0
+  XRAY_JSON_CONFIG="$SUB_DIR/$(printf '%03d' "$SUB_TEST").json"
+  printf 'note: --subscription fetched %s config(s); inventory printed below; full suite runs on index %s\n' "$SUB_COUNT" "$SUB_TEST" >&2
 fi
 
 # --xray-config-json accepts a file path, INLINE JSON ('{...}'), or '-' (stdin).
@@ -3226,6 +3283,31 @@ probe_happ_crypt() {
   info "paste the decrypted vless:// (or the plain subscription URL) to test the server"
 }
 
+# Subscription inventory — prints the fleet decoded from --subscription (one line
+# per config: remarks + the first proxy outbound's protocol/security/server/cover),
+# marking the index being deep-tested. Values are run through _safe (a sub is
+# untrusted input). The selected config is tested by the normal probes below.
+probe_subscription_inventory() {
+  { [ -n "${SUB_DIR:-}" ] && [ -d "$SUB_DIR" ]; } || return 0
+  hdr "Subscription inventory (${SUB_COUNT:-?} configs)"
+  local f i=0 line
+  for f in "$SUB_DIR"/[0-9][0-9][0-9].json; do
+    [ -f "$f" ] || continue
+    line=$(jq -r '
+      (.remarks // .name // "?") as $r
+      | ([.outbounds[]? | select(.settings.vnext != null or .settings.servers != null)
+          | "\(.protocol)/\(.streamSettings.security // "none") "
+            + ((.settings.vnext // .settings.servers)[0].address) + ":" + ((.settings.vnext // .settings.servers)[0].port|tostring)
+            + " cover=\(.streamSettings.realitySettings.serverName // "-")"]) as $o
+      | "[\($r)] " + (if ($o|length) > 0 then $o[0] else "(no proxy outbound — e.g. Hysteria/sing-box)" end)
+    ' "$f" 2>/dev/null)
+    line=$(_safe "$line")
+    if [ "$i" = "${SUB_TEST:-0}" ]; then info "→ #${i} ${line}  ◀ tested below"; else info "  #${i} ${line}"; fi
+    i=$((i+1))
+  done
+  info "deep-test another server with: --sub-test N   (N = 0..$(( ${SUB_COUNT:-1} - 1 )))"
+}
+
 # Hysteria2 static config analysis. Hysteria2 is QUIC over UDP/443 — a different
 # stack from Xray/Reality (no cover relay, no TLS-in-TLS), so the Xray probes
 # don't apply and a TCP/TLS probe against it would falsely read "unreachable".
@@ -5733,6 +5815,8 @@ _cleanup() {
   [ -n "$XRAY_INLINE_JSON_PATH" ] && rm -f "$XRAY_INLINE_JSON_PATH" 2>/dev/null
   # --outbound narrowed config holds live credentials too — remove it.
   [ -n "$XRAY_OUTBOUND_PATH" ] && rm -f "$XRAY_OUTBOUND_PATH" 2>/dev/null
+  # --subscription extracted configs hold live creds — remove the whole temp dir.
+  [ -n "$SUB_DIR" ] && rm -rf "$SUB_DIR" 2>/dev/null
   # Routing-probe xray instance (live split-tunnel test) — don't orphan it.
   [ -n "$XRAY_ROUTING_PID" ] && kill "$XRAY_ROUTING_PID" 2>/dev/null
 }
@@ -5803,6 +5887,7 @@ _should_run compare && probe_compare_matrix
 
 # Hysteria2 (QUIC/UDP) static analysis — runs in place of the Xray probes when a
 # Hysteria2 config was detected (which already cleared the Xray config vars).
+[ -n "${SUB_DIR:-}" ] && probe_subscription_inventory
 [ -n "${HYSTERIA_DETECTED:-}" ] && probe_hysteria
 [ -n "${HAPP_ROUTING:-}" ] && probe_happ_routing
 [ -n "${HAPP_CRYPT:-}" ] && probe_happ_crypt

@@ -968,6 +968,12 @@ Options:
                               type/server/route) is detected and reported as
                               such; the Xray-protocol probes are skipped while
                               transport probes still run against its server.
+      --subscription URL  Fetch a subscription (cookie-jar + client UA, so the
+                          common 302-cookie-challenge / UA-gated panels work),
+                          decode it (JSON array of Xray configs / single config /
+                          base64), print a fleet inventory, and run the full suite
+                          on one config. --sub-test N picks which (default 0);
+                          --sub-ua sets the User-Agent (default Happ/2.6.0).
       --json              Emit machine-readable JSON; implies --quiet. Requires jq.
       --reveal            Print the real offending values (cover serverName,
                           flagged SNI, egress IP / org) to the TERMINAL. Off by

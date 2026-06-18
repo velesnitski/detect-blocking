@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-06-18
+
+### Added
+
+- **`--subscription URL` — fetch, decode, inventory, and test a subscription.**
+  Sub panels commonly 302-to-self with a `Set-Cookie` challenge and gate on the
+  client User-Agent, so the fetch uses a **cookie jar + a Happ-like UA**
+  (`--sub-ua` to override). The response is decoded as a **JSON array of full Xray
+  configs** (the "advanced" Happ sub format), a single config object, or a base64
+  blob wrapping either. It prints a **fleet inventory** (one line per config:
+  remarks + the first proxy outbound's protocol/security/server/cover, marking the
+  one under test) and runs the **full suite on a selected config** (`--sub-test N`,
+  default 0) by reusing the normal pipeline. Extracted configs hold live creds, so
+  they're written `0600` into a `0700` temp dir and EXIT-cleaned; inventory values
+  go through the v0.23.1 `_safe` sanitizer (a sub is untrusted input). New
+  `tests/test_subscription.sh` (offline, via a `file://` fixture). A base64
+  `vless://` *list* and a per-server "score the whole fleet" walk are the next step.
+
+
 ## [0.23.1] - 2026-06-16
 
 ### Security

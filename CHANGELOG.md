@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-06-18
+
+### Added
+
+- **Fleet remediation plan** — the single "fleet root cause" line is replaced by a
+  ranked, deduplicated fix list. Many of the per-node tells are *symptoms of one
+  root fix* (self-signed / chain-invalid / cn!=sni / no-relay / tls-parity / sni!=ip
+  all clear when the cover is relayed), so the plan collapses signals into a handful
+  of actionable fixes, annotates each with **how many nodes it clears and which**
+  (range-compressed, e.g. `0-10,12,14,16-27`), and ranks them by impact (ties broken
+  by how fundamental the fix is). A node can appear under several fixes — it needs
+  each. New `_compress_ranges` helper + `tests/test_fleet_plan.sh`.
+
+### Fixed
+
+- The plan's symptom→fix grouping uses `|` as the signal/fix delimiter, not `=` —
+  signal tokens themselves contain `=` (`cn!=sni`, `sni!=ip`), which an `=` split
+  would corrupt.
+
 ## [0.30.0] - 2026-06-18
 
 ### Fixed

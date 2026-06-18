@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.30.0"
+readonly DETECT_BLOCKING_VERSION="0.31.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -3331,6 +3331,18 @@ probe_subscription_inventory() {
 # on a char boundary — exact for Latin/Cyrillic/flag emoji, at most ~1 col off per
 # wide pictograph, and never cuts mid-codepoint. Falls back to byte-pad if perl is
 # absent (ragged, like before, but never corrupt).
+# Collapse a sorted list of integers (one per line on stdin) into compact ranges:
+# "0 1 2 3 5 7 8" → "0-3,5,7-8". Used to render the node lists in the fleet
+# remediation plan without printing 25 individual indices.
+_compress_ranges() {
+  awk '
+    NR==1 { start=$1; prev=$1; next }
+    $1 == prev+1 { prev=$1; next }
+    { out = out sep (start==prev ? start"" : start"-"prev); sep=","; start=$1; prev=$1 }
+    END { if (NR>0) { out = out sep (start==prev ? start"" : start"-"prev); print out } }
+  '
+}
+
 _wpad() {
   local s="${1-}" w="$2"
   if command -v perl >/dev/null 2>&1; then
@@ -3475,7 +3487,7 @@ probe_subscription_walk() {
 
   # Render the row files in index order and tally as we go.
   local rf idx kind remarks server cover detect fp tells band
-  local crit=0 high=0 mod=0 low=0 dead=0 fp_lines="" sig_lines=""
+  local crit=0 high=0 mod=0 low=0 dead=0 fp_lines="" plan_lines=""
   for rf in "$SUB_DIR"/[0-9][0-9][0-9].row; do
     [ -f "$rf" ] || continue
     IFS=$'\t' read -r idx kind remarks server cover detect fp tells band < "$rf"
@@ -3486,11 +3498,12 @@ probe_subscription_walk() {
       scored)
         case "$band" in critical) crit=$((crit+1)) ;; high) high=$((high+1)) ;; moderate) mod=$((mod+1)) ;; low) low=$((low+1)) ;; esac
         [ "$fp" != "-" ] && fp_lines="${fp_lines}${fp} ${band}"$'\n'
-        # Accumulate the BASE signal tokens (value suffix after ':' stripped, so
-        # no-relay:403 and no-relay:noresp group as "no-relay") for the fleet tally.
+        # Accumulate "<base-signal> <node-idx>" pairs (value suffix after ':'
+        # stripped, so no-relay:403 / no-relay:noresp group as "no-relay") — drives
+        # both the shared-signals tally and the per-fix node lists in the plan.
         case "$tells" in
           clean|'?'|'') : ;;
-          *) sig_lines="${sig_lines}$(printf '%s' "$tells" | tr ',' '\n' | sed 's/:.*$//')"$'\n' ;;
+          *) plan_lines="${plan_lines}$(printf '%s' "$tells" | tr ',' '\n' | sed 's/:.*$//' | awk -v ix="$idx" 'NF{print $1, ix}')"$'\n' ;;
         esac ;;
     esac
   done
@@ -3504,32 +3517,39 @@ probe_subscription_walk() {
       [ -n "$fpx" ] && info "  ${cnt}× ${fpx} (${bnd})"
     done
   fi
-  # Fleet root-cause synthesis: tally the fired signals across the scored nodes,
-  # then name the single highest-LEVERAGE fix — the one that, applied to the
-  # shared template, clears the most nodes at once. Priority is by how FUNDAMENTAL
-  # the signal is (a broken cover relay outranks an exposed port), not raw count.
   local scored=$(( crit + high + mod + low ))
-  if [ "$scored" -gt 0 ] && [ -n "$sig_lines" ]; then
+  if [ "$scored" -gt 0 ] && [ -n "$plan_lines" ]; then
+    # Raw signal frequencies across the fleet.
     info "shared signals across ${scored} scored node(s):"
-    printf '%s' "$sig_lines" | grep -v '^$' | sort | uniq -c | sort -rn | while read -r cnt sig; do
+    printf '%s' "$plan_lines" | awk 'NF{print $1}' | sort | uniq -c | sort -rn | while read -r cnt sig; do
       [ -n "$sig" ] && info "  ${cnt}× ${sig}"
     done
-    local pr prsig
-    for pr in \
-      "self-signed|Reality cover is not relayed — the server presents its OWN cert instead of relaying probers to the genuine cover, the #1 active-probe tell. Point Reality dest + serverNames at the real cover host:443 (server-side, fixes the whole template at once)." \
-      "no-relay|Server does not relay an active prober to the genuine cover (no/!=cover response). Set Reality dest + serverNames to the real cover host:443 (server-side)." \
-      "cn!=sni|Presented cert CN != serverName — it isn't the cover's cert. Relay to the genuine cover so its real cert is served (server-side)." \
-      "cover-obscure|Cover SNI is an obscure / self-owned domain — swap it for a popular high-traffic HTTPS site that the server actually relays to." \
-      "sni-kw|A circumvention keyword is in the SNI — change serverName to an innocuous popular domain." \
-      "non443|Server is on a non-standard port — move it to 443." \
-      "vision-off|TLS-in-TLS is not protected — set flow=xtls-rprx-vision so the inner TLS isn't nested-visible." \
-      "exposed|Management/SSH ports are open on the VPN IP — firewall them so only 443 is reachable from outside." ; do
-      prsig="${pr%%|*}"
-      if printf '%s' "$sig_lines" | grep -Fxq "$prsig"; then
-        cnt=$(printf '%s' "$sig_lines" | grep -Fxc "$prsig")
-        info "fleet root cause (${cnt}/${scored} nodes): ${pr#*|}"
-        break
-      fi
+    # Remediation plan: many of those signals are SYMPTOMS of one root fix (e.g.
+    # self-signed / chain-invalid / cn!=sni / no-relay / tls-parity all clear when
+    # the cover is relayed), so we collapse them into a handful of actionable fixes,
+    # each annotated with how many nodes it clears and which (range-compressed), and
+    # ranked by impact. A node can appear under several fixes — it needs each.
+    info "remediation plan (fixes ranked by nodes affected; a node may need several):"
+    # group = "<comma-signals>|<fix text>". The delimiter is '|' (NOT '='), because
+    # signal tokens themselves contain '=' (cn!=sni, sni!=ip).
+    local _g _sigs _fix _idxs _cnt _rng _pri=0 _planout=""
+    for _g in \
+      "self-signed,cover-mismatch,chain-invalid,cn!=sni,no-relay,tls-parity,sni!=ip|Reality cover not relayed / cover-cert invalid — point Reality dest + serverNames at the real cover host:443 (server-side; clears self-signed/chain/cn/no-relay/parity at once)" \
+      "sni-nxdomain,cover-obscure|Cover SNI does not resolve or is a low-quality/self-owned domain — use a real, resolvable, popular HTTPS cover the server actually relays to" \
+      "non443|Listener on a non-standard port — move it to 443" \
+      "exposed|Management/SSH port(s) open on the VPN IP — firewall so only 443 is reachable from outside" \
+      "sni-kw|Circumvention keyword in the SNI — change serverName to an innocuous popular domain" \
+      "vision-off|TLS-in-TLS not protected — set flow=xtls-rprx-vision" ; do
+      _sigs="${_g%%|*}"; _fix="${_g#*|}"; _pri=$((_pri+1))
+      _idxs=$(printf '%s' "$plan_lines" | awk -v want=",${_sigs}," 'NF && index(want, ","$1",")>0 {print $2}' | sort -n | uniq)
+      [ -n "$_idxs" ] || continue
+      _cnt=$(printf '%s\n' "$_idxs" | grep -c .)
+      _rng=$(printf '%s\n' "$_idxs" | _compress_ranges)
+      _planout="${_planout}${_cnt}	${_pri}	[${_cnt} node(s): ${_rng}] ${_fix}"$'\n'
+    done
+    # rank by node count desc, ties broken by how fundamental the fix is (def order)
+    printf '%s' "$_planout" | sort -t"$(printf '\t')" -k1,1nr -k2,2n | awk -F"$(printf '\t')" 'NF>=3{n++; printf "%d. %s\n", n, $3}' | while IFS= read -r _l; do
+      info "  $_l"
     done
   fi
   info "deep-test any server (tunnel + throughput + stability) with: --sub-test N"

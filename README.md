@@ -521,17 +521,21 @@ no data pull, so a whole fleet is just TLS handshakes, probed **concurrently**
     27× abcdef01 (critical)
     1× a1b2c3d4 (high)
   shared signals across 28 scored node(s):
-    27× self-signed   27× no-relay   27× cn!=sni   27× tls-parity   27× sni!=ip   …
-  fleet root cause (27/28 nodes): Reality cover is not relayed — point Reality
-    dest + serverNames at the real cover host:443 (server-side, fixes the template at once).
+    28× cn!=sni   28× exposed   27× self-signed   27× no-relay   …
+  remediation plan (fixes ranked by nodes affected; a node may need several):
+    1. [27 node(s): 0-6,8-27] Reality cover not relayed / cover-cert invalid — point Reality dest + serverNames at the real cover host:443 (server-side; clears self-signed/chain/cn/no-relay/parity at once)
+    2. [28 node(s): 0-27] Management/SSH port(s) open on the VPN IP — firewall so only 443 is reachable from outside
+    3. [4 node(s): 7,9,16,22] Cover SNI does not resolve or is a low-quality/self-owned domain — use a real, resolvable, popular HTTPS cover the server relays to
+    4. [1 node(s): 9] Listener on a non-standard port — move it to 443
   deep-test any server (tunnel + throughput + stability) with: --sub-test N
 ```
 
-The **fleet root-cause line** is the payoff: it tallies the fired signals across
-the whole fleet and names the single highest-leverage fix — the one that, applied
-to the shared deployment template, clears the most nodes at once (a broken cover
-relay outranks an exposed port, so priority is by how fundamental the signal is,
-not raw count).
+The **remediation plan** is the payoff. Most of the per-node tells are *symptoms of
+one root fix* (self-signed / chain-invalid / cn!=sni / no-relay / tls-parity all
+clear when the cover is relayed), so the plan collapses the signals into a handful
+of actionable fixes, tells you **how many nodes each clears and which** (range-
+compressed), and ranks them by impact — a fix-it roadmap instead of 28 rows to
+eyeball. A node can appear under several fixes; it needs each.
 
 - **`tells`** is the compact set of detectability signals that drove each score,
   so you see *why* a node scores what it does — and how the outliers differ —

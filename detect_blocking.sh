@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.29.0"
+readonly DETECT_BLOCKING_VERSION="0.30.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -3324,6 +3324,27 @@ probe_subscription_inventory() {
   info "deep-test another server with: --sub-test N   (N = 0..$(( ${SUB_COUNT:-1} - 1 )))"
 }
 
+# Pad string $1 to $2 DISPLAY columns (trailing spaces), truncating with an
+# ellipsis if longer. printf's '%-Ns' counts BYTES, which mangles the alignment of
+# any column holding CJK / Cyrillic / emoji (each row's byte-vs-display delta
+# differs, so everything after it shifts). perl -CS counts CHARACTERS and truncates
+# on a char boundary — exact for Latin/Cyrillic/flag emoji, at most ~1 col off per
+# wide pictograph, and never cuts mid-codepoint. Falls back to byte-pad if perl is
+# absent (ragged, like before, but never corrupt).
+_wpad() {
+  local s="${1-}" w="$2"
+  if command -v perl >/dev/null 2>&1; then
+    printf '%s' "$s" | perl -CS -e '
+      my $w = shift; local $/; my $x = <STDIN>; $x //= ""; chomp $x;
+      $x = substr($x, 0, $w - 1) . "\x{2026}" if length($x) > $w;
+      my $pad = $w - length($x); $pad = 0 if $pad < 0;
+      print $x, " " x $pad;
+    ' "$w"
+  else
+    printf '%-*s' "$w" "$s"
+  fi
+}
+
 # Pure helper (unit-testable): given a per-server run's JSON blob, emit a single
 # TAB-separated line "score<TAB>band<TAB>fp<TAB>tells". `tells` is a compact,
 # comma-joined list of the dominant detectability signals that drove the score —
@@ -3428,13 +3449,14 @@ EOF
 # 28-server fleet is just TLS handshakes. Deep-test any row with --sub-test N.
 probe_subscription_walk() {
   { [ -n "${SUB_DIR:-}" ] && [ -d "$SUB_DIR" ]; } || return 0
-  # server:port is pad-only (no byte-truncation): a long hostname makes the row a
-  # little ragged, but the port is NEVER cut off (losing it is real data loss).
-  local fmt='          %-3s %-22s %-36s %-16.16s %-13s %-9s %s\n'
+  # remarks is pre-padded to a fixed DISPLAY width via _wpad (multibyte-aware) and
+  # printed with %s; server:port is pad-only so a long hostname stays ragged but the
+  # port is never cut (losing it is real data loss). The other columns are ASCII.
+  local rw=24 fmt='          %-3s %s %-36s %-16.16s %-13s %-9s %s\n'
   hdr "Subscription fleet scan — ${SUB_COUNT} configs (fingerprint-only, no tunnel)"
   info "tells = fired detectability signals (why the score); fp = deployment template — configs sharing an fp are the same server build"
   # shellcheck disable=SC2059
-  printf "$fmt" "#" "remarks" "server:port" "cover" "detect" "fp" "tells"
+  printf "$fmt" "#" "$(_wpad remarks "$rw")" "server:port" "cover" "detect" "fp" "tells"
 
   # Probe the fleet CONCURRENTLY in batches of $jobs (each _walk_one writes its own
   # row file → no shared state, no interleaved output). A 28-node fleet goes from
@@ -3458,7 +3480,7 @@ probe_subscription_walk() {
     [ -f "$rf" ] || continue
     IFS=$'\t' read -r idx kind remarks server cover detect fp tells band < "$rf"
     # shellcheck disable=SC2059
-    printf "$fmt" "$idx" "$remarks" "$server" "$cover" "$detect" "$fp" "$tells"
+    printf "$fmt" "$idx" "$(_wpad "$remarks" "$rw")" "$server" "$cover" "$detect" "$fp" "$tells"
     case "$kind" in
       dead) dead=$((dead+1)) ;;
       scored)

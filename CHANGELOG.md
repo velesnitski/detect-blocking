@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-06-18
+
+### Fixed
+
+- **Fleet table is now aligned when remarks contain Cyrillic / CJK / emoji.** The
+  `remarks` column was padded with `printf '%-Ns'`, which counts **bytes** — so a
+  flag emoji (8 bytes) or Cyrillic name (2 bytes/char) made every row's
+  byte-vs-display delta different and shifted every column after it. A new
+  multibyte-aware `_wpad` helper pads/truncates by **display width** (`perl -CS`,
+  exact for Latin/Cyrillic/flags, ~1 col off per wide pictograph; falls back to the
+  old byte-pad if perl is absent), so `server:port` / `cover` / `detect` / `fp`
+  now line up across all rows. Over-long remarks truncate with an ellipsis.
+  Covered by `tests/test_wpad.sh`.
+
 ## [0.29.0] - 2026-06-18
 
 ### Changed

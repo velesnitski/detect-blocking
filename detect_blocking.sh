@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.25.2"
+readonly DETECT_BLOCKING_VERSION="0.26.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -3319,15 +3319,50 @@ probe_subscription_inventory() {
   info "deep-test another server with: --sub-test N   (N = 0..$(( ${SUB_COUNT:-1} - 1 )))"
 }
 
+# Pure helper (unit-testable): given a per-server run's JSON blob, emit a single
+# TAB-separated line "score<TAB>band<TAB>fp<TAB>tells". `tells` is a compact,
+# comma-joined list of the dominant detectability signals that drove the score —
+# all sourced from DIRECT probes that run under --no-tunnel (15 cover-cert,
+# 20 active-probe, 24 TLS-parity, host-exposure, 26 detectability) — so the fleet
+# table can show WHY each node scores what it does. "clean" = no signal fired.
+_fleet_row_fields() {
+  printf '%s' "${1-}" | jq -r '
+    .probes as $p
+    | (($p // {}).xray_detectability // {}) as $d
+    | [ (($d.score // "?") | tostring),
+        ($d.band // "?"),
+        ((($d.deployment_fingerprint) // "-") | tostring | .[0:8]),
+        ([ (if   $p.xray_cover.status == "fake"        then "self-signed"
+            elif $p.xray_cover.status == "mismatch"    then "cover-mismatch"
+            elif $p.xray_cover.status == "unreachable" then "cover-unreach" else empty end),
+           (if $p.xray_active_probe.matches_cover == false then "no-relay"   else empty end),
+           (if $p.xray_tls_parity.status == "mismatch"     then "tls-parity" else empty end),
+           (if $d.cover_obscure == true              then "cover-obscure" else empty end),
+           (if $d.sni_ip_asn_match == false          then "sni!=ip"       else empty end),
+           (if $d.sni_resolves == false              then "sni-nxdomain"  else empty end),
+           (if $d.port_standard == false             then "non443"        else empty end),
+           (if $d.sni_keyword == true                then "sni-kw"        else empty end),
+           (if $d.tls_in_tls_protected == false      then "vision-off"    else empty end),
+           (if (($p.host_exposure.open_ports // []) | length) > 0
+              then "exposed:" + ((($p.host_exposure.open_ports // []) | length) | tostring) else empty end),
+           (if $d.volume_throttle_suspected == true  then "throttle?"     else empty end)
+         ] | if length == 0 then "clean" else join(",") end) ]
+    | @tsv' 2>/dev/null
+}
+
 # --sub-test all: score EVERY config in the sub with a fast no-tunnel fingerprint
 # pass (self-invoke per config → reuses the whole probe pipeline) and print a fleet
 # detectability table. No xray spawn / no data pull, so a 28-server fleet is just
 # TLS handshakes. Deep-test any row with --sub-test N. Values are _safe-sanitised.
 probe_subscription_walk() {
   { [ -n "${SUB_DIR:-}" ] && [ -d "$SUB_DIR" ]; } || return 0
+  local fmt='          %-3s %-22s %-36.36s %-16.16s %-13s %-9s %s\n'
   hdr "Subscription fleet scan — ${SUB_COUNT} configs (fingerprint-only, no tunnel)"
-  printf '          %-3s %-24s %-38s %-18s %s\n' "#" "remarks" "server:port" "cover" "detect"
-  local f i=0 j score band remarks host port server cover crit=0 high=0 mod=0 low=0 dead=0
+  info "tells = fired detectability signals (why the score); fp = deployment template — configs sharing an fp are the same server build"
+  # shellcheck disable=SC2059
+  printf "$fmt" "#" "remarks" "server:port" "cover" "detect" "fp" "tells"
+  local f i=0 j score band fp tells detect remarks host port server cover
+  local crit=0 high=0 mod=0 low=0 dead=0 fp_lines=""
   for f in "$SUB_DIR"/[0-9][0-9][0-9].json; do
     [ -f "$f" ] || continue
     remarks=$(_safe "$(jq -r '.remarks // .name // "?"' "$f" 2>/dev/null)")
@@ -3335,7 +3370,8 @@ probe_subscription_walk() {
     port=$(_safe "$(jq -r 'first(.outbounds[]? | select(.settings.vnext != null or .settings.servers != null) | (.settings.vnext // .settings.servers)[0].port) // empty' "$f" 2>/dev/null)")
     cover=$(_safe "$(jq -r 'first(.outbounds[]? | .streamSettings.realitySettings.serverName // empty) // "-"' "$f" 2>/dev/null)")
     if [ -z "$host" ]; then
-      printf '          %-3s %-24s %-38.38s %-18.18s %s\n' "$i" "$remarks" "(no vless outbound)" "-" "skip (HY)"
+      # shellcheck disable=SC2059
+      printf "$fmt" "$i" "$remarks" "(no vless outbound)" "-" "skip (HY)" "-" "no Reality fingerprint"
       i=$((i+1)); continue
     fi
     server="${host}:${port}"
@@ -3343,19 +3379,38 @@ probe_subscription_walk() {
     # connect would otherwise hang the OS connect timeout (~75s), not $TIMEOUT.
     if ! _nc_tcp_probe "$host" "$port"; then
       dead=$((dead+1))
-      printf '          %-3s %-24s %-38.38s %-18.18s %s\n' "$i" "$remarks" "$server" "$cover" "unreachable (TCP)"
+      # shellcheck disable=SC2059
+      printf "$fmt" "$i" "$remarks" "$server" "$cover" "unreachable" "-" "TCP refused/filtered"
       i=$((i+1)); continue
     fi
     # Fingerprint only: --only xray,xrayjson skips the transport probes (0-10),
     # --no-tunnel skips the xray-spawning/data probes → just the direct detectability.
     j=$(bash "$0" --xray-config-json "$f" --only xray,xrayjson --no-tunnel --json 2>/dev/null)
-    score=$(printf '%s' "$j" | jq -r '.probes.xray_detectability.score // "?"' 2>/dev/null)
-    band=$(printf '%s'  "$j" | jq -r '.probes.xray_detectability.band  // "?"' 2>/dev/null)
+    # ONE jq pass (the _fleet_row_fields helper) derives score, band, short
+    # deployment-fingerprint, and a compact "tells" string — the dominant signals
+    # that drove the score — so the table shows WHY each node scores what it does
+    # (and how the outliers differ) without a per-server deep dive.
+    IFS=$'\t' read -r score band fp tells <<EOF
+$(_fleet_row_fields "$j")
+EOF
+    score="${score:-?}"; band="${band:-?}"; fp="${fp:--}"; tells="${tells:-?}"
+    detect="${score}/${band}"
     case "$band" in critical) crit=$((crit+1)) ;; high) high=$((high+1)) ;; moderate) mod=$((mod+1)) ;; low) low=$((low+1)) ;; esac
-    printf '          %-3s %-24s %-38.38s %-18.18s %s/%s\n' "$i" "$remarks" "$server" "$cover" "${score:-?}" "${band:-?}"
+    [ "$fp" != "-" ] && fp_lines="${fp_lines}${fp} ${band}"$'\n'
+    # shellcheck disable=SC2059
+    printf "$fmt" "$i" "$remarks" "$server" "$cover" "$detect" "$fp" "$tells"
     i=$((i+1))
   done
   info "fleet detectability: ${crit} critical · ${high} high · ${mod} moderate · ${low} low · ${dead} unreachable (Hysteria entries skipped — no Reality fingerprint)"
+  # Template clusters: group the scored nodes by deployment fingerprint so a fleet
+  # built from one template shows as a single line — and any node that breaks the
+  # mold (a different fp, or the same fp scoring a different band) stands out.
+  if [ -n "$fp_lines" ]; then
+    info "deployment templates (count × fingerprint, band):"
+    printf '%s' "$fp_lines" | sort | uniq -c | sort -rn | while read -r cnt fpx bnd; do
+      [ -n "$fpx" ] && info "  ${cnt}× ${fpx} (${bnd})"
+    done
+  fi
   info "deep-test any server (tunnel + throughput + stability) with: --sub-test N"
 }
 

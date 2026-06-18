@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-06-18
+
+### Added
+
+- **Fleet walk (`--sub-test all`) now explains *why*, not just *how bad*.** Each
+  row gains a **`tells`** column — the compact set of detectability signals that
+  drove that server's score (`self-signed`, `no-relay`, `cover-obscure`,
+  `sni!=ip`, `sni-nxdomain`, `tls-parity`, `non443`, `sni-kw`, `vision-off`,
+  `exposed:N`, `throttle?`, or `clean`) — so you can see at a glance how the
+  lower-scoring outliers differ from the critical mass without deep-testing each.
+  All signals come from the DIRECT probes that already run under `--no-tunnel`
+  (15 cover-cert, 20 active-probe, 24 TLS-parity, host-exposure, 26
+  detectability); the walk just stops throwing them away. No extra network — the
+  same one self-invoke per server, one `jq` pass instead of two.
+- **Deployment-template fingerprint column + cluster summary.** A short **`fp`**
+  column groups servers built from the same template, and a new
+  *"deployment templates (count × fingerprint, band)"* summary at the bottom
+  collapses a uniform fleet to one line — so any node that breaks the mold (a
+  different `fp`, or the same `fp` scoring a different band) stands out
+  immediately. Answers "are these all the same build?" cryptographically.
+- A one-line **legend** above the table documents the `tells` / `fp` columns, and
+  the no-Reality (Hysteria) and unreachable rows now carry an explanatory note in
+  the `tells` column instead of a bare status.
+- Tells/fp/score-band extraction is factored into a pure, unit-tested helper
+  (`_fleet_row_fields`) with a new `tests/test_fleet_tells.sh` covering the
+  signal matrix, the fingerprint prefix, the `clean` case, and safe degradation
+  on a garbage payload.
+
 ## [0.25.2] - 2026-06-18
 
 ### Fixed

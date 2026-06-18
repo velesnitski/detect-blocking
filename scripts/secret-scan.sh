@@ -25,7 +25,10 @@ if [ "${1:-}" = "--staged" ]; then
 elif [ "$#" -gt 0 ]; then
   files=("$@")
 else
-  while IFS= read -r f; do files+=("$f"); done < <(git ls-files 2>/dev/null)
+  # Tracked AND untracked-but-not-ignored: a brand-new file holding a secret is
+  # the highest-risk case, yet `git ls-files` alone (tracked only) would skip it
+  # until it's staged — so the no-arg scan would give a false "clean".
+  while IFS= read -r f; do files+=("$f"); done < <(git ls-files 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
 fi
 [ "${#files[@]}" -eq 0 ] && { echo "secret-scan: nothing to scan"; exit 0; }
 

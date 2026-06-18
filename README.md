@@ -494,6 +494,49 @@ configs. Pass one straight to `--xray-config`:
   key can open it. The tool detects it and asks for the decrypted `vless://` or
   the plain subscription URL instead.
 
+### Subscriptions (`--subscription`)
+
+Point `--subscription` at a subscription URL and the tool fetches it (with a
+cookie jar and a client User-Agent, so the common 302-cookie-challenge and
+UA-gated panels work), decodes it (a JSON array of Xray configs, a single config
+object, or base64), and prints a **fleet inventory**. By default it then runs the
+full suite against one server (`--sub-test N`, default 0). Pass `--sub-test all`
+to score **every** server with a fast no-tunnel fingerprint pass — no xray spawn,
+no data pull, so a whole fleet is just TLS handshakes:
+
+```
+./detect_blocking.sh --subscription 'https://example.com/sub/<token>' --sub-test all
+```
+
+```
+== Subscription fleet scan — 28 configs (fingerprint-only, no tunnel) ==
+  tells = fired detectability signals (why the score); fp = deployment template …
+  #   remarks         server:port                cover              detect       fp        tells
+  0   Auto            edge01.example.net:443     www.microsoft.com  100/critical abcdef01  self-signed,no-relay
+  7   Country B       edge07.example.net:443     news.example.io    70/critical  abcdef01  cover-obscure
+  9   Country C       edge09.example.net:8443    cdn.example.io     60/high      a1b2c3d4  cover-obscure,non443
+  fleet detectability: 27 critical · 1 high · 0 moderate · 0 low · 0 unreachable …
+  deployment templates (count × fingerprint, band):
+    27× abcdef01 (critical)
+    1× a1b2c3d4 (high)
+  deep-test any server (tunnel + throughput + stability) with: --sub-test N
+```
+
+- **`tells`** is the compact set of detectability signals that drove each score,
+  so you see *why* a node scores what it does — and how the outliers differ —
+  without deep-testing each. Tokens: `self-signed` / `cover-mismatch` /
+  `cover-unreach` (Reality cover-cert), `no-relay` (active prober sees a different
+  response than the genuine cover), `tls-parity` (server TLS ≠ cover TLS),
+  `cover-obscure`, `sni!=ip`, `sni-nxdomain`, `non443`, `sni-kw`, `vision-off`
+  (TLS-in-TLS not protected), `exposed:N` (open service ports), `throttle?`.
+  `clean` means nothing fired.
+- **`fp`** is a short **deployment-template fingerprint**. Servers built from the
+  same template share an `fp`; the **template-cluster summary** at the bottom
+  groups the fleet by it, so a fleet built from one build shows as a single line
+  and any node that breaks the mold (different `fp`, or the same `fp` scoring a
+  different band) stands out. The fleet table is fingerprint-only — for the full
+  tunnel + throughput + stability picture on a specific row, run `--sub-test N`.
+
 ### Probe 13 — data-plane throughput (catches cover-SNI shaping)
 
 Probe 12 confirms the Reality / VLESS handshake succeeds, but says nothing
@@ -973,7 +1016,8 @@ Options:
                           decode it (JSON array of Xray configs / single config /
                           base64), print a fleet inventory, and run the full suite
                           on one config. --sub-test N picks which (default 0);
-                          --sub-test all scores EVERY server (fast fleet table);
+                          --sub-test all scores EVERY server (fast fleet table
+                          with per-server `tells` + deployment-template `fp`);
                           --sub-ua sets the User-Agent (default Happ/2.6.0).
       --no-tunnel         Run only the direct fingerprint probes (cover / active-
                           probe / TLS-parity / detectability) — no xray spawn, no

@@ -70,8 +70,14 @@ case "$r_tells" in *id-nonuuid*)        : ;; *) fail "E: tells should include id
 case "$r_tells" in *utls-rare*)         : ;; *) fail "E: tells should include utls-rare (got '$r_tells')" ;; esac
 case "$r_tells" in *exposed:22+80+1more*) : ;; *) fail "E: >2 ports should collapse to +Nmore (got '$r_tells')" ;; esac
 
-# --- F: garbage payload → empty fields (the caller defaults them to ?/-) ---
+# --- F: curl "000" relay code (no HTTP response) renders as "noresp", and a
+#        named uncommon uTLS fp carries its value (utls-rare:qq). ---
+row '{"probes":{"xray_active_probe":{"matches_cover":false,"relay_http_code":"000"},"xray_detectability":{"score":100,"band":"critical","deployment_fingerprint":"abc","utls_fp_uncommon":true,"utls_fp":"qq"}}}'
+case "$r_tells" in *no-relay:noresp*) : ;; *) fail "F: relay code 000 should render as no-relay:noresp (got '$r_tells')" ;; esac
+case "$r_tells" in *utls-rare:qq*)    : ;; *) fail "F: utls-rare should name the fp (got '$r_tells')" ;; esac
+
+# --- G: garbage payload → empty fields (the caller defaults them to ?/-) ---
 row 'not json at all'
-[ -z "$r_score" ] && [ -z "$r_band" ] || fail "F: garbage payload should yield empty fields (got score='$r_score' band='$r_band')"
+[ -z "$r_score" ] && [ -z "$r_band" ] || fail "G: garbage payload should yield empty fields (got score='$r_score' band='$r_band')"
 
 echo "PASS: _fleet_row_fields derives score/band/fp + value-carrying tells; clean + garbage degrade safely"

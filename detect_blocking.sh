@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.27.0"
+readonly DETECT_BLOCKING_VERSION="0.28.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -1032,6 +1032,7 @@ XRAY_PASSIVE_FP_STRONG=""   # 1 / 0 — both passive tells co-occur (the Reality
 XRAY_PASSIVE_SNI_RESOLVES="" # 1 / 0 / "" — cover SNI publicly resolves (a non-resolving SNI is a tell)
 XRAY_PASSIVE_SNI_KEYWORD=""  # 1 / 0 — cover SNI contains a circumvention/antagonistic keyword (cleartext)
 XRAY_PASSIVE_UTLS_RARE=""    # 1 / 0 — uTLS fingerprint is uncommon/regional (distinctive JA3)
+XRAY_PASSIVE_UTLS_FP=""      # the configured uTLS fp string (chrome/qq/random/…) — for JSON/tells
 XRAY_PASSIVE_COVER_OBSCURE="" # 1 / 0 — cover SNI resolves to a hosting/VPS net (self-owned/obscure), not a CDN
 XRAY_PASSIVE_VISION=""       # 1 protected / 0 exposed / "" n/a — VLESS-Reality uses xtls-rprx-vision (anti TLS-in-TLS)
 XRAY_TRANSPORT_MUX=""        # 1 / 0 / "" — mux.cool enabled on the proxy outbound (shape/correlation note vs vision)
@@ -3340,6 +3341,10 @@ _fleet_row_fields() {
          (if $tp.alpn_match    == false then "alpn"   else empty end),
          (if $tp.cipher_match  == false then "cipher" else empty end),
          (if $tp.ext_match     == false then "ext"    else empty end) ] | join("+")) as $pdims
+    # the active prober got this from the server posing as the cover. curl "000"
+    # (or empty) means NO HTTP response at all — show it as "noresp", not a code.
+    | (($ap.relay_http_code // "") | tostring) as $relcode
+    | (if ($relcode == "" or $relcode == "000") then "noresp" else $relcode end) as $reldisp
     | [ (($d.score // "?") | tostring),
         ($d.band // "?"),
         ((($d.deployment_fingerprint) // "-") | tostring | .[0:8]),
@@ -3350,9 +3355,7 @@ _fleet_row_fields() {
             elif $cv.status == "unreachable" then "cover-unreach" else empty end),
            (if $cv.chain_valid == false           then "chain-invalid" else empty end),
            (if $cv.cn_matches_servername == false then "cn!=sni"       else empty end),
-           (if $ap.matches_cover == false
-              then "no-relay" + (if (($ap.relay_http_code // "") | tostring) != "" then ":" + ($ap.relay_http_code | tostring) else "" end)
-              else empty end),
+           (if $ap.matches_cover == false then "no-relay:" + $reldisp else empty end),
            (if $tp.status == "mismatch"
               then "tls-parity" + (if $pdims != "" then ":" + $pdims else "" end)
               else empty end),
@@ -3365,7 +3368,9 @@ _fleet_row_fields() {
            (if $ln.fet_exposed == true          then "fet"           else empty end),
            (if $d.mux_enabled == true           then "mux"           else empty end),
            (if $ln.id_uuid == false             then "id-nonuuid"    else empty end),
-           (if $d.utls_fp_uncommon == true      then "utls-rare"     else empty end),
+           (if $d.utls_fp_uncommon == true
+              then "utls-rare" + (if (($d.utls_fp // "") | tostring) != "" then ":" + ($d.utls_fp | tostring) else "" end)
+              else empty end),
            (if ($ck.skew_seconds != null and ($ck.skew_seconds | fabs) >= 5)
               then "clock:" + ($ck.skew_seconds | tostring) + "s" else empty end),
            (if ($op | length) > 0
@@ -3391,7 +3396,7 @@ probe_subscription_walk() {
   # shellcheck disable=SC2059
   printf "$fmt" "#" "remarks" "server:port" "cover" "detect" "fp" "tells"
   local f i=0 j score band fp tells detect remarks host port server cover
-  local crit=0 high=0 mod=0 low=0 dead=0 fp_lines=""
+  local crit=0 high=0 mod=0 low=0 dead=0 fp_lines="" sig_lines=""
   for f in "$SUB_DIR"/[0-9][0-9][0-9].json; do
     [ -f "$f" ] || continue
     remarks=$(_safe "$(jq -r '.remarks // .name // "?"' "$f" 2>/dev/null)")
@@ -3426,6 +3431,12 @@ EOF
     detect="${score}/${band}"
     case "$band" in critical) crit=$((crit+1)) ;; high) high=$((high+1)) ;; moderate) mod=$((mod+1)) ;; low) low=$((low+1)) ;; esac
     [ "$fp" != "-" ] && fp_lines="${fp_lines}${fp} ${band}"$'\n'
+    # Accumulate the BASE signal tokens (value suffix after ':' stripped, so
+    # no-relay:403 and no-relay:noresp group as "no-relay") for the fleet tally.
+    case "$tells" in
+      clean|'?'|'') : ;;
+      *) sig_lines="${sig_lines}$(printf '%s' "$tells" | tr ',' '\n' | sed 's/:.*$//')"$'\n' ;;
+    esac
     # shellcheck disable=SC2059
     printf "$fmt" "$i" "$remarks" "$server" "$cover" "$detect" "$fp" "$tells"
     i=$((i+1))
@@ -3438,6 +3449,34 @@ EOF
     info "deployment templates (count × fingerprint, band):"
     printf '%s' "$fp_lines" | sort | uniq -c | sort -rn | while read -r cnt fpx bnd; do
       [ -n "$fpx" ] && info "  ${cnt}× ${fpx} (${bnd})"
+    done
+  fi
+  # Fleet root-cause synthesis: tally the fired signals across the scored nodes,
+  # then name the single highest-LEVERAGE fix — the one that, applied to the
+  # shared template, clears the most nodes at once. Priority is by how FUNDAMENTAL
+  # the signal is (a broken cover relay outranks an exposed port), not raw count.
+  local scored=$(( crit + high + mod + low ))
+  if [ "$scored" -gt 0 ] && [ -n "$sig_lines" ]; then
+    info "shared signals across ${scored} scored node(s):"
+    printf '%s' "$sig_lines" | grep -v '^$' | sort | uniq -c | sort -rn | while read -r cnt sig; do
+      [ -n "$sig" ] && info "  ${cnt}× ${sig}"
+    done
+    local pr prsig
+    for pr in \
+      "self-signed|Reality cover is not relayed — the server presents its OWN cert instead of relaying probers to the genuine cover, the #1 active-probe tell. Point Reality dest + serverNames at the real cover host:443 (server-side, fixes the whole template at once)." \
+      "no-relay|Server does not relay an active prober to the genuine cover (no/!=cover response). Set Reality dest + serverNames to the real cover host:443 (server-side)." \
+      "cn!=sni|Presented cert CN != serverName — it isn't the cover's cert. Relay to the genuine cover so its real cert is served (server-side)." \
+      "cover-obscure|Cover SNI is an obscure / self-owned domain — swap it for a popular high-traffic HTTPS site that the server actually relays to." \
+      "sni-kw|A circumvention keyword is in the SNI — change serverName to an innocuous popular domain." \
+      "non443|Server is on a non-standard port — move it to 443." \
+      "vision-off|TLS-in-TLS is not protected — set flow=xtls-rprx-vision so the inner TLS isn't nested-visible." \
+      "exposed|Management/SSH ports are open on the VPN IP — firewall them so only 443 is reachable from outside." ; do
+      prsig="${pr%%|*}"
+      if printf '%s' "$sig_lines" | grep -Fxq "$prsig"; then
+        cnt=$(printf '%s' "$sig_lines" | grep -Fxc "$prsig")
+        info "fleet root cause (${cnt}/${scored} nodes): ${pr#*|}"
+        break
+      fi
     done
   fi
   info "deep-test any server (tunnel + throughput + stability) with: --sub-test N"
@@ -5139,6 +5178,7 @@ probe_xray_detectability() {
   # IDENTIFIES the deployment), but add NO points either way.
   local fp_pts=0 fp_desc utls_fp
   utls_fp=$(_xray_utls_fp)
+  XRAY_PASSIVE_UTLS_FP="$utls_fp"
   case "$utls_fp" in
     qq|360)
       XRAY_PASSIVE_UTLS_RARE=1
@@ -5568,6 +5608,7 @@ _emit_json() {
     --arg xpf_sni_keyword   "$XRAY_PASSIVE_SNI_KEYWORD" \
     --arg xpf_cover_obscure "$XRAY_PASSIVE_COVER_OBSCURE" \
     --arg xpf_utls_rare     "$XRAY_PASSIVE_UTLS_RARE" \
+    --arg xpf_utls_fp       "$XRAY_PASSIVE_UTLS_FP" \
     --arg xpf_vision        "$XRAY_PASSIVE_VISION" \
     --arg xtr_mux           "$XRAY_TRANSPORT_MUX" \
     --arg xd_deployfp       "$XRAY_DEPLOY_FINGERPRINT" \
@@ -5845,6 +5886,7 @@ _emit_json() {
           sni_keyword: tri_bool(($xpf_sni_keyword | tonumber? // -1)),
           cover_obscure: tri_bool(($xpf_cover_obscure | tonumber? // -1)),
           utls_fp_uncommon: tri_bool(($xpf_utls_rare | tonumber? // -1)),
+          utls_fp: opt($xpf_utls_fp),
           tls_in_tls_protected: (($xpf_vision | tonumber? // -1) as $v | if $v == 1 then true elif $v == 0 then false else null end),
           mux_enabled: tri_bool(($xtr_mux | tonumber? // -1)),
           volume_throttle_suspected: tri_bool(($xd_voltht | tonumber? // -1)),

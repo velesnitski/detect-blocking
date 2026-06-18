@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-06-18
+
+### Added
+
+- **Fleet root-cause synthesis.** After the table, `--sub-test all` now tallies
+  the fired signals across all scored nodes (*"shared signals across N nodes:
+  27× self-signed · 27× no-relay · …"*) and names the single highest-**leverage**
+  fix — the one that, applied to the shared template, clears the most nodes at
+  once. Priority is by how fundamental a signal is (a broken cover relay outranks
+  an exposed port), not raw count, so a uniform fleet gets one actionable verdict:
+  *"fleet root cause (27/27 nodes): Reality cover is not relayed — point dest +
+  serverNames at the real cover host:443."*
+- **`no-relay` now carries the prober-facing result**, and curl's `000` (no HTTP
+  response at all — reset/TLS-fail/silence) renders as the readable **`no-relay:noresp`**
+  instead of a cryptic code; real codes stay numeric (`no-relay:403`).
+- **`utls-rare` names the fingerprint** (e.g. **`utls-rare:qq`**) so you can tell
+  a deliberate signature-evading fp (qq/360) from an accidental outlier. The uTLS
+  fp string is now also emitted in JSON (`xray_detectability.utls_fp`).
+
 ## [0.27.0] - 2026-06-18
 
 ### Added

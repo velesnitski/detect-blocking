@@ -511,15 +511,16 @@ no data pull, so a whole fleet is just TLS handshakes, probed **concurrently**
 
 ```
 == Subscription fleet scan — 28 configs (fingerprint-only, no tunnel) ==
-  tells = fired detectability signals (why the score); fp = deployment template …
-  #   remarks         server:port                cover              detect       fp        tells
-  0   Auto            edge01.example.net:443     www.microsoft.com  100/critical abcdef01  self-signed,cn!=sni,no-relay:noresp,tls-parity:alpn+cipher,sni!=ip,utls-rare:qq,exposed:22(SSH)
-  7   Country B       edge07.example.net:443     news.example.io    70/critical  abcdef01  cover-obscure
-  9   Country C       edge09.example.net:8443    cdn.example.io     60/high      a1b2c3d4  cover-obscure,non443
+  fp = deployment template (same fp = same server build); per-node signals are grouped under 'node profiles' below
+  #   remarks         server:port                cover              detect       fp
+  0   Auto            edge01.example.net:443     www.microsoft.com  100/critical abcdef01
+  7   Country B       edge07.example.net:443     news.example.io    70/critical  abcdef01
+  9   Country C       edge09.example.net:8443    cdn.example.io     60/high      a1b2c3d4
   fleet detectability: 27 critical · 1 high · 0 moderate · 0 low · 0 unreachable …
-  deployment templates (count × fingerprint, band):
-    27× abcdef01 (critical)
-    1× a1b2c3d4 (high)
+  node profiles (nodes sharing fingerprint + band + signals), most common first:
+    [0-6,8,10-27] abcdef01 critical: self-signed,chain-invalid,cn!=sni,no-relay:noresp,tls-parity:alpn+cipher,sni!=ip,cover-obscure,utls-rare:qq,exposed:22(SSH)
+    [7] abcdef01 critical: self-signed,chain-invalid,cn!=sni,sni-nxdomain,utls-rare:qq,exposed:22(SSH)
+    [9] a1b2c3d4 high: cover-obscure,non443,exposed:22(SSH)
   shared signals across 28 scored node(s):
     28× cn!=sni   28× exposed   27× self-signed   27× no-relay   …
   remediation plan (fixes ranked by nodes affected; a node may need several):
@@ -530,36 +531,31 @@ no data pull, so a whole fleet is just TLS handshakes, probed **concurrently**
   deep-test any server (tunnel + throughput + stability) with: --sub-test N
 ```
 
-The **remediation plan** is the payoff. Most of the per-node tells are *symptoms of
-one root fix* (self-signed / chain-invalid / cn!=sni / no-relay / tls-parity all
-clear when the cover is relayed), so the plan collapses the signals into a handful
-of actionable fixes, tells you **how many nodes each clears and which** (range-
-compressed), and ranks them by impact — a fix-it roadmap instead of 28 rows to
-eyeball. A node can appear under several fixes; it needs each.
+The table stays a clean, fixed-width row per server (it never wraps); the per-node
+**signals live in `node profiles`**, which groups servers by identical
+*fingerprint + band + signals* so a uniform fleet collapses to a few lines and any
+node that differs stands out — the full signal list is shown once per profile, not
+repeated on every row. The **remediation plan** is the payoff: most signals are
+*symptoms of one root fix* (self-signed / chain-invalid / cn!=sni / no-relay /
+tls-parity all clear when the cover is relayed), so the plan collapses them into a
+handful of fixes, tells you **how many nodes each clears and which** (range-
+compressed), and ranks by impact. A node can appear under several fixes; it needs each.
 
-- **`tells`** is the compact set of detectability signals that drove each score,
-  so you see *why* a node scores what it does — and how the outliers differ —
-  without deep-testing each. Where a signal has a value, the token carries it, so
-  it's actionable at a glance. Tokens:
+- **Signal tokens** (shown in `node profiles`; values carried where they have one):
   - **Cover / active probe:** `self-signed` / `cover-mismatch` / `cover-unreach`
-    (Reality cover-cert), `chain-invalid` (cert chain), `cn!=sni` (cert CN ≠
-    serverName), **`no-relay:CODE`** (the active prober got HTTP `CODE` from the
-    server posing as the cover instead of a relay to the genuine site — e.g.
-    `no-relay:403`; curl's `000` = *no response at all* shows as `no-relay:noresp`),
-    **`tls-parity:DIMS`** (server TLS ≠ cover TLS on `ver`/`alpn`/`cipher`/`ext`).
-  - **Passive fingerprint:** `sni!=ip`, `sni-nxdomain`, `non443`, `sni-kw`
-    (keyword in SNI), `cover-obscure`, `vision-off` (TLS-in-TLS not protected),
-    **`utls-rare:FP`** (uncommon uTLS fp, named — e.g. `utls-rare:qq`, which can be
-    deliberate to evade a signature censor), `mux` (multiplexing on).
-  - **Correctness / exposure:** `fet` (flow/`fragment` exposure), `id-nonuuid`
-    (non-UUID VLESS id), `clock:Ns` (client clock skew ≥ 5s), **`exposed:PORTS`**
-    (the actual open service ports, e.g. `exposed:22+8080`, `+Nmore` past two).
+    (Reality cover-cert), `chain-invalid`, `cn!=sni` (cert CN ≠ serverName),
+    **`no-relay:CODE`** (the active prober got HTTP `CODE` from the server posing as
+    the cover instead of a relay — e.g. `no-relay:403`; curl's `000` = *no response*
+    shows as `no-relay:noresp`), **`tls-parity:DIMS`** (server TLS ≠ cover TLS on
+    `ver`/`alpn`/`cipher`/`ext`).
+  - **Passive fingerprint:** `sni!=ip`, `sni-nxdomain`, `non443`, `sni-kw`,
+    `cover-obscure`, `vision-off` (TLS-in-TLS not protected), **`utls-rare:FP`**
+    (uncommon uTLS fp, named — e.g. `utls-rare:qq`, which can be deliberate), `mux`.
+  - **Correctness / exposure:** `fet`, `id-nonuuid`, `clock:Ns` (clock skew ≥ 5s),
+    **`exposed:PORTS`** (the actual open service ports, e.g. `exposed:22+8080`).
   - `clean` means nothing fired.
-- **`fp`** is a short **deployment-template fingerprint**. Servers built from the
-  same template share an `fp`; the **template-cluster summary** at the bottom
-  groups the fleet by it, so a fleet built from one build shows as a single line
-  and any node that breaks the mold (different `fp`, or the same `fp` scoring a
-  different band) stands out. The fleet table is fingerprint-only — for the full
+- **`fp`** is a short **deployment-template fingerprint**; servers built from the
+  same template share it. The fleet table is fingerprint-only — for the full
   tunnel + throughput + stability picture on a specific row, run `--sub-test N`.
 
 ### Probe 13 — data-plane throughput (catches cover-SNI shaping)

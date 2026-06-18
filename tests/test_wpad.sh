@@ -34,10 +34,10 @@ case "$out" in *"…") : ;; *) fail "truncated string should end with an ellipsi
 efn=$(awk '/^_ep_fit\(\)/,/^}/' "$SCRIPT"); [ -n "$efn" ] || fail "could not extract _ep_fit"
 eval "$efn"
 
-out=$(_ep_fit "test.grey-lance.test-cdn-kkk.com:443" 38)
-[ "$out" = "test.grey-lance.test-cdn-kkk.com:443" ] || fail "endpoint within width passes through (got '$out')"
+out=$(_ep_fit "edge01.region.sub.example.com:443" 38)
+[ "$out" = "edge01.region.sub.example.com:443" ] || fail "endpoint within width passes through (got '$out')"
 
-out=$(_ep_fit "test10.rare-lance.test-cdn-kkk.com:10443" 38)
+out=$(_ep_fit "edge10.long-region.sub.example.com:10443" 38)
 [ "${#out}" -le 38 ]      || fail "over-long endpoint must be capped to the width (got ${#out})"
 case "$out" in *":10443") : ;; *) fail "_ep_fit must keep the port, truncate the host (got '$out')" ;; esac
 case "$out" in *"~:10443") : ;; *) fail "host truncation should be marked with '~' (got '$out')" ;; esac

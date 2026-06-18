@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.32.3"
+readonly DETECT_BLOCKING_VERSION="0.33.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -3482,14 +3482,15 @@ EOF
 # 28-server fleet is just TLS handshakes. Deep-test any row with --sub-test N.
 probe_subscription_walk() {
   { [ -n "${SUB_DIR:-}" ] && [ -d "$SUB_DIR" ]; } || return 0
-  # Every column is a FIXED width so the table stays aligned: remarks via _wpad
-  # (multibyte display-width), server:port via _ep_fit (capped at sw, host truncated
-  # but port kept), cover/detect/fp byte-capped (ASCII). tells is last (free).
-  local rw=24 sw=38 fmt='          %-3s %s %-38s %-16.16s %-13s %-9s %s\n'
+  # Compact, fixed-width table that never wraps: the per-node "tells" are NOT a
+  # column here — they're a ~100-char string that repeats across same-template nodes
+  # and overran the line. They're shown deduplicated under "node profiles" below.
+  # remarks via _wpad (multibyte display-width), server:port via _ep_fit (port kept).
+  local rw=24 sw=38 fmt='          %-3s %s %-38s %-16.16s %-13s %s\n'
   hdr "Subscription fleet scan — ${SUB_COUNT} configs (fingerprint-only, no tunnel)"
-  info "tells = fired detectability signals (why the score); fp = deployment template — configs sharing an fp are the same server build"
+  info "fp = deployment template (same fp = same server build); per-node signals are grouped under 'node profiles' below"
   # shellcheck disable=SC2059
-  printf "$fmt" "#" "$(_wpad remarks "$rw")" "server:port" "cover" "detect" "fp" "tells"
+  printf "$fmt" "#" "$(_wpad remarks "$rw")" "server:port" "cover" "detect" "fp"
 
   # Probe the fleet CONCURRENTLY in batches of $jobs (each _walk_one writes its own
   # row file → no shared state, no interleaved output). A 28-node fleet goes from
@@ -3508,20 +3509,21 @@ probe_subscription_walk() {
 
   # Render the row files in index order and tally as we go.
   local rf idx kind remarks server cover detect fp tells band
-  local crit=0 high=0 mod=0 low=0 dead=0 fp_lines="" plan_lines=""
+  local crit=0 high=0 mod=0 low=0 dead=0 plan_lines="" prof_lines=""
   for rf in "$SUB_DIR"/[0-9][0-9][0-9].row; do
     [ -f "$rf" ] || continue
     IFS=$'\t' read -r idx kind remarks server cover detect fp tells band < "$rf"
     # shellcheck disable=SC2059
-    printf "$fmt" "$idx" "$(_wpad "$remarks" "$rw")" "$(_ep_fit "$server" "$sw")" "$cover" "$detect" "$fp" "$tells"
+    printf "$fmt" "$idx" "$(_wpad "$remarks" "$rw")" "$(_ep_fit "$server" "$sw")" "$cover" "$detect" "$fp"
     case "$kind" in
       dead) dead=$((dead+1)) ;;
       scored)
         case "$band" in critical) crit=$((crit+1)) ;; high) high=$((high+1)) ;; moderate) mod=$((mod+1)) ;; low) low=$((low+1)) ;; esac
-        [ "$fp" != "-" ] && fp_lines="${fp_lines}${fp} ${band}"$'\n'
-        # Accumulate "<base-signal> <node-idx>" pairs (value suffix after ':'
-        # stripped, so no-relay:403 / no-relay:noresp group as "no-relay") — drives
-        # both the shared-signals tally and the per-fix node lists in the plan.
+        # Per-node profile = "fp band: tells" (TAB idx). Identical profiles collapse
+        # into one line in the profiles section — the full signal list shown once.
+        prof_lines="${prof_lines}${fp} ${band}: ${tells}"$'\t'"${idx}"$'\n'
+        # Base signal tokens (value suffix after ':' stripped, so no-relay:403 /
+        # no-relay:noresp group as "no-relay") → shared-signals tally + the plan.
         case "$tells" in
           clean|'?'|'') : ;;
           *) plan_lines="${plan_lines}$(printf '%s' "$tells" | tr ',' '\n' | sed 's/:.*$//' | awk -v ix="$idx" 'NF{print $1, ix}')"$'\n' ;;
@@ -3529,13 +3531,22 @@ probe_subscription_walk() {
     esac
   done
   info "fleet detectability: ${crit} critical · ${high} high · ${mod} moderate · ${low} low · ${dead} unreachable (Hysteria entries skipped — no Reality fingerprint)"
-  # Template clusters: group the scored nodes by deployment fingerprint so a fleet
-  # built from one template shows as a single line — and any node that breaks the
-  # mold (a different fp, or the same fp scoring a different band) stands out.
-  if [ -n "$fp_lines" ]; then
-    info "deployment templates (count × fingerprint, band):"
-    printf '%s' "$fp_lines" | sort | uniq -c | sort -rn | while read -r cnt fpx bnd; do
-      [ -n "$fpx" ] && info "  ${cnt}× ${fpx} (${bnd})"
+  # Node profiles: group scored nodes by IDENTICAL fingerprint + band + signals, so a
+  # uniform fleet collapses to a few lines (and any node that differs stands out) —
+  # the full signal list appears once per profile, never repeated per row. Ranked by
+  # node count. This is where the per-node "tells" now live.
+  if [ -n "$prof_lines" ]; then
+    info "node profiles (nodes sharing fingerprint + band + signals), most common first:"
+    local _prof _pidxs _pcnt _prng _profout=""
+    while IFS= read -r _prof; do
+      [ -n "$_prof" ] || continue
+      _pidxs=$(printf '%s' "$prof_lines" | awk -F'\t' -v p="$_prof" '$1==p{print $2}' | sort -n | uniq)
+      _pcnt=$(printf '%s\n' "$_pidxs" | grep -c .)
+      _prng=$(printf '%s\n' "$_pidxs" | _compress_ranges)
+      _profout="${_profout}${_pcnt}"$'\t'"[${_prng}] ${_prof}"$'\n'
+    done < <(printf '%s' "$prof_lines" | cut -f1 | sort -u)
+    printf '%s' "$_profout" | sort -t"$(printf '\t')" -k1,1nr | awk -F"$(printf '\t')" 'NF>=2{print $2}' | while IFS= read -r _l; do
+      info "  $_l"
     done
   fi
   local scored=$(( crit + high + mod + low ))

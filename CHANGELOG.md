@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-06-18
+
+### Changed
+
+- **Fleet table no longer wraps — per-node `tells` moved out of the table into a
+  deduplicated `node profiles` section.** The `tells` column was a ~100-char string
+  that was *identical across same-template nodes* and overran the line (the table
+  wrapped and repeated the same signals 20+ times). The per-row table is now a
+  compact fixed-width line (`# · remarks · server:port · cover · detect · fp`) that
+  fits any reasonable terminal, and the signals are shown **once per distinct
+  profile** — nodes are grouped by identical *fingerprint + band + signals*, listed
+  with range-compressed node indices, most common first. No information lost; a
+  uniform fleet collapses to a few lines and any node that differs stands out. The
+  old "deployment templates" count section is folded into this (profiles already
+  show the fingerprint per group).
+
 ## [0.32.3] - 2026-06-18
 
 ### Added

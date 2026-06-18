@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-06-18
+
+### Changed
+
+- **The `--sub-test all` fleet walk now probes servers concurrently** (in batches
+  of `--sub-jobs`, default 8) instead of one at a time. A fleet of N servers —
+  each several TLS handshakes — drops from minutes to seconds. Each node writes
+  its own row file (no shared state, no interleaved output); the table is rendered
+  in index order after the batch completes, so the output is byte-identical to the
+  old serial walk. `--sub-jobs 1` forces the old serial behaviour. New
+  `tests/test_subscription.sh` assertion locks parallel == serial.
+
 ## [0.28.0] - 2026-06-18
 
 ### Added

@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.28.0"
+readonly DETECT_BLOCKING_VERSION="0.29.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -123,6 +123,7 @@ SUB_UA="${SUB_UA:-Happ/2.6.0}"     # client User-Agent for the sub fetch (many p
 SUB_DIR=""                         # temp dir holding the extracted per-config files (EXIT-cleaned)
 SUB_COUNT=""                       # number of configs found in the sub
 SUB_WALK=""                        # set when --sub-test all: walk + score every config
+SUB_JOBS="${SUB_JOBS:-8}"          # --sub-test all: concurrent fingerprint probes (1 = serial)
 NO_TUNNEL="${NO_TUNNEL:-}"         # 1 = skip tunnel/data-plane probes, keep direct fingerprint only
 XRAY_ONLY="${XRAY_ONLY:-}"   # 1 = --xray-only (run only the Xray-protocol probes 11-26 + routing/egress)
 SKIP_PROBES="${SKIP_PROBES:-}"
@@ -187,6 +188,8 @@ while [ $# -gt 0 ]; do
     --sub-test=*)  SUB_TEST="${1#--sub-test=}"; shift ;;
     --sub-ua)      SUB_UA="${2:-}"; shift 2 ;;
     --sub-ua=*)    SUB_UA="${1#--sub-ua=}"; shift ;;
+    --sub-jobs)    SUB_JOBS="${2:-}"; shift 2 ;;
+    --sub-jobs=*)  SUB_JOBS="${1#--sub-jobs=}"; shift ;;
     --no-tunnel)   NO_TUNNEL=1; shift ;;
     --outbound)    OUTBOUND_TAG="${2:-}"; shift 2 ;;
     --outbound=*)  OUTBOUND_TAG="${1#--outbound=}"; shift ;;
@@ -243,7 +246,8 @@ while [ $# -gt 0 ]; do
       printf '  --subscription URL  fetch a subscription (cookie-jar + client UA), decode it (JSON array of\n'
       printf '                      Xray configs / single config / base64), inventory the fleet, and run the\n'
       printf '                      full suite on one config (--sub-test N, default 0; --sub-ua to set the UA).\n'
-      printf '                      --sub-test all → score EVERY server (fast fingerprint-only fleet table)\n'
+      printf '                      --sub-test all → score EVERY server (fast fingerprint-only fleet table,\n'
+      printf '                      probed concurrently; --sub-jobs N sets the batch size, default 8, 1=serial)\n'
       printf '  --no-tunnel         skip tunnel/data-plane probes (no xray spawn, no throughput); run only the\n'
       printf '                      direct fingerprint probes (cover/active-probe/TLS-parity/detectability)\n'
       printf '  --outbound TAG      for a multi-outbound JSON config, narrow to the outbound with this\n'
@@ -3382,10 +3386,46 @@ _fleet_row_fields() {
     | @tsv' 2>/dev/null
 }
 
+# One fleet node: parse its endpoint, do a bounded TCP precheck, then (if up) a
+# no-tunnel fingerprint self-invoke → write ONE tab-separated row file into SUB_DIR
+# (idx, kind, remarks, server, cover, detect, fp, tells, band). Runs as a background
+# job so a whole fleet probes concurrently; the parent renders the rows in order.
+# All attacker-influenced values are _safe-sanitised before they reach the row.
+_walk_one() {
+  local f="$1" pad idx remarks host port cover server j score band fp tells detect kind
+  pad=$(basename "$f" .json); idx=$((10#$pad))
+  remarks=$(_safe "$(jq -r '.remarks // .name // "?"' "$f" 2>/dev/null)")
+  host=$(_safe "$(jq -r 'first(.outbounds[]? | select(.settings.vnext != null or .settings.servers != null) | (.settings.vnext // .settings.servers)[0].address) // empty' "$f" 2>/dev/null)")
+  port=$(_safe "$(jq -r 'first(.outbounds[]? | select(.settings.vnext != null or .settings.servers != null) | (.settings.vnext // .settings.servers)[0].port) // empty' "$f" 2>/dev/null)")
+  cover=$(_safe "$(jq -r 'first(.outbounds[]? | .streamSettings.realitySettings.serverName // empty) // "-"' "$f" 2>/dev/null)")
+  if [ -z "$host" ]; then
+    kind=skip; server="(no vless outbound)"; cover="-"; detect="skip (HY)"; fp="-"; tells="no Reality fingerprint"; band=""
+  else
+    server="${host}:${port}"
+    # Bounded TCP precheck (nc -G/-w $TIMEOUT) — a dead server's openssl connect
+    # would otherwise hang the OS connect timeout (~75s), not $TIMEOUT.
+    if ! _nc_tcp_probe "$host" "$port"; then
+      kind=dead; detect="unreachable"; fp="-"; tells="TCP refused/filtered"; band=""
+    else
+      # --only xray,xrayjson skips transport probes (0-10); --no-tunnel skips the
+      # xray-spawning/data probes → just the direct fingerprint.
+      j=$(bash "$0" --xray-config-json "$f" --only xray,xrayjson --no-tunnel --json 2>/dev/null)
+      IFS=$'\t' read -r score band fp tells <<EOF
+$(_fleet_row_fields "$j")
+EOF
+      score="${score:-?}"; band="${band:-?}"; fp="${fp:--}"; tells="${tells:-?}"
+      detect="${score}/${band}"; kind=scored
+    fi
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$idx" "$kind" "$remarks" "$server" "$cover" "$detect" "$fp" "$tells" "$band" > "$SUB_DIR/$pad.row"
+}
+
 # --sub-test all: score EVERY config in the sub with a fast no-tunnel fingerprint
-# pass (self-invoke per config → reuses the whole probe pipeline) and print a fleet
-# detectability table. No xray spawn / no data pull, so a 28-server fleet is just
-# TLS handshakes. Deep-test any row with --sub-test N. Values are _safe-sanitised.
+# pass (one _walk_one self-invoke per config → reuses the whole probe pipeline),
+# run CONCURRENTLY in batches of --sub-jobs (default 8), and print a fleet
+# detectability table + root-cause synthesis. No xray spawn / no data pull, so a
+# 28-server fleet is just TLS handshakes. Deep-test any row with --sub-test N.
 probe_subscription_walk() {
   { [ -n "${SUB_DIR:-}" ] && [ -d "$SUB_DIR" ]; } || return 0
   # server:port is pad-only (no byte-truncation): a long hostname makes the row a
@@ -3395,51 +3435,42 @@ probe_subscription_walk() {
   info "tells = fired detectability signals (why the score); fp = deployment template — configs sharing an fp are the same server build"
   # shellcheck disable=SC2059
   printf "$fmt" "#" "remarks" "server:port" "cover" "detect" "fp" "tells"
-  local f i=0 j score band fp tells detect remarks host port server cover
-  local crit=0 high=0 mod=0 low=0 dead=0 fp_lines="" sig_lines=""
+
+  # Probe the fleet CONCURRENTLY in batches of $jobs (each _walk_one writes its own
+  # row file → no shared state, no interleaved output). A 28-node fleet goes from
+  # minutes to seconds; --sub-jobs 1 forces serial.
+  local jobs="${SUB_JOBS:-8}"
+  case "$jobs" in ''|*[!0-9]*) jobs=8 ;; esac
+  [ "$jobs" -ge 1 ] || jobs=8
+  local f running=0
   for f in "$SUB_DIR"/[0-9][0-9][0-9].json; do
     [ -f "$f" ] || continue
-    remarks=$(_safe "$(jq -r '.remarks // .name // "?"' "$f" 2>/dev/null)")
-    host=$(_safe "$(jq -r 'first(.outbounds[]? | select(.settings.vnext != null or .settings.servers != null) | (.settings.vnext // .settings.servers)[0].address) // empty' "$f" 2>/dev/null)")
-    port=$(_safe "$(jq -r 'first(.outbounds[]? | select(.settings.vnext != null or .settings.servers != null) | (.settings.vnext // .settings.servers)[0].port) // empty' "$f" 2>/dev/null)")
-    cover=$(_safe "$(jq -r 'first(.outbounds[]? | .streamSettings.realitySettings.serverName // empty) // "-"' "$f" 2>/dev/null)")
-    if [ -z "$host" ]; then
-      # shellcheck disable=SC2059
-      printf "$fmt" "$i" "$remarks" "(no vless outbound)" "-" "skip (HY)" "-" "no Reality fingerprint"
-      i=$((i+1)); continue
-    fi
-    server="${host}:${port}"
-    # Bounded TCP precheck first (nc -G/-w $TIMEOUT) — a dead server's openssl
-    # connect would otherwise hang the OS connect timeout (~75s), not $TIMEOUT.
-    if ! _nc_tcp_probe "$host" "$port"; then
-      dead=$((dead+1))
-      # shellcheck disable=SC2059
-      printf "$fmt" "$i" "$remarks" "$server" "$cover" "unreachable" "-" "TCP refused/filtered"
-      i=$((i+1)); continue
-    fi
-    # Fingerprint only: --only xray,xrayjson skips the transport probes (0-10),
-    # --no-tunnel skips the xray-spawning/data probes → just the direct detectability.
-    j=$(bash "$0" --xray-config-json "$f" --only xray,xrayjson --no-tunnel --json 2>/dev/null)
-    # ONE jq pass (the _fleet_row_fields helper) derives score, band, short
-    # deployment-fingerprint, and a compact "tells" string — the dominant signals
-    # that drove the score — so the table shows WHY each node scores what it does
-    # (and how the outliers differ) without a per-server deep dive.
-    IFS=$'\t' read -r score band fp tells <<EOF
-$(_fleet_row_fields "$j")
-EOF
-    score="${score:-?}"; band="${band:-?}"; fp="${fp:--}"; tells="${tells:-?}"
-    detect="${score}/${band}"
-    case "$band" in critical) crit=$((crit+1)) ;; high) high=$((high+1)) ;; moderate) mod=$((mod+1)) ;; low) low=$((low+1)) ;; esac
-    [ "$fp" != "-" ] && fp_lines="${fp_lines}${fp} ${band}"$'\n'
-    # Accumulate the BASE signal tokens (value suffix after ':' stripped, so
-    # no-relay:403 and no-relay:noresp group as "no-relay") for the fleet tally.
-    case "$tells" in
-      clean|'?'|'') : ;;
-      *) sig_lines="${sig_lines}$(printf '%s' "$tells" | tr ',' '\n' | sed 's/:.*$//')"$'\n' ;;
-    esac
+    _walk_one "$f" &
+    running=$((running+1))
+    if [ "$running" -ge "$jobs" ]; then wait; running=0; fi
+  done
+  wait
+
+  # Render the row files in index order and tally as we go.
+  local rf idx kind remarks server cover detect fp tells band
+  local crit=0 high=0 mod=0 low=0 dead=0 fp_lines="" sig_lines=""
+  for rf in "$SUB_DIR"/[0-9][0-9][0-9].row; do
+    [ -f "$rf" ] || continue
+    IFS=$'\t' read -r idx kind remarks server cover detect fp tells band < "$rf"
     # shellcheck disable=SC2059
-    printf "$fmt" "$i" "$remarks" "$server" "$cover" "$detect" "$fp" "$tells"
-    i=$((i+1))
+    printf "$fmt" "$idx" "$remarks" "$server" "$cover" "$detect" "$fp" "$tells"
+    case "$kind" in
+      dead) dead=$((dead+1)) ;;
+      scored)
+        case "$band" in critical) crit=$((crit+1)) ;; high) high=$((high+1)) ;; moderate) mod=$((mod+1)) ;; low) low=$((low+1)) ;; esac
+        [ "$fp" != "-" ] && fp_lines="${fp_lines}${fp} ${band}"$'\n'
+        # Accumulate the BASE signal tokens (value suffix after ':' stripped, so
+        # no-relay:403 and no-relay:noresp group as "no-relay") for the fleet tally.
+        case "$tells" in
+          clean|'?'|'') : ;;
+          *) sig_lines="${sig_lines}$(printf '%s' "$tells" | tr ',' '\n' | sed 's/:.*$//')"$'\n' ;;
+        esac ;;
+    esac
   done
   info "fleet detectability: ${crit} critical · ${high} high · ${mod} moderate · ${low} low · ${dead} unreachable (Hysteria entries skipped — no Reality fingerprint)"
   # Template clusters: group the scored nodes by deployment fingerprint so a fleet

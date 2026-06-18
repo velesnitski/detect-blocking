@@ -502,7 +502,8 @@ UA-gated panels work), decodes it (a JSON array of Xray configs, a single config
 object, or base64), and prints a **fleet inventory**. By default it then runs the
 full suite against one server (`--sub-test N`, default 0). Pass `--sub-test all`
 to score **every** server with a fast no-tunnel fingerprint pass — no xray spawn,
-no data pull, so a whole fleet is just TLS handshakes:
+no data pull, so a whole fleet is just TLS handshakes, probed **concurrently**
+(in batches of `--sub-jobs`, default 8; `--sub-jobs 1` forces serial):
 
 ```
 ./detect_blocking.sh --subscription 'https://example.com/sub/<token>' --sub-test all

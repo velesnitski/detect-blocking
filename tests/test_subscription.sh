@@ -59,4 +59,10 @@ printf '%s' "$out" | grep -q 'fleet detectability:'    || fail "fleet walk shoul
 printf '%s' "$out" | grep -q 'Alpha'                   || fail "fleet table should list each config"
 printf '%s' "$out" | grep -qiE 'no vless outbound|skip' || fail "the no-proxy (Hysteria-like) config should be marked skipped"
 
-echo "PASS: --subscription decodes/inventories/selects; --no-tunnel keeps fingerprint only; --sub-test all walks the fleet"
+# --- the concurrent walk must produce the SAME ordered rows as the serial walk ---
+rows_par=$(TIMEOUT=2 bash "$SCRIPT" --subscription "file://$tmp/arr.json" --sub-test all 2>&1 | grep -E '^[[:space:]]+[0-9]+ ')
+rows_ser=$(TIMEOUT=2 bash "$SCRIPT" --subscription "file://$tmp/arr.json" --sub-test all --sub-jobs 1 2>&1 | grep -E '^[[:space:]]+[0-9]+ ')
+[ -n "$rows_par" ] || fail "parallel walk produced no data rows"
+[ "$rows_par" = "$rows_ser" ] || fail "parallel (--sub-jobs 8) and serial (--sub-jobs 1) walks must render identically"
+
+echo "PASS: --subscription decodes/inventories/selects; --no-tunnel keeps fingerprint only; --sub-test all walks the fleet (parallel == serial)"

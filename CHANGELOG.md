@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-06-18
+
+### Added
+
+- **`--subscription … --sub-test all` — score the whole fleet at once.** v0.24.0
+  inventoried every config but deep-tested only one; now `--sub-test all` walks
+  **every** config and prints a fleet **detectability table** (idx · remarks ·
+  server:port · cover · score/band) plus a summary (N critical/high/moderate/low).
+  It uses the new `--no-tunnel` mode per server, so a 28-server fleet is just TLS
+  handshakes — no `xray` spawn, no throughput/stability pulls — and won't hammer
+  prod. Hysteria/no-proxy entries are marked skipped. Deep-test any row with
+  `--sub-test N`.
+- **`--no-tunnel`** — run only the **direct fingerprint** probes (cover-cert,
+  active-probe, TLS-parity, detectability, lint, clock, MTU, host-exposure),
+  skipping every probe that spawns `xray-core` or moves data (11/12/13/14/16/17/
+  21/routing/22/25/volume). A fast detectability read for any single config too.
+
+
 ## [0.24.0] - 2026-06-18
 
 ### Added

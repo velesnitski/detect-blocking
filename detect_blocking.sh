@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.24.0"
+readonly DETECT_BLOCKING_VERSION="0.25.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -122,6 +122,8 @@ SUB_TEST="${SUB_TEST:-0}"          # which config index from the sub to run the 
 SUB_UA="${SUB_UA:-Happ/2.6.0}"     # client User-Agent for the sub fetch (many panels gate on it)
 SUB_DIR=""                         # temp dir holding the extracted per-config files (EXIT-cleaned)
 SUB_COUNT=""                       # number of configs found in the sub
+SUB_WALK=""                        # set when --sub-test all: walk + score every config
+NO_TUNNEL="${NO_TUNNEL:-}"         # 1 = skip tunnel/data-plane probes, keep direct fingerprint only
 XRAY_ONLY="${XRAY_ONLY:-}"   # 1 = --xray-only (run only the Xray-protocol probes 11-26 + routing/egress)
 SKIP_PROBES="${SKIP_PROBES:-}"
 JSON_MODE="${JSON_MODE:-0}"
@@ -185,6 +187,7 @@ while [ $# -gt 0 ]; do
     --sub-test=*)  SUB_TEST="${1#--sub-test=}"; shift ;;
     --sub-ua)      SUB_UA="${2:-}"; shift 2 ;;
     --sub-ua=*)    SUB_UA="${1#--sub-ua=}"; shift ;;
+    --no-tunnel)   NO_TUNNEL=1; shift ;;
     --outbound)    OUTBOUND_TAG="${2:-}"; shift 2 ;;
     --outbound=*)  OUTBOUND_TAG="${1#--outbound=}"; shift ;;
     --xray-config-json)    XRAY_JSON_CONFIG="${2:-}"; shift 2 ;;
@@ -239,7 +242,10 @@ while [ $# -gt 0 ]; do
       printf '                      static Hysteria2 analyzer (SNI tell, obfs, QUIC-SNI, UDP/443)\n'
       printf '  --subscription URL  fetch a subscription (cookie-jar + client UA), decode it (JSON array of\n'
       printf '                      Xray configs / single config / base64), inventory the fleet, and run the\n'
-      printf '                      full suite on one config (--sub-test N, default 0; --sub-ua to set the UA)\n'
+      printf '                      full suite on one config (--sub-test N, default 0; --sub-ua to set the UA).\n'
+      printf '                      --sub-test all → score EVERY server (fast fingerprint-only fleet table)\n'
+      printf '  --no-tunnel         skip tunnel/data-plane probes (no xray spawn, no throughput); run only the\n'
+      printf '                      direct fingerprint probes (cover/active-probe/TLS-parity/detectability)\n'
       printf '  --outbound TAG      for a multi-outbound JSON config, narrow to the outbound with this\n'
       printf '                      tag and test that server standalone (routing dropped); without it the\n'
       printf '                      full config is tested and the first proxy outbound feeds the probes\n'
@@ -403,10 +409,15 @@ if [ -n "$SUB_URL" ]; then
     exit 1
   fi
   [ "${SUB_COUNT:-0}" -ge 1 ] 2>/dev/null || { printf 'error: --subscription: no configs found in the response\n' >&2; exit 1; }
-  case "$SUB_TEST" in ''|*[!0-9]*) SUB_TEST=0 ;; esac
-  [ "$SUB_TEST" -ge "$SUB_COUNT" ] && SUB_TEST=0
-  XRAY_JSON_CONFIG="$SUB_DIR/$(printf '%03d' "$SUB_TEST").json"
-  printf 'note: --subscription fetched %s config(s); inventory printed below; full suite runs on index %s\n' "$SUB_COUNT" "$SUB_TEST" >&2
+  if [ "$SUB_TEST" = "all" ]; then
+    SUB_WALK=1
+    printf 'note: --subscription fetched %s config(s); scoring ALL (fingerprint-only fleet walk, no tunnel)\n' "$SUB_COUNT" >&2
+  else
+    case "$SUB_TEST" in ''|*[!0-9]*) SUB_TEST=0 ;; esac
+    [ "$SUB_TEST" -ge "$SUB_COUNT" ] && SUB_TEST=0
+    XRAY_JSON_CONFIG="$SUB_DIR/$(printf '%03d' "$SUB_TEST").json"
+    printf 'note: --subscription fetched %s config(s); inventory printed below; full suite runs on index %s\n' "$SUB_COUNT" "$SUB_TEST" >&2
+  fi
 fi
 
 # --xray-config-json accepts a file path, INLINE JSON ('{...}'), or '-' (stdin).
@@ -3308,6 +3319,35 @@ probe_subscription_inventory() {
   info "deep-test another server with: --sub-test N   (N = 0..$(( ${SUB_COUNT:-1} - 1 )))"
 }
 
+# --sub-test all: score EVERY config in the sub with a fast no-tunnel fingerprint
+# pass (self-invoke per config → reuses the whole probe pipeline) and print a fleet
+# detectability table. No xray spawn / no data pull, so a 28-server fleet is just
+# TLS handshakes. Deep-test any row with --sub-test N. Values are _safe-sanitised.
+probe_subscription_walk() {
+  { [ -n "${SUB_DIR:-}" ] && [ -d "$SUB_DIR" ]; } || return 0
+  hdr "Subscription fleet scan — ${SUB_COUNT} configs (fingerprint-only, no tunnel)"
+  printf '          %-3s %-24s %-34s %-12s %s\n' "#" "remarks" "server:port" "cover" "detect"
+  local f i=0 j score band remarks server cover crit=0 high=0 mod=0 low=0
+  for f in "$SUB_DIR"/[0-9][0-9][0-9].json; do
+    [ -f "$f" ] || continue
+    remarks=$(_safe "$(jq -r '.remarks // .name // "?"' "$f" 2>/dev/null)")
+    server=$(_safe "$(jq -r 'first(.outbounds[]? | select(.settings.vnext != null or .settings.servers != null) | "\((.settings.vnext // .settings.servers)[0].address):\((.settings.vnext // .settings.servers)[0].port)") // "-"' "$f" 2>/dev/null)")
+    cover=$(_safe "$(jq -r 'first(.outbounds[]? | .streamSettings.realitySettings.serverName // empty) // "-"' "$f" 2>/dev/null)")
+    if [ "$server" = "-" ]; then
+      printf '          %-3s %-24.24s %-34.34s %-12.12s %s\n' "$i" "$remarks" "(no vless outbound)" "-" "skip (HY)"
+      i=$((i+1)); continue
+    fi
+    j=$(bash "$0" --xray-config-json "$f" --no-tunnel --json 2>/dev/null)
+    score=$(printf '%s' "$j" | jq -r '.probes.xray_detectability.score // "?"' 2>/dev/null)
+    band=$(printf '%s'  "$j" | jq -r '.probes.xray_detectability.band  // "?"' 2>/dev/null)
+    case "$band" in critical) crit=$((crit+1)) ;; high) high=$((high+1)) ;; moderate) mod=$((mod+1)) ;; low) low=$((low+1)) ;; esac
+    printf '          %-3s %-24.24s %-34.34s %-12.12s %s/%s\n' "$i" "$remarks" "$server" "$cover" "${score:-?}" "${band:-?}"
+    i=$((i+1))
+  done
+  info "fleet detectability: ${crit} critical · ${high} high · ${mod} moderate · ${low} low (Hysteria entries skipped — no Reality fingerprint)"
+  info "deep-test any server (tunnel + throughput + stability) with: --sub-test N"
+}
+
 # Hysteria2 static config analysis. Hysteria2 is QUIC over UDP/443 — a different
 # stack from Xray/Reality (no cover relay, no TLS-in-TLS), so the Xray probes
 # don't apply and a TCP/TLS probe against it would falsely read "unreachable".
@@ -5850,6 +5890,13 @@ if [ -n "$PCAP_FILE" ]; then
   fi
 fi
 
+# --subscription --sub-test all: walk + score every config, then exit (the normal
+# single-host flow doesn't apply to a whole fleet). EXIT trap cleans the temp dir.
+if [ -n "${SUB_WALK:-}" ]; then
+  probe_subscription_walk
+  exit 0
+fi
+
 if [ "$LOG_QUIET" != "1" ]; then
   printf '%s\n' "${BLU}VPN-blocking diagnostic for ${VPN_HOST}${RST}"
   printf '%s\n' "${DIM}Run from $(hostname) on $(date)${RST}"
@@ -5910,32 +5957,37 @@ if [ -n "${XRAY_JSON_FORMAT:-}" ]; then
   XRAY_JSON_CONFIG=""   # the Xray-JSON probes below now skip cleanly
 fi
 
-_should_run xray    && probe_xray_protocol
-_should_run xrayjson && probe_xray_json
-_should_run xrayjson && probe_xray_throughput
-_should_run xrayjson && probe_xray_speedtest
+# --no-tunnel (NO_TUNNEL): skip every probe that spawns xray-core or moves data
+# (11/12/13/14/16/17/21/routing/22/25/volume) and keep only the DIRECT fingerprint
+# probes (15 cover-cert, 18 lint, 19 clock, 20 active-probe, 23 MTU, 24 TLS-parity,
+# 26 detectability, + host-exposure) — they connect to the server directly, so a
+# valid detectability score comes back with no tunnel. Powers the fast fleet walk.
+[ -z "${NO_TUNNEL:-}" ] && _should_run xray    && probe_xray_protocol
+[ -z "${NO_TUNNEL:-}" ] && _should_run xrayjson && probe_xray_json
+[ -z "${NO_TUNNEL:-}" ] && _should_run xrayjson && probe_xray_throughput
+[ -z "${NO_TUNNEL:-}" ] && _should_run xrayjson && probe_xray_speedtest
 { _should_run xray || _should_run xrayjson; } && probe_xray_cover
 { _should_run xray || _should_run xrayjson; } && probe_host_exposure
-_should_run xrayjson && probe_xray_egress
-_should_run xrayjson && probe_xray_stability
+[ -z "${NO_TUNNEL:-}" ] && _should_run xrayjson && probe_xray_egress
+[ -z "${NO_TUNNEL:-}" ] && _should_run xrayjson && probe_xray_stability
 # Lint + clock-skew run in numeric position (after 17, before 20). They're
 # static/cheap and their findings also surface in the consolidated verdict.
 { _should_run xray || _should_run xrayjson; } && probe_xray_lint
 { _should_run xray || _should_run xrayjson; } && probe_clock_skew
 { _should_run xray || _should_run xrayjson; } && probe_xray_active_probe
-_should_run xrayjson && probe_xray_fleet
-_should_run xrayjson && probe_xray_routing
-[ -n "$XRAY_CENSOR_SWEEP" ] && probe_censor_sweep
-_should_run xrayjson && probe_xray_bufferbloat
+[ -z "${NO_TUNNEL:-}" ] && _should_run xrayjson && probe_xray_fleet
+[ -z "${NO_TUNNEL:-}" ] && _should_run xrayjson && probe_xray_routing
+[ -z "${NO_TUNNEL:-}" ] && [ -n "$XRAY_CENSOR_SWEEP" ] && probe_censor_sweep
+[ -z "${NO_TUNNEL:-}" ] && _should_run xrayjson && probe_xray_bufferbloat
 { _should_run xray || _should_run xrayjson; } && probe_xray_mtu
 { _should_run xray || _should_run xrayjson; } && probe_xray_tls_parity
-{ _should_run xray || _should_run xrayjson; } && probe_xray_coverthrottle
+[ -z "${NO_TUNNEL:-}" ] && _should_run xrayjson && probe_xray_coverthrottle
 # Detectability is the FINAL synthesis (active probes 15/20/24 + passive
 # port / SNI↔IP signals) — always run it last.
 { _should_run xray || _should_run xrayjson; } && probe_xray_detectability
 # Cross-probe temporal synthesis — runs after the data-plane + sustained-use
 # probes so it can compare early-vs-late tunnel behaviour. Advisory only.
-_should_run xrayjson && probe_volume_synthesis
+[ -z "${NO_TUNNEL:-}" ] && _should_run xrayjson && probe_volume_synthesis
 
 # ---- cross-reference: drop severe verdicts the rest of the run disproves ----
 # A single early/single-stream probe can fire a SEVERE verdict that later probes

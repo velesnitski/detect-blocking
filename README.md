@@ -973,7 +973,11 @@ Options:
                           decode it (JSON array of Xray configs / single config /
                           base64), print a fleet inventory, and run the full suite
                           on one config. --sub-test N picks which (default 0);
+                          --sub-test all scores EVERY server (fast fleet table);
                           --sub-ua sets the User-Agent (default Happ/2.6.0).
+      --no-tunnel         Run only the direct fingerprint probes (cover / active-
+                          probe / TLS-parity / detectability) — no xray spawn, no
+                          throughput. Fast detectability read; powers --sub-test all.
       --json              Emit machine-readable JSON; implies --quiet. Requires jq.
       --reveal            Print the real offending values (cover serverName,
                           flagged SNI, egress IP / org) to the TERMINAL. Off by

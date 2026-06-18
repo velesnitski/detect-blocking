@@ -45,4 +45,18 @@ jq -c '.[0]' "$tmp/arr.json" > "$tmp/one.json"
 out=$(TIMEOUT=2 bash "$SCRIPT" --subscription "file://$tmp/one.json" --only env 2>&1)
 printf '%s' "$out" | grep -q 'Subscription inventory (1 configs)' || fail "a single config object should parse as 1"
 
-echo "PASS: --subscription decodes a JSON array/object, inventories the fleet, selects + clamps --sub-test"
+# --- --no-tunnel: detectability runs (direct probe) but the tunnel probe (12) is skipped ---
+out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config-json "$tmp/one.json" --no-tunnel --json 2>/dev/null)
+printf '%s' "$out" | jq -e '.probes.xray_detectability | has("score")' >/dev/null 2>&1 \
+  || fail "--no-tunnel should still produce a detectability score (direct probes)"
+printf '%s' "$out" | jq -e '.probes.xray_full_config.status == "skipped" or (.probes.xray_full_config.status == null)' >/dev/null 2>&1 \
+  || fail "--no-tunnel should skip the full-config tunnel probe (12)"
+
+# --- --sub-test all: fleet walk scores every config + prints a summary (TEST-NET → fast timeouts) ---
+out=$(TIMEOUT=2 bash "$SCRIPT" --subscription "file://$tmp/arr.json" --sub-test all 2>&1)
+printf '%s' "$out" | grep -q 'Subscription fleet scan' || fail "--sub-test all should run the fleet walk"
+printf '%s' "$out" | grep -q 'fleet detectability:'    || fail "fleet walk should print a detectability summary"
+printf '%s' "$out" | grep -q 'Alpha'                   || fail "fleet table should list each config"
+printf '%s' "$out" | grep -qiE 'no vless outbound|skip' || fail "the no-proxy (Hysteria-like) config should be marked skipped"
+
+echo "PASS: --subscription decodes/inventories/selects; --no-tunnel keeps fingerprint only; --sub-test all walks the fleet"

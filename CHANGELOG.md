@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.3] - 2026-06-18
+
+### Added
+
+- **Scheduled run-log cleanup** (`.github/workflows/cleanup-runs.yml`): deletes
+  `sub-run` workflow runs older than 24h (configurable via `max_age_hours` /
+  `workflow`, `ALL` to prune everything), every 6h + on demand. Keeps dispatch-input
+  metadata from lingering in the public Actions history. Needs Actions write
+  permission (Settings → Actions → General → Workflow permissions). Note: this
+  limits lingering exposure but is **not** leak prevention — a public run is visible
+  the instant it starts, so a pasted tokened URL must still be rotated.
+
+### Reverted
+
+- The v0.32.2 guard that blocked paste-in inputs on a public repo is removed (the
+  paste-in convenience is kept); the redacted output + the input warnings remain,
+  and the new cleanup workflow handles stale runs instead.
+
 ## [0.32.2] - 2026-06-18
 
 ### Changed (security)

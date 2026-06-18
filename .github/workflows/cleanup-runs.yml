@@ -1,0 +1,66 @@
+name: cleanup-runs (scheduled)
+
+# Delete old workflow runs so their logs / dispatch-input metadata don't linger.
+# Targets the sub-run workflow by default (those runs can carry pasted subscription
+# URLs); widen `workflow` to prune others. Runs every 6h + on demand.
+#
+# NOTE: this limits how long a run lingers — it is NOT leak prevention. A public
+# Actions run is visible the instant it starts (public events firehose). If you ever
+# paste a real tokened URL into sub-run, rotate that token; don't rely on cleanup.
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # every 6 hours
+  workflow_dispatch:
+    inputs:
+      max_age_hours:
+        description: "Delete runs older than this many hours"
+        required: false
+        default: "24"
+      workflow:
+        description: "Workflow file to prune (e.g. sub-run.yml; 'ALL' = every workflow)"
+        required: false
+        default: "sub-run.yml"
+
+permissions:
+  actions: write      # required to delete workflow runs
+  contents: read
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete runs older than the cutoff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          MAX_AGE_HOURS: ${{ github.event.inputs.max_age_hours || '24' }}
+          WF: ${{ github.event.inputs.workflow || 'sub-run.yml' }}
+        run: |
+          set -u
+          cutoff=$(date -u -d "-${MAX_AGE_HOURS} hours" +%s)
+          echo "Pruning '${WF}' runs in ${REPO} created before $(date -u -d "@${cutoff}" '+%Y-%m-%d %H:%M:%SZ') (older than ${MAX_AGE_HOURS}h)"
+
+          if [ "$WF" = "ALL" ]; then
+            list="repos/${REPO}/actions/runs"
+          else
+            list="repos/${REPO}/actions/workflows/${WF}/runs"
+          fi
+
+          deleted=0; kept=0
+          # id + created_at for every run; delete those older than the cutoff.
+          while read -r id created; do
+            [ -n "$id" ] || continue
+            ts=$(date -u -d "$created" +%s 2>/dev/null) || { echo "skip $id (bad date '$created')"; continue; }
+            if [ "$ts" -lt "$cutoff" ]; then
+              if gh api -X DELETE "repos/${REPO}/actions/runs/${id}" >/dev/null 2>&1; then
+                echo "  deleted run $id ($created)"; deleted=$((deleted+1))
+              else
+                echo "  FAILED to delete run $id ($created)"
+              fi
+            else
+              kept=$((kept+1))
+            fi
+          done < <(gh api --paginate "$list" -q '.workflow_runs[] | "\(.id) \(.created_at)"')
+
+          echo "Done: deleted=${deleted}, kept (within window)=${kept}"

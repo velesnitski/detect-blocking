@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.32.2"
+readonly DETECT_BLOCKING_VERSION="0.32.3"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section

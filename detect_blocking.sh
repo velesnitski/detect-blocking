@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.32.0"
+readonly DETECT_BLOCKING_VERSION="0.32.1"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -3466,8 +3466,13 @@ EOF
       detect="${score}/${band}"; kind=scored
     fi
   fi
+  # Self-heal the row dir: under heavy concurrency the dir has been observed briefly
+  # unavailable on some systems, which made this redirect fail with ENOENT (a noisy
+  # but non-fatal "012.row: No such file or directory"). mkdir -p is idempotent and
+  # cheap, and guarantees the write target exists regardless of the transient.
+  [ -d "$SUB_DIR" ] || mkdir -p "$SUB_DIR" 2>/dev/null
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$idx" "$kind" "$remarks" "$server" "$cover" "$detect" "$fp" "$tells" "$band" > "$SUB_DIR/$pad.row"
+    "$idx" "$kind" "$remarks" "$server" "$cover" "$detect" "$fp" "$tells" "$band" > "$SUB_DIR/$pad.row" 2>/dev/null
 }
 
 # --sub-test all: score EVERY config in the sub with a fast no-tunnel fingerprint

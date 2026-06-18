@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.1] - 2026-06-18
+
+### Fixed
+
+- **Fleet walk no longer prints a stray `NNN.row: No such file or directory`.** A
+  concurrent `_walk_one` job could try to write its row file when the temp dir was
+  momentarily unavailable (e.g. an orphaned background job from an earlier
+  interrupted run, whose `_cleanup` had already removed that run's dir, flushing its
+  stderr into a later run). The write now `mkdir -p`s the dir first (idempotent,
+  cheap) and silences the redirect, so the row write always succeeds and never emits
+  the noisy error. No data was lost before — the affected row still rendered — but
+  the message was alarming.
+
 ## [0.32.0] - 2026-06-18
 
 ### Added

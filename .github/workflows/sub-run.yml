@@ -1,0 +1,91 @@
+name: sub-run (manual)
+
+# Run detect-blocking against a subscription ON GITHUB, on demand:
+#   Actions → "sub-run (manual)" → Run workflow → fill the form → read the output.
+#
+# ⚠️ PUBLIC-REPO SAFETY ⚠️
+#   workflow_dispatch INPUT VALUES and run LOGS are world-readable on a public repo.
+#   • For a real, tokened subscription URL: DO NOT paste it in the form. Store it as
+#     the repo secret SUB_URL (Settings → Secrets and variables → Actions) and leave
+#     `sub_url` blank — secrets are masked in logs and never shown in the run UI.
+#   • Use the `sub_url` / `sub_json` inputs only for sharing-safe / demo data.
+#   • Output is REDACTED by default to safe aggregates (counts + remediation plan,
+#     never hostnames / covers / deployment fingerprints). Set `redact: false` only
+#     on a PRIVATE repo/fork where logs are not public.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sub_url:
+        description: "Subscription URL (PUBLIC: visible in logs — for a tokened URL use the SUB_URL secret instead and leave this blank)"
+        required: false
+        default: ""
+      sub_json:
+        description: "OR paste a sub JSON array / single config (PUBLIC: visible in logs — sharing-safe data only)"
+        required: false
+        default: ""
+      sub_test:
+        description: "--sub-test value: 'all' scores every server, or an index N to deep-test one"
+        required: false
+        default: "all"
+      redact:
+        description: "Redact output to safe aggregates (counts + plan). Set 'false' ONLY on a private repo."
+        required: false
+        default: "true"
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    name: run detect-blocking
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure jq + xray
+        run: |
+          command -v jq >/dev/null || { sudo apt-get update && sudo apt-get install -y jq; }
+          # xray is optional: --sub-test all is fingerprint-only (no tunnel), so it
+          # is not required. A specific --sub-test N (deep test) would use it.
+
+      - name: Run
+        env:
+          SUB_URL_SECRET: ${{ secrets.SUB_URL }}
+          IN_URL: ${{ inputs.sub_url }}
+          IN_JSON: ${{ inputs.sub_json }}
+          MODE: ${{ inputs.sub_test }}
+          REDACT: ${{ inputs.redact }}
+        run: |
+          set -u
+          out="$(mktemp)"
+          if [ -n "${IN_JSON:-}" ]; then
+            f="$(mktemp)"; printf '%s' "$IN_JSON" > "$f"
+            echo "Source: pasted JSON (sharing-safe data only on a public repo)"
+            bash detect_blocking.sh --subscription "file://$f" --sub-test "$MODE" > "$out" 2>&1 || true
+          else
+            URL="${IN_URL:-$SUB_URL_SECRET}"
+            if [ -z "$URL" ]; then
+              echo "No sub_url input and no SUB_URL secret set — nothing to run."
+              echo "Set the SUB_URL repo secret (recommended for tokened URLs) or paste a sharing-safe sub_url/sub_json."
+              exit 1
+            fi
+            [ -n "${IN_URL:-}" ] && echo "Source: sub_url input (visible in logs!)" || echo "Source: SUB_URL secret (masked)"
+            bash detect_blocking.sh --subscription "$URL" --sub-test "$MODE" > "$out" 2>&1 || true
+          fi
+
+          echo "::group::result"
+          if [ "${REDACT}" = "false" ]; then
+            echo "(full output — only safe on a private repo)"
+            cat "$out"
+          else
+            echo "Redacted to safe aggregates (counts + remediation plan; no hostnames / covers / fingerprints)."
+            echo "Run with redact=false on a PRIVATE repo, or locally, for the full per-server table."
+            echo "----"
+            grep -E 'fetched [0-9]+ config|fleet detectability:|remediation plan|[0-9]+\. \[[0-9]+ node\(s\):' "$out" \
+              || echo "(no summary produced — the fetch may have failed; check the URL/secret)"
+          fi
+          echo "::endgroup::"
+
+          # Fail the run if no fleet summary came back (fetch/decode failed).
+          grep -q 'fleet detectability:' "$out" || { echo "::error::no fleet summary — subscription fetch/decode failed"; exit 1; }

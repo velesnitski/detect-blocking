@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-06-18
+
+### Added
+
+- **Run a subscription on GitHub Actions, on-demand** (`.github/workflows/sub-run.yml`):
+  a manual `workflow_dispatch` that takes a pasted `sub_url` / `sub_json` (or a stored
+  `SUB_URL` secret) and runs `--subscription … --sub-test all`, printing a **redacted**
+  summary (counts + remediation plan — never hostnames/covers/fingerprints) by default.
+  Documented public-repo caveats: inputs/logs are world-readable, so tokened URLs go in
+  the secret and `redact: false` is private-repo-only.
+- **Hermetic subscription CI** — `tests/test_subscription_http.sh` + a local stdlib
+  fake panel (`tests/fixtures/fake_sub_server.py`) that UA-gates and runs a 302 cookie
+  challenge, exercising the whole `--subscription … --sub-test all` fetch→decode→walk
+  path with safe placeholders and no real infra. Wired into the macOS/Ubuntu CI matrix
+  alongside the fleet helper tests.
+
+### Changed (security)
+
+- **secret-scan no longer stores the banned values in the repo** — those strings *are*
+  the secrets, so a banned list living in a public file defeats the purpose. The list
+  now loads from the `SECRET_SCAN_BANNED` env/secret or a **gitignored** `scripts/.banned`
+  (template: `scripts/.banned.example`); the committed script holds only the loader. The
+  always-on generic-credential layer is unchanged, and layer 1 still trips locally via
+  the pre-commit hook. The no-arg scan now also covers untracked files and ignores
+  `__pycache__`. (Pre-existing entries remain in git history — rotate those secrets.)
+
 ## [0.31.1] - 2026-06-18
 
 ### Fixed

@@ -1,0 +1,21 @@
+# scripts/.banned — local-only banned-string list for secret-scan.sh (layer 1).
+#
+# These patterns ARE the secrets (real product names, hostnames, IPs, tokens, ids),
+# so the real file must NEVER be committed. Copy this template to scripts/.banned
+# (which is gitignored) and fill it with your own infra identifiers — ONE extended
+# regular-expression (ERE) per line. Blank lines and # comments are ignored; the
+# lines are joined with '|' into a single ERE.
+#
+# For CI, set the SAME patterns as the SECRET_SCAN_BANNED repo secret instead
+# (pipe-joined, e.g. "foo|bar\.example\.com|[0-9a-f]{16}"); the workflow passes it
+# via env. With neither scripts/.banned nor SECRET_SCAN_BANNED present, layer 1 is
+# skipped and only the generic-credential layer (2) runs.
+#
+#   cp scripts/.banned.example scripts/.banned   # then edit scripts/.banned
+#
+# --- examples (PLACEHOLDERS — replace with your own; do not commit the real file) ---
+# mycompanyname
+# myproductname
+# subs\.example\.com
+# 203\.0\.113\.[0-9]+          # a server IP / range (TEST-NET shown here)
+# [0-9a-f]{16}                 # a known API / subscription token shape

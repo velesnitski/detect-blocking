@@ -1279,10 +1279,39 @@ bash tests/run.sh
 
 # Individual:
 bash tests/test_smoke.sh
-bash tests/test_doh_compromise.sh   # spins up a local fake-DoH server
+bash tests/test_doh_compromise.sh        # spins up a local fake-DoH server
+bash tests/test_subscription_http.sh     # local fake panel: UA gate + 302 cookie challenge
 ```
 
-The CI workflow runs shellcheck plus smoke tests on macOS and Ubuntu.
+The CI workflow (`.github/workflows/test.yml`) runs shellcheck, the secret-scan, and
+smoke + subscription/fleet tests on macOS and Ubuntu. The subscription pipeline
+(`--subscription … --sub-test all`) is covered hermetically: `tests/test_subscription_http.sh`
+stands up a local stdlib HTTP server (`tests/fixtures/fake_sub_server.py`) that
+UA-gates and runs a 302 cookie challenge, then serves a synthetic sub of **safe
+placeholders** against loopback closed ports — so the full fetch → decode → walk →
+table → remediation-plan path runs with no real infra and no secrets.
+
+### Run a subscription on GitHub Actions (on-demand)
+
+`.github/workflows/sub-run.yml` lets you run the tool **on GitHub** without committing
+anything: **Actions → "sub-run (manual)" → Run workflow**, then either paste a
+`sub_url` / `sub_json` or rely on a stored secret. Output defaults to a **redacted**
+summary (counts + remediation plan — never hostnames/covers/fingerprints).
+
+> ⚠️ **Public repo:** `workflow_dispatch` inputs and run logs are world-readable. For a
+> real, tokened subscription URL, **store it as the `SUB_URL` repo secret** (Settings →
+> Secrets and variables → Actions) and leave the `sub_url` field blank — secrets are
+> masked. Use the paste-in fields only for sharing-safe data, and set `redact: false`
+> only on a private repo/fork.
+
+### secret-scan & the banned list
+
+`scripts/secret-scan.sh` blocks real infra (product names, hostnames, IPs, tokens,
+ids) from entering this public repo. Because those values *are* the secrets, they are
+**not stored in the repo** — copy `scripts/.banned.example` to `scripts/.banned`
+(gitignored) and fill in your own ERE patterns, or set them as the `SECRET_SCAN_BANNED`
+repo secret for CI. `bash scripts/install-hooks.sh` wires it as a pre-commit hook.
+A second, listless layer always catches generic UUIDs / Reality keys / public IPs.
 
 ---
 

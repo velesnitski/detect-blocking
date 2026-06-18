@@ -28,6 +28,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Scan for leaked credentials / fleet infra (banned strings + generic creds)
+        # The banned VALUES are not in the repo (they ARE secrets); set them as the
+        # SECRET_SCAN_BANNED repo secret (pipe-joined ERE) to enable layer 1 in CI.
+        # If unset, only the generic-credential layer runs (still catches UUIDs /
+        # keys / public IPs); the local pre-commit hook enforces the full list.
+        env:
+          SECRET_SCAN_BANNED: ${{ secrets.SECRET_SCAN_BANNED }}
         run: bash scripts/secret-scan.sh
 
   syntax-and-smoke:
@@ -84,6 +90,17 @@ jobs:
       - name: --xray-config-json schema + graceful degradation
         run: bash tests/test_xrayjson.sh
         timeout-minutes: 2
+
+      - name: Subscription + fleet-walk pipeline (hermetic — local fake panel)
+        # Exercises --subscription … --sub-test all end to end: a local stdlib HTTP
+        # server (UA gate + 302 cookie challenge) serves a synthetic sub of SAFE
+        # placeholders against loopback closed ports, plus the pure helpers behind
+        # the tells / remediation plan / table alignment. No real infra, no secrets.
+        run: |
+          for t in test_subscription test_subscription_http test_fleet_tells test_fleet_plan test_wpad; do
+            echo "== $t =="; bash "tests/$t.sh" || exit 1
+          done
+        timeout-minutes: 3
 
       - name: --only / --skip flag wiring
         run: |

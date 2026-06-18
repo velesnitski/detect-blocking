@@ -1,6 +1,11 @@
 # Local configuration — may contain real endpoint details
 detect_blocking.conf
 
+# secret-scan banned-string list — holds REAL infra identifiers (the values are
+# themselves the secrets), so it lives only on disk / in CI's SECRET_SCAN_BANNED
+# secret, NEVER in the repo. Only scripts/.banned.example (placeholders) is committed.
+scripts/.banned
+
 # Local Xray configs used for ad-hoc testing — must NEVER be committed.
 .xray-*.json
 .xray-*-cfg.json
@@ -22,6 +27,10 @@ xray-test-*.json
 .vscode/
 .idea/
 *.iml
+
+# Python bytecode (from test fixtures like tests/fixtures/fake_sub_server.py)
+__pycache__/
+*.pyc
 
 # Test artefacts
 tests/*.out

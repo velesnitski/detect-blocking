@@ -16,7 +16,17 @@
 set -u
 
 # ---- layer 1: explicit banned strings (known fleet infra) ----
-BANNED='REDACTED-PRODUCT|REDACTED-PRODUCT|REDACTED-PRODUCT|REDACTED-PRODUCT|REDACTED-PROVIDER|REDACTED-PROVIDER|REDACTED-PROVIDER|REDACTED-PROVIDER|REDACTED-PROVIDER|REDACTED-PRODUCT|REDACTED-PROVIDER|blocked-rkn|REDACTED-DOMAIN|relay-b|relay-a|REDACTED-CREDENTIAL|REDACTED|REDACTED-CREDENTIAL|REDACTED-CREDENTIAL|REDACTED-CREDENTIAL|REDACTED|REDACTED-CREDENTIAL|REDACTED-CREDENTIAL|REDACTED-CREDENTIAL|REDACTED-CREDENTIAL|203\.0\.113\.|203\.0\.113\.|198\.51\.100\.|203\.0\.113\.|203\.0\.113\.|203\.0\.113\.9|203\.0\.113\.8'
+# The banned VALUES are themselves sensitive (they ARE the real infra strings), so
+# they are NOT stored in this committed file — that would publish them. They load
+# from, in order: the SECRET_SCAN_BANNED env var (pipe-joined ERE; used by CI via a
+# repo secret), else a gitignored scripts/.banned file (one ERE pattern per line;
+# copy scripts/.banned.example). With neither present, layer 1 is skipped and only
+# the generic layer (2) runs. See scripts/.banned.example.
+SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]:-$0}" )" &> /dev/null && pwd )"
+BANNED="${SECRET_SCAN_BANNED:-}"
+if [ -z "$BANNED" ] && [ -r "$SCRIPT_DIR/.banned" ]; then
+  BANNED=$(awk 'NF && $0 !~ /^[[:space:]]*#/ {printf "%s%s", sep, $0; sep="|"}' "$SCRIPT_DIR/.banned")
+fi
 
 # ---- collect files ----
 files=()
@@ -49,8 +59,8 @@ for f in "${files[@]}"; do
   [ -f "$f" ] || continue
   case "$f" in *secret-scan.sh) continue ;; esac   # don't scan self (holds the banned list)
   {
-    # (1) banned strings, anywhere
-    grep -niE "$BANNED" "$f" 2>/dev/null | sed "s#^#${f} [banned] #"
+    # (1) banned strings, anywhere (only if a list was provided — see above)
+    [ -n "$BANNED" ] && grep -niE "$BANNED" "$f" 2>/dev/null | sed "s#^#${f} [banned] #"
 
     # (2a) real UUID (not the all-zero / all-one placeholder family)
     grep -niE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' "$f" 2>/dev/null \

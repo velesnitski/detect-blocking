@@ -511,18 +511,19 @@ no data pull, so a whole fleet is just TLS handshakes, probed **concurrently**
 
 ```
 == Subscription fleet scan — 28 configs (fingerprint-only, no tunnel) ==
-  fp = deployment template (same fp = same server build); per-node signals are grouped under 'node profiles' below
+  fp = deployment template (same fp = same server build); per-node signals are in the 'signal matrix' below
   #   remarks         server:port                cover              detect       fp
   0   Auto            edge01.example.net:443     www.microsoft.com  100/critical abcdef01
   7   Country B       edge07.example.net:443     news.example.io    70/critical  abcdef01
   9   Country C       edge09.example.net:8443    cdn.example.io     60/high      a1b2c3d4
   fleet detectability: 27 critical · 1 high · 0 moderate · 0 low · 0 unreachable …
-  node profiles (nodes sharing fingerprint + band + signals), most common first:
-    [0-6,8,10-27] abcdef01 critical: self-signed,chain-invalid,cn!=sni,no-relay:noresp,tls-parity:alpn+cipher,sni!=ip,cover-obscure,utls-rare:qq,exposed:22(SSH)
-    [7] abcdef01 critical: self-signed,chain-invalid,cn!=sni,sni-nxdomain,utls-rare:qq,exposed:22(SSH)
-    [9] a1b2c3d4 high: cover-obscure,non443,exposed:22(SSH)
-  shared signals across 28 scored node(s):
-    28× cn!=sni   28× exposed   27× self-signed   27× no-relay   …
+  signal matrix (x = signal fired; rows grouped by identical signal-set, most common first; 'total' = nodes per signal):
+    nodes                         SS CI CN NR TP SI NX CO NP UT EX
+    [0-6,8,10-27] (26)            x  x  x  x  x  x  .  x  .  x  x
+    [7] (1)                       x  x  x  .  .  .  x  .  .  x  x
+    [9] (1)                       .  .  .  .  .  .  .  x  x  .  x
+    total                         27 27 27 26 26 26 1  27 1  27 28
+    legend: SS=self-signed CI=chain-invalid CN=cn!=sni NR=no-relay TP=tls-parity SI=sni!=ip NX=sni-nxdomain CO=cover-obscure NP=non443 UT=utls-rare EX=exposed
   remediation plan (fixes ranked by nodes affected; a node may need several):
     1. [27 node(s): 0-6,8-27] Reality cover not relayed / cover-cert invalid — point Reality dest + serverNames at the real cover host:443 (server-side; clears self-signed/chain/cn/no-relay/parity at once)
     2. [28 node(s): 0-27] Management/SSH port(s) open on the VPN IP — firewall so only 443 is reachable from outside
@@ -532,16 +533,16 @@ no data pull, so a whole fleet is just TLS handshakes, probed **concurrently**
 ```
 
 The table stays a clean, fixed-width row per server (it never wraps); the per-node
-**signals live in `node profiles`**, which groups servers by identical
-*fingerprint + band + signals* so a uniform fleet collapses to a few lines and any
-node that differs stands out — the full signal list is shown once per profile, not
-repeated on every row. The **remediation plan** is the payoff: most signals are
-*symptoms of one root fix* (self-signed / chain-invalid / cn!=sni / no-relay /
-tls-parity all clear when the cover is relayed), so the plan collapses them into a
-handful of fixes, tells you **how many nodes each clears and which** (range-
-compressed), and ranks by impact. A node can appear under several fixes; it needs each.
+**signals are a `signal matrix`** — a grid with signals as fixed columns and nodes
+grouped by identical signal-set, so a uniform fleet collapses to a few rows, you can
+scan a column to see which nodes share a signal, and any node that differs stands
+out as its own row. The `total` row is the per-signal node count. The
+**remediation plan** is the payoff: most signals are *symptoms of one root fix*
+(self-signed / chain-invalid / cn!=sni / no-relay / tls-parity all clear when the
+cover is relayed), so the plan collapses them into a handful of fixes, tells you
+**how many nodes each clears and which** (range-compressed), and ranks by impact.
 
-- **Signal tokens** (shown in `node profiles`; values carried where they have one):
+- **Signal tokens** (decoded by the matrix legend; values carried where they have one):
   - **Cover / active probe:** `self-signed` / `cover-mismatch` / `cover-unreach`
     (Reality cover-cert), `chain-invalid`, `cn!=sni` (cert CN ≠ serverName),
     **`no-relay:CODE`** (the active prober got HTTP `CODE` from the server posing as

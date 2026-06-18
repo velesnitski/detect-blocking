@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-06-18
+
+### Changed
+
+- **Per-node signals are now a `signal matrix` instead of comma-joined profile
+  lines** (which still wrapped, since the signal list is long). The matrix is a
+  systematic grid: signals are **fixed columns** (2-char codes), rows are nodes
+  **grouped by identical signal-set** (range-compressed indices, most common first),
+  cells are `x`/`.`, and a `total` footer row gives the per-signal node count (this
+  folds in the old "shared signals" tally). Result: it never wraps, you can scan a
+  column to see which profiles share a signal, and any node that differs (e.g. a
+  `cover-mismatch` instead of `self-signed`, or an extra `non443`) stands out as its
+  own row. Backed by a new pure helper `_signal_matrix` + `tests/test_signal_matrix.sh`.
+
 ## [0.33.0] - 2026-06-18
 
 ### Changed

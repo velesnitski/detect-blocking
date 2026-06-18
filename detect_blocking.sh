@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.33.0"
+readonly DETECT_BLOCKING_VERSION="0.34.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -3343,6 +3343,30 @@ _compress_ranges() {
   '
 }
 
+# Build a profile×signal MATRIX from "<base-signal> <node-idx>" lines on stdin —
+# the systematic view of the fleet's tells. Groups nodes by identical signal-SET and
+# emits TAB-tagged lines for the caller to render: HDR (2-char column codes), one ROW
+# per group (count, x/. cells, comma-idx list), TOT (per-signal node totals), LEG
+# (code→name legend). Columns = the canonical-ordered signals present in the fleet.
+# Cells are ASCII (x/.) and every field is width-3 so columns align (no multibyte).
+_signal_matrix() {
+  awk '
+    BEGIN{
+      N=split("self-signed:SS cover-mismatch:CM chain-invalid:CI cn!=sni:CN no-relay:NR tls-parity:TP sni!=ip:SI sni-nxdomain:NX cover-obscure:CO non443:NP sni-kw:KW vision-off:VO utls-rare:UT mux:MX fet:FE id-nonuuid:ID clock:CK exposed:EX throttle?:TH", o, " ")
+      for(i=1;i<=N;i++){ split(o[i],kv,":"); name[i]=kv[1]; code[i]=kv[2] }
+    }
+    NF>=2{ has[$2 SUBSEP $1]=1; node[$2]=1; present[$1]=1 }
+    END{
+      nc=0; for(i=1;i<=N;i++) if(present[name[i]]){ nc++; cn[nc]=name[i]; cc[nc]=code[i] }
+      for(nd in node){ sig=""; for(c=1;c<=nc;c++) sig=sig (has[nd SUBSEP cn[c]]?"1":"0"); mem[sig]=mem[sig](mem[sig]==""?"":",")nd; gc[sig]++ }
+      h=""; for(c=1;c<=nc;c++) h=h sprintf("%-3s",cc[c]); printf "HDR\t%s\n",h
+      for(sig in mem){ cells=""; for(c=1;c<=nc;c++){ on=(substr(sig,c,1)=="1"); cells=cells sprintf("%-3s",(on?"x":".")); if(on) tot[c]+=gc[sig] } printf "ROW\t%d\t%s\t%s\n",gc[sig],cells,mem[sig] }
+      tc=""; for(c=1;c<=nc;c++) tc=tc sprintf("%-3s",tot[c]); printf "TOT\t%s\n",tc
+      leg=""; for(c=1;c<=nc;c++) leg=leg cc[c]"="cn[c]" "; printf "LEG\t%s\n",leg
+    }
+  '
+}
+
 # Fit a "host:port" endpoint into $2 columns WITHOUT losing the port: if it
 # overflows, truncate the HOST (ASCII, '~' marker) and keep ":port" — so the column
 # never overruns and shifts the rest of the table, yet the port (real data) is never
@@ -3488,7 +3512,7 @@ probe_subscription_walk() {
   # remarks via _wpad (multibyte display-width), server:port via _ep_fit (port kept).
   local rw=24 sw=38 fmt='          %-3s %s %-38s %-16.16s %-13s %s\n'
   hdr "Subscription fleet scan — ${SUB_COUNT} configs (fingerprint-only, no tunnel)"
-  info "fp = deployment template (same fp = same server build); per-node signals are grouped under 'node profiles' below"
+  info "fp = deployment template (same fp = same server build); per-node signals are in the 'signal matrix' below"
   # shellcheck disable=SC2059
   printf "$fmt" "#" "$(_wpad remarks "$rw")" "server:port" "cover" "detect" "fp"
 
@@ -3509,7 +3533,7 @@ probe_subscription_walk() {
 
   # Render the row files in index order and tally as we go.
   local rf idx kind remarks server cover detect fp tells band
-  local crit=0 high=0 mod=0 low=0 dead=0 plan_lines="" prof_lines=""
+  local crit=0 high=0 mod=0 low=0 dead=0 plan_lines=""
   for rf in "$SUB_DIR"/[0-9][0-9][0-9].row; do
     [ -f "$rf" ] || continue
     IFS=$'\t' read -r idx kind remarks server cover detect fp tells band < "$rf"
@@ -3519,11 +3543,9 @@ probe_subscription_walk() {
       dead) dead=$((dead+1)) ;;
       scored)
         case "$band" in critical) crit=$((crit+1)) ;; high) high=$((high+1)) ;; moderate) mod=$((mod+1)) ;; low) low=$((low+1)) ;; esac
-        # Per-node profile = "fp band: tells" (TAB idx). Identical profiles collapse
-        # into one line in the profiles section — the full signal list shown once.
-        prof_lines="${prof_lines}${fp} ${band}: ${tells}"$'\t'"${idx}"$'\n'
-        # Base signal tokens (value suffix after ':' stripped, so no-relay:403 /
-        # no-relay:noresp group as "no-relay") → shared-signals tally + the plan.
+        # Accumulate "<base-signal> <node-idx>" pairs (value suffix after ':'
+        # stripped, so no-relay:403 / no-relay:noresp group as "no-relay") — drives
+        # the signal matrix and the per-fix node lists in the remediation plan.
         case "$tells" in
           clean|'?'|'') : ;;
           *) plan_lines="${plan_lines}$(printf '%s' "$tells" | tr ',' '\n' | sed 's/:.*$//' | awk -v ix="$idx" 'NF{print $1, ix}')"$'\n' ;;
@@ -3531,31 +3553,27 @@ probe_subscription_walk() {
     esac
   done
   info "fleet detectability: ${crit} critical · ${high} high · ${mod} moderate · ${low} low · ${dead} unreachable (Hysteria entries skipped — no Reality fingerprint)"
-  # Node profiles: group scored nodes by IDENTICAL fingerprint + band + signals, so a
-  # uniform fleet collapses to a few lines (and any node that differs stands out) —
-  # the full signal list appears once per profile, never repeated per row. Ranked by
-  # node count. This is where the per-node "tells" now live.
-  if [ -n "$prof_lines" ]; then
-    info "node profiles (nodes sharing fingerprint + band + signals), most common first:"
-    local _prof _pidxs _pcnt _prng _profout=""
-    while IFS= read -r _prof; do
-      [ -n "$_prof" ] || continue
-      _pidxs=$(printf '%s' "$prof_lines" | awk -F'\t' -v p="$_prof" '$1==p{print $2}' | sort -n | uniq)
-      _pcnt=$(printf '%s\n' "$_pidxs" | grep -c .)
-      _prng=$(printf '%s\n' "$_pidxs" | _compress_ranges)
-      _profout="${_profout}${_pcnt}"$'\t'"[${_prng}] ${_prof}"$'\n'
-    done < <(printf '%s' "$prof_lines" | cut -f1 | sort -u)
-    printf '%s' "$_profout" | sort -t"$(printf '\t')" -k1,1nr | awk -F"$(printf '\t')" 'NF>=2{print $2}' | while IFS= read -r _l; do
-      info "  $_l"
-    done
-  fi
   local scored=$(( crit + high + mod + low ))
+  # Signal matrix: nodes grouped by identical signal-SET, signals as fixed columns,
+  # x/. cells + a per-signal total row. A systematic grid (never wraps) where a
+  # uniform fleet collapses to a few rows and any node that differs stands out.
+  if [ -n "$plan_lines" ]; then
+    info "signal matrix (x = signal fired; rows grouped by identical signal-set, most common first; 'total' = nodes per signal):"
+    local _mw=30 _mrow _ma _mb _mc _mtot="" _mleg="" _mrng _mrows=""
+    while IFS=$'\t' read -r _mrow _ma _mb _mc; do
+      case "$_mrow" in
+        HDR) info "$(printf '  %-*s%s' "$_mw" 'nodes' "$_ma")" ;;
+        ROW) _mrng=$(printf '%s' "$_mc" | tr ',' '\n' | sort -n | _compress_ranges)
+             _mrows="${_mrows}${_ma}"$'\t'"$(printf '  %-*s%s' "$_mw" "[${_mrng}] (${_ma})" "$_mb")"$'\n' ;;
+        TOT) _mtot="$_ma" ;;
+        LEG) _mleg="$_ma" ;;
+      esac
+    done < <(printf '%s' "$plan_lines" | _signal_matrix)
+    printf '%s' "$_mrows" | sort -t"$(printf '\t')" -k1,1nr | cut -f2- | while IFS= read -r _l; do info "$_l"; done
+    [ -n "$_mtot" ] && info "$(printf '  %-*s%s' "$_mw" 'total' "$_mtot")"
+    [ -n "$_mleg" ] && info "  legend: ${_mleg}"
+  fi
   if [ "$scored" -gt 0 ] && [ -n "$plan_lines" ]; then
-    # Raw signal frequencies across the fleet.
-    info "shared signals across ${scored} scored node(s):"
-    printf '%s' "$plan_lines" | awk 'NF{print $1}' | sort | uniq -c | sort -rn | while read -r cnt sig; do
-      [ -n "$sig" ] && info "  ${cnt}× ${sig}"
-    done
     # Remediation plan: many of those signals are SYMPTOMS of one root fix (e.g.
     # self-signed / chain-invalid / cn!=sni / no-relay / tls-parity all clear when
     # the cover is relayed), so we collapse them into a handful of actionable fixes,

@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.31.0"
+readonly DETECT_BLOCKING_VERSION="0.31.1"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -3343,6 +3343,22 @@ _compress_ranges() {
   '
 }
 
+# Fit a "host:port" endpoint into $2 columns WITHOUT losing the port: if it
+# overflows, truncate the HOST (ASCII, '~' marker) and keep ":port" — so the column
+# never overruns and shifts the rest of the table, yet the port (real data) is never
+# cut. A value with no ':' (e.g. the "(no vless outbound)" label) is tail-truncated.
+# Endpoints are ASCII (domains / IPv4 / bracketed IPv6), so byte length == columns.
+_ep_fit() {
+  local s="${1-}" w="$2" host port hb
+  [ "${#s}" -le "$w" ] && { printf '%s' "$s"; return; }
+  case "$s" in
+    *:*) port="${s##*:}"; host="${s%:*}"
+         hb=$(( w - ${#port} - 2 )); [ "$hb" -lt 1 ] && hb=1
+         printf '%s~:%s' "${host:0:$hb}" "$port" ;;
+    *)   printf '%s~' "${s:0:$((w-1))}" ;;
+  esac
+}
+
 _wpad() {
   local s="${1-}" w="$2"
   if command -v perl >/dev/null 2>&1; then
@@ -3461,10 +3477,10 @@ EOF
 # 28-server fleet is just TLS handshakes. Deep-test any row with --sub-test N.
 probe_subscription_walk() {
   { [ -n "${SUB_DIR:-}" ] && [ -d "$SUB_DIR" ]; } || return 0
-  # remarks is pre-padded to a fixed DISPLAY width via _wpad (multibyte-aware) and
-  # printed with %s; server:port is pad-only so a long hostname stays ragged but the
-  # port is never cut (losing it is real data loss). The other columns are ASCII.
-  local rw=24 fmt='          %-3s %s %-36s %-16.16s %-13s %-9s %s\n'
+  # Every column is a FIXED width so the table stays aligned: remarks via _wpad
+  # (multibyte display-width), server:port via _ep_fit (capped at sw, host truncated
+  # but port kept), cover/detect/fp byte-capped (ASCII). tells is last (free).
+  local rw=24 sw=38 fmt='          %-3s %s %-38s %-16.16s %-13s %-9s %s\n'
   hdr "Subscription fleet scan — ${SUB_COUNT} configs (fingerprint-only, no tunnel)"
   info "tells = fired detectability signals (why the score); fp = deployment template — configs sharing an fp are the same server build"
   # shellcheck disable=SC2059
@@ -3492,7 +3508,7 @@ probe_subscription_walk() {
     [ -f "$rf" ] || continue
     IFS=$'\t' read -r idx kind remarks server cover detect fp tells band < "$rf"
     # shellcheck disable=SC2059
-    printf "$fmt" "$idx" "$(_wpad "$remarks" "$rw")" "$server" "$cover" "$detect" "$fp" "$tells"
+    printf "$fmt" "$idx" "$(_wpad "$remarks" "$rw")" "$(_ep_fit "$server" "$sw")" "$cover" "$detect" "$fp" "$tells"
     case "$kind" in
       dead) dead=$((dead+1)) ;;
       scored)

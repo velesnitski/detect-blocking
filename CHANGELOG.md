@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.1] - 2026-06-18
+
+### Fixed
+
+- **Fleet table fully aligned — the `server:port` column no longer overruns.** After
+  v0.30.0 fixed multibyte `remarks`, a hostname longer than the column (e.g.
+  `…:10443` at 40 chars) still pushed `cover`/`detect`/`fp`/`tells` rightward for
+  that row. The column is now capped via a new `_ep_fit` helper that truncates the
+  **host** (ASCII `~` marker) while keeping the **port** intact, so the column is a
+  fixed width and the rest of the table lines up across every row. Covered by
+  `tests/test_wpad.sh`.
+
 ## [0.31.0] - 2026-06-18
 
 ### Added

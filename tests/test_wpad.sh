@@ -30,4 +30,19 @@ out=$(_wpad "Самый Быстрый АВТО Резерв" 10)
 [ "$(cnt "$out")" = 10 ] || fail "over-long string should truncate to exactly 10 chars (got $(cnt "$out"))"
 case "$out" in *"…") : ;; *) fail "truncated string should end with an ellipsis (got '$out')" ;; esac
 
-echo "PASS: _wpad pads/truncates to a fixed DISPLAY width across ASCII / Cyrillic / emoji"
+# --- _ep_fit: cap "host:port" to a width but NEVER drop the port ---
+efn=$(awk '/^_ep_fit\(\)/,/^}/' "$SCRIPT"); [ -n "$efn" ] || fail "could not extract _ep_fit"
+eval "$efn"
+
+out=$(_ep_fit "test.grey-lance.test-cdn-kkk.com:443" 38)
+[ "$out" = "test.grey-lance.test-cdn-kkk.com:443" ] || fail "endpoint within width passes through (got '$out')"
+
+out=$(_ep_fit "test10.rare-lance.test-cdn-kkk.com:10443" 38)
+[ "${#out}" -le 38 ]      || fail "over-long endpoint must be capped to the width (got ${#out})"
+case "$out" in *":10443") : ;; *) fail "_ep_fit must keep the port, truncate the host (got '$out')" ;; esac
+case "$out" in *"~:10443") : ;; *) fail "host truncation should be marked with '~' (got '$out')" ;; esac
+
+out=$(_ep_fit "(no vless outbound)" 38)
+[ "$out" = "(no vless outbound)" ] || fail "a short no-colon label passes through (got '$out')"
+
+echo "PASS: _wpad fixes display-width padding; _ep_fit caps endpoints while preserving the port"

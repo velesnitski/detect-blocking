@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.2] - 2026-06-18
+
+### Changed (security)
+
+- **`sub-run.yml` now refuses paste-in inputs on a public repo.** `workflow_dispatch`
+  input values are recorded in the run's metadata and are world-readable, so a
+  `sub_url` / `sub_json` pasted into the form on a public repo leaks (a tokened URL
+  ends up public). The workflow now aborts with a clear error when the repo is public
+  and either input is non-empty, forcing the masked `SUB_URL` secret with a blank
+  form. Private repos/forks are unaffected (they can still paste + use `redact:false`).
+
 ## [0.32.1] - 2026-06-18
 
 ### Fixed

@@ -43,6 +43,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # On a PUBLIC repo, workflow_dispatch input VALUES are recorded in the run's
+      # metadata and are world-readable — so a pasted sub_url / sub_json (which may
+      # carry a token) would leak. Refuse to run in that case and force the masked
+      # SUB_URL secret (blank form) instead. Private repos/forks are unaffected.
+      - name: Guard — no paste-in inputs on a public repo (they leak)
+        if: ${{ github.event.repository.private == false && (inputs.sub_url != '' || inputs.sub_json != '') }}
+        run: |
+          echo "::error::Public repo: the sub_url/sub_json inputs are stored in this run's metadata and are world-readable. Leave them BLANK and set the SUB_URL repo secret instead (Settings → Secrets and variables → Actions). Aborting to prevent a token leak. If you pasted a real URL, rotate that token now."
+          exit 1
+
       - name: Ensure jq + xray
         run: |
           command -v jq >/dev/null || { sudo apt-get update && sudo apt-get install -y jq; }

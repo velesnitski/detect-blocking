@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.25.0"
+readonly DETECT_BLOCKING_VERSION="0.25.1"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -3327,24 +3327,35 @@ probe_subscription_walk() {
   { [ -n "${SUB_DIR:-}" ] && [ -d "$SUB_DIR" ]; } || return 0
   hdr "Subscription fleet scan — ${SUB_COUNT} configs (fingerprint-only, no tunnel)"
   printf '          %-3s %-24s %-34s %-12s %s\n' "#" "remarks" "server:port" "cover" "detect"
-  local f i=0 j score band remarks server cover crit=0 high=0 mod=0 low=0
+  local f i=0 j score band remarks host port server cover crit=0 high=0 mod=0 low=0 dead=0
   for f in "$SUB_DIR"/[0-9][0-9][0-9].json; do
     [ -f "$f" ] || continue
     remarks=$(_safe "$(jq -r '.remarks // .name // "?"' "$f" 2>/dev/null)")
-    server=$(_safe "$(jq -r 'first(.outbounds[]? | select(.settings.vnext != null or .settings.servers != null) | "\((.settings.vnext // .settings.servers)[0].address):\((.settings.vnext // .settings.servers)[0].port)") // "-"' "$f" 2>/dev/null)")
+    host=$(_safe "$(jq -r 'first(.outbounds[]? | select(.settings.vnext != null or .settings.servers != null) | (.settings.vnext // .settings.servers)[0].address) // empty' "$f" 2>/dev/null)")
+    port=$(_safe "$(jq -r 'first(.outbounds[]? | select(.settings.vnext != null or .settings.servers != null) | (.settings.vnext // .settings.servers)[0].port) // empty' "$f" 2>/dev/null)")
     cover=$(_safe "$(jq -r 'first(.outbounds[]? | .streamSettings.realitySettings.serverName // empty) // "-"' "$f" 2>/dev/null)")
-    if [ "$server" = "-" ]; then
+    if [ -z "$host" ]; then
       printf '          %-3s %-24.24s %-34.34s %-12.12s %s\n' "$i" "$remarks" "(no vless outbound)" "-" "skip (HY)"
       i=$((i+1)); continue
     fi
-    j=$(bash "$0" --xray-config-json "$f" --no-tunnel --json 2>/dev/null)
+    server="${host}:${port}"
+    # Bounded TCP precheck first (nc -G/-w $TIMEOUT) — a dead server's openssl
+    # connect would otherwise hang the OS connect timeout (~75s), not $TIMEOUT.
+    if ! _nc_tcp_probe "$host" "$port"; then
+      dead=$((dead+1))
+      printf '          %-3s %-24.24s %-34.34s %-12.12s %s\n' "$i" "$remarks" "$server" "$cover" "unreachable (TCP)"
+      i=$((i+1)); continue
+    fi
+    # Fingerprint only: --only xray,xrayjson skips the transport probes (0-10),
+    # --no-tunnel skips the xray-spawning/data probes → just the direct detectability.
+    j=$(bash "$0" --xray-config-json "$f" --only xray,xrayjson --no-tunnel --json 2>/dev/null)
     score=$(printf '%s' "$j" | jq -r '.probes.xray_detectability.score // "?"' 2>/dev/null)
     band=$(printf '%s'  "$j" | jq -r '.probes.xray_detectability.band  // "?"' 2>/dev/null)
     case "$band" in critical) crit=$((crit+1)) ;; high) high=$((high+1)) ;; moderate) mod=$((mod+1)) ;; low) low=$((low+1)) ;; esac
     printf '          %-3s %-24.24s %-34.34s %-12.12s %s/%s\n' "$i" "$remarks" "$server" "$cover" "${score:-?}" "${band:-?}"
     i=$((i+1))
   done
-  info "fleet detectability: ${crit} critical · ${high} high · ${mod} moderate · ${low} low (Hysteria entries skipped — no Reality fingerprint)"
+  info "fleet detectability: ${crit} critical · ${high} high · ${mod} moderate · ${low} low · ${dead} unreachable (Hysteria entries skipped — no Reality fingerprint)"
   info "deep-test any server (tunnel + throughput + stability) with: --sub-test N"
 }
 

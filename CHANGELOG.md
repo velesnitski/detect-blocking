@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.1] - 2026-06-18
+
+### Fixed
+
+- **Fleet walk (`--sub-test all`) is now fast and robust.** Two issues with the
+  v0.25.0 walk: (1) each per-server self-invoke also ran the **transport probes
+  (0-10)** — now it passes `--only xray,xrayjson` so only the fingerprint probes
+  run; (2) a dead/unreachable server's `openssl` connect hangs the OS connect
+  timeout (~75 s), not `TIMEOUT` — the walk now does a **bounded TCP precheck**
+  (`nc -G/-w $TIMEOUT`) per server and marks unreachable ones without attempting
+  the handshake (reported in the summary as `… unreachable`). A 28-server fleet,
+  including down nodes, now scans in seconds instead of stalling.
+
+
 ## [0.25.0] - 2026-06-18
 
 ### Added

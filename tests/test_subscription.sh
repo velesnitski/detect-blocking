@@ -19,10 +19,10 @@ ID='00000000-0000-0000-0000-000000000000'
 cat > "$tmp/arr.json" <<EOF
 [
  {"remarks":"Alpha","outbounds":[
-   {"tag":"p","protocol":"vless","settings":{"vnext":[{"address":"192.0.2.10","port":443,"users":[{"id":"$ID","flow":"xtls-rprx-vision","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"publicKey":"$PBK","serverName":"www.example.com","shortId":"01","fingerprint":"chrome"}}},
+   {"tag":"p","protocol":"vless","settings":{"vnext":[{"address":"127.0.0.1","port":1,"users":[{"id":"$ID","flow":"xtls-rprx-vision","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"publicKey":"$PBK","serverName":"www.example.com","shortId":"01","fingerprint":"chrome"}}},
    {"tag":"direct","protocol":"freedom"}]},
  {"remarks":"Bravo","outbounds":[
-   {"tag":"p","protocol":"vless","settings":{"vnext":[{"address":"192.0.2.20","port":8443,"users":[{"id":"$ID","flow":"xtls-rprx-vision","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"publicKey":"$PBK","serverName":"www.microsoft.com","shortId":"01","fingerprint":"chrome"}}}]},
+   {"tag":"p","protocol":"vless","settings":{"vnext":[{"address":"127.0.0.1","port":2,"users":[{"id":"$ID","flow":"xtls-rprx-vision","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"publicKey":"$PBK","serverName":"www.microsoft.com","shortId":"01","fingerprint":"chrome"}}}]},
  {"remarks":"Charlie-noproxy","outbounds":[{"protocol":"freedom"}]}
 ]
 EOF
@@ -34,7 +34,7 @@ printf '%s' "$out" | grep -q 'Alpha'   || fail "inventory should list Alpha"
 printf '%s' "$out" | grep -q 'Bravo'   || fail "inventory should list Bravo"
 printf '%s' "$out" | grep -qE 'noproxy.*no proxy outbound' || fail "a config with no proxy outbound should be noted"
 printf '%s' "$out" | grep -qE '#1 .*Bravo.*tested below' || fail "--sub-test 1 should mark Bravo as the tested config"
-printf '%s' "$out" | grep -q '192.0.2.20:8443' || fail "inventory should show the server endpoint"
+printf '%s' "$out" | grep -q '127.0.0.1:2' || fail "inventory should show the server endpoint"
 
 # --- out-of-range --sub-test clamps to 0 (Alpha) ---
 out=$(TIMEOUT=2 bash "$SCRIPT" --subscription "file://$tmp/arr.json" --sub-test 99 --only env 2>&1)

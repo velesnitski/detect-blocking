@@ -512,7 +512,7 @@ no data pull, so a whole fleet is just TLS handshakes:
 == Subscription fleet scan — 28 configs (fingerprint-only, no tunnel) ==
   tells = fired detectability signals (why the score); fp = deployment template …
   #   remarks         server:port                cover              detect       fp        tells
-  0   Auto            edge01.example.net:443     www.microsoft.com  100/critical abcdef01  self-signed,no-relay
+  0   Auto            edge01.example.net:443     www.microsoft.com  100/critical abcdef01  self-signed,no-relay:403,tls-parity:cipher+ext,sni!=ip,exposed:22
   7   Country B       edge07.example.net:443     news.example.io    70/critical  abcdef01  cover-obscure
   9   Country C       edge09.example.net:8443    cdn.example.io     60/high      a1b2c3d4  cover-obscure,non443
   fleet detectability: 27 critical · 1 high · 0 moderate · 0 low · 0 unreachable …
@@ -524,12 +524,21 @@ no data pull, so a whole fleet is just TLS handshakes:
 
 - **`tells`** is the compact set of detectability signals that drove each score,
   so you see *why* a node scores what it does — and how the outliers differ —
-  without deep-testing each. Tokens: `self-signed` / `cover-mismatch` /
-  `cover-unreach` (Reality cover-cert), `no-relay` (active prober sees a different
-  response than the genuine cover), `tls-parity` (server TLS ≠ cover TLS),
-  `cover-obscure`, `sni!=ip`, `sni-nxdomain`, `non443`, `sni-kw`, `vision-off`
-  (TLS-in-TLS not protected), `exposed:N` (open service ports), `throttle?`.
-  `clean` means nothing fired.
+  without deep-testing each. Where a signal has a value, the token carries it, so
+  it's actionable at a glance. Tokens:
+  - **Cover / active probe:** `self-signed` / `cover-mismatch` / `cover-unreach`
+    (Reality cover-cert), `chain-invalid` (cert chain), `cn!=sni` (cert CN ≠
+    serverName), **`no-relay:CODE`** (the active prober got HTTP `CODE` instead of
+    a relay to the genuine cover — e.g. `no-relay:403`), **`tls-parity:DIMS`**
+    (server TLS ≠ cover TLS on `ver`/`alpn`/`cipher`/`ext`).
+  - **Passive fingerprint:** `sni!=ip`, `sni-nxdomain`, `non443`, `sni-kw`
+    (keyword in SNI), `cover-obscure`, `vision-off` (TLS-in-TLS not protected),
+    `utls-rare` (uncommon uTLS fp — can be deliberate, e.g. `fp=qq` to evade a
+    signature censor), `mux` (multiplexing on).
+  - **Correctness / exposure:** `fet` (flow/`fragment` exposure), `id-nonuuid`
+    (non-UUID VLESS id), `clock:Ns` (client clock skew ≥ 5s), **`exposed:PORTS`**
+    (the actual open service ports, e.g. `exposed:22+8080`, `+Nmore` past two).
+  - `clean` means nothing fired.
 - **`fp`** is a short **deployment-template fingerprint**. Servers built from the
   same template share an `fp`; the **template-cluster summary** at the bottom
   groups the fleet by it, so a fleet built from one build shows as a single line

@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.26.0"
+readonly DETECT_BLOCKING_VERSION="0.27.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -3329,23 +3329,50 @@ _fleet_row_fields() {
   printf '%s' "${1-}" | jq -r '
     .probes as $p
     | (($p // {}).xray_detectability // {}) as $d
+    | ($p.xray_cover // {})        as $cv
+    | ($p.xray_active_probe // {}) as $ap
+    | ($p.xray_tls_parity // {})   as $tp
+    | ($p.xray_lint // {})         as $ln
+    | ($p.xray_clock // {})        as $ck
+    | (($p.host_exposure // {}).open_ports // []) as $op
+    # which TLS dimensions diverged from the cover (only set when parity mismatched)
+    | ([ (if $tp.version_match == false then "ver"    else empty end),
+         (if $tp.alpn_match    == false then "alpn"   else empty end),
+         (if $tp.cipher_match  == false then "cipher" else empty end),
+         (if $tp.ext_match     == false then "ext"    else empty end) ] | join("+")) as $pdims
     | [ (($d.score // "?") | tostring),
         ($d.band // "?"),
         ((($d.deployment_fingerprint) // "-") | tostring | .[0:8]),
-        ([ (if   $p.xray_cover.status == "fake"        then "self-signed"
-            elif $p.xray_cover.status == "mismatch"    then "cover-mismatch"
-            elif $p.xray_cover.status == "unreachable" then "cover-unreach" else empty end),
-           (if $p.xray_active_probe.matches_cover == false then "no-relay"   else empty end),
-           (if $p.xray_tls_parity.status == "mismatch"     then "tls-parity" else empty end),
-           (if $d.cover_obscure == true              then "cover-obscure" else empty end),
-           (if $d.sni_ip_asn_match == false          then "sni!=ip"       else empty end),
-           (if $d.sni_resolves == false              then "sni-nxdomain"  else empty end),
-           (if $d.port_standard == false             then "non443"        else empty end),
-           (if $d.sni_keyword == true                then "sni-kw"        else empty end),
-           (if $d.tls_in_tls_protected == false      then "vision-off"    else empty end),
-           (if (($p.host_exposure.open_ports // []) | length) > 0
-              then "exposed:" + ((($p.host_exposure.open_ports // []) | length) | tostring) else empty end),
-           (if $d.volume_throttle_suspected == true  then "throttle?"     else empty end)
+        # tells: each signal carries its value where it has one, so the table is
+        # actionable (which port / which HTTP code / which TLS dim), not just labels.
+        ([ (if   $cv.status == "fake"        then "self-signed"
+            elif $cv.status == "mismatch"    then "cover-mismatch"
+            elif $cv.status == "unreachable" then "cover-unreach" else empty end),
+           (if $cv.chain_valid == false           then "chain-invalid" else empty end),
+           (if $cv.cn_matches_servername == false then "cn!=sni"       else empty end),
+           (if $ap.matches_cover == false
+              then "no-relay" + (if (($ap.relay_http_code // "") | tostring) != "" then ":" + ($ap.relay_http_code | tostring) else "" end)
+              else empty end),
+           (if $tp.status == "mismatch"
+              then "tls-parity" + (if $pdims != "" then ":" + $pdims else "" end)
+              else empty end),
+           (if $d.tls_in_tls_protected == false then "vision-off"    else empty end),
+           (if $d.sni_ip_asn_match == false     then "sni!=ip"       else empty end),
+           (if $d.sni_resolves == false         then "sni-nxdomain"  else empty end),
+           (if $d.port_standard == false        then "non443"        else empty end),
+           (if $d.sni_keyword == true           then "sni-kw"        else empty end),
+           (if $d.cover_obscure == true         then "cover-obscure" else empty end),
+           (if $ln.fet_exposed == true          then "fet"           else empty end),
+           (if $d.mux_enabled == true           then "mux"           else empty end),
+           (if $ln.id_uuid == false             then "id-nonuuid"    else empty end),
+           (if $d.utls_fp_uncommon == true      then "utls-rare"     else empty end),
+           (if ($ck.skew_seconds != null and ($ck.skew_seconds | fabs) >= 5)
+              then "clock:" + ($ck.skew_seconds | tostring) + "s" else empty end),
+           (if ($op | length) > 0
+              then "exposed:" + (($op | map(tostring | split("/")[0]))[0:2] | join("+"))
+                   + (if ($op | length) > 2 then "+" + ((($op | length) - 2) | tostring) + "more" else "" end)
+              else empty end),
+           (if $d.volume_throttle_suspected == true then "throttle?" else empty end)
          ] | if length == 0 then "clean" else join(",") end) ]
     | @tsv' 2>/dev/null
 }
@@ -3356,7 +3383,9 @@ _fleet_row_fields() {
 # TLS handshakes. Deep-test any row with --sub-test N. Values are _safe-sanitised.
 probe_subscription_walk() {
   { [ -n "${SUB_DIR:-}" ] && [ -d "$SUB_DIR" ]; } || return 0
-  local fmt='          %-3s %-22s %-36.36s %-16.16s %-13s %-9s %s\n'
+  # server:port is pad-only (no byte-truncation): a long hostname makes the row a
+  # little ragged, but the port is NEVER cut off (losing it is real data loss).
+  local fmt='          %-3s %-22s %-36s %-16.16s %-13s %-9s %s\n'
   hdr "Subscription fleet scan — ${SUB_COUNT} configs (fingerprint-only, no tunnel)"
   info "tells = fired detectability signals (why the score); fp = deployment template — configs sharing an fp are the same server build"
   # shellcheck disable=SC2059

@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-06-18
+
+### Added
+
+- **Fleet-walk `tells` now carry their values — actionable, not just labels.**
+  `no-relay` → **`no-relay:403`** (the HTTP code the active prober actually got
+  instead of a relay), `tls-parity` → **`tls-parity:cipher+ext`** (which TLS
+  dimensions diverged from the cover), `exposed:1` → **`exposed:22+8080`** (the
+  real open ports, collapsing to `+Nmore` past two).
+- **Six new tells**, all from direct probes already running under `--no-tunnel`:
+  `chain-invalid` (cover cert chain), `cn!=sni` (cert CN ≠ serverName), `fet`
+  (flow/`fragment` exposure, lint 18), `mux` (multiplexing on — a Reality
+  detectability risk), `id-nonuuid` (non-UUID VLESS id), `utls-rare` (uncommon
+  uTLS fingerprint), and `clock:Ns` (client clock skew ≥ 5s, probe 19).
+
+### Fixed
+
+- **Fleet table no longer truncates the port off a long hostname.** A
+  `host:port` longer than the 36-char column was byte-cut (`…kkk.com:4` — the
+  port silently lost, real data loss). The server column is now pad-only: a long
+  hostname makes that row slightly ragged but the port is always intact.
+
 ## [0.26.0] - 2026-06-18
 
 ### Added

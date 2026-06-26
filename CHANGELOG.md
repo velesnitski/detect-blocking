@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.39.1] - 2026-06-26
+
+### Fixed
+
+- **Root-cause fix for the `--yt-test` / `--conn-test` hang.** Both probes launched
+  their curls with `&` and then called a **bare `wait`** — which, in the main shell,
+  blocks on *every* background job including the long-lived **xray-core** process that
+  probe 12 starts. So whenever the tunnel was up (probe 12 ok), the YouTube probe hung
+  **forever** on xray-core (the v0.39.0 maxt cap / single-probe / progress bounded the
+  *curls* but not this `wait`). Now each probe collects its curl PIDs and waits only on
+  those (`wait $pids`), so it returns as soon as its own connections finish. Verified a
+  long-lived background job no longer blocks the wait.
+
 ## [0.39.0] - 2026-06-26
 
 ### Changed

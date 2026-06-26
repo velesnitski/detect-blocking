@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.39.0"
+readonly DETECT_BLOCKING_VERSION="0.39.1"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -3320,11 +3320,16 @@ probe_conn_limit() {
   local t=$(( TIMEOUT + 3 )) d i
   d=$(mktemp -d -t detect_blocking.conn.XXXXXX) || { CONN_LIMIT_STATUS="error"; return 0; }
   # Fire all N at once (same instant) so a concurrency cap actually triggers.
+  local pids=""
   for i in $(seq 1 "$n"); do
     ( curl -k -sS --max-time "$t" --connect-to "${sni}:443:${VPN_HOST}:${VPN_PORT_TCP}" \
         "https://${sni}/" -o /dev/null -w '%{time_appconnect}' 2>/dev/null > "$d/$i" ) &
+    pids="$pids $!"
   done
-  wait
+  # Wait ONLY for our curls — a bare `wait` would also block on a long-lived xray-core
+  # background job (probe 12, when --conn-test runs without --no-tunnel) and hang.
+  # shellcheck disable=SC2086
+  [ -n "$pids" ] && wait $pids 2>/dev/null
   local succ=0 fail=0 minms="" maxms=0 ta ms
   for i in $(seq 1 "$n"); do
     ta=$(cat "$d/$i" 2>/dev/null)
@@ -3415,11 +3420,13 @@ probe_yt_reach() {
   else
     info "probing ${n} connection(s) across ${nh} YouTube host(s) via the tunnel (up to ${maxt}s)…"
   fi
+  local pids=""
   for i in $(seq 1 "$n"); do
     host="${ha[$(( (i-1) % nh ))]}"
     ( curl -sS --max-time "$maxt" --socks5-hostname "127.0.0.1:$port" \
         -o /dev/null -w '%{time_starttransfer} %{http_code}' \
         "https://${host}/" 2>/dev/null > "$d/$i"; : > "$d/$i.done" ) &
+    pids="$pids $!"
   done
   # Live progress (terminal only — suppressed under --json) so a slow/dead tunnel
   # shows a ticking counter instead of looking frozen.
@@ -3432,7 +3439,10 @@ probe_yt_reach() {
     done
     printf '\r\033[K' >&2
   fi
-  wait
+  # Wait ONLY for our curls — a bare `wait` would also block on the long-lived
+  # xray-core background job (probe 12) and hang forever.
+  # shellcheck disable=SC2086
+  [ -n "$pids" ] && wait $pids 2>/dev/null
   local succ=0 fail=0 minms="" maxms=0 line ttfb code ms
   for i in $(seq 1 "$n"); do
     line=$(cat "$d/$i" 2>/dev/null); ttfb=${line%% *}; code=${line##* }

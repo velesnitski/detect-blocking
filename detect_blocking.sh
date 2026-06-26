@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.35.0"
+readonly DETECT_BLOCKING_VERSION="0.36.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -158,6 +158,8 @@ while [ $# -gt 0 ]; do
     --scan-covers=*) XRAY_SCAN_COVERS="${1#--scan-covers=}"; shift ;;
     --censor-sweep) case "${2:-}" in ""|-*) XRAY_CENSOR_SWEEP=default; shift ;; *) XRAY_CENSOR_SWEEP="$2"; shift 2 ;; esac ;;
     --censor-sweep=*) XRAY_CENSOR_SWEEP="${1#--censor-sweep=}"; shift ;;
+    --conn-test) case "${2:-}" in ""|-*|*[!0-9]*) CONN_TEST_N=16; shift ;; *) CONN_TEST_N="$2"; shift 2 ;; esac ;;
+    --conn-test=*) CONN_TEST_N="${1#--conn-test=}"; case "$CONN_TEST_N" in ''|*[!0-9]*) CONN_TEST_N=16 ;; esac; shift ;;
     --full|--thorough)
       # Umbrella: turn on the two opt-in scanners (everything else already runs by
       # default for a config). Explicit by design — --censor-sweep fetches
@@ -226,6 +228,9 @@ while [ $# -gt 0 ]; do
       printf '  --xray-only         only the Xray-protocol probes (11-26 + routing/egress); skips transport probes 0-10 (alias for --only xray,xrayjson; needs --xray-config / --xray-config-json)\n'
       printf '  --scan-covers[=LIST] rank candidate Reality dest/serverName covers (TLSv1.3 + H2 + CA-valid + non-redirect); LIST is comma-separated, or omit for a built-in set\n'
       printf '  --censor-sweep[=LIST] reachability of commonly-censored hosts, direct vs through the tunnel (does the tunnel unblock them?); LIST is comma-separated, or omit for a built-in set\n'
+      printf '  --conn-test [N]     open N (default 16) simultaneous TLS handshakes to the server and report how\n'
+      printf '                      many complete — does it cap / rate-limit / degrade under concurrency (server\n'
+      printf '                      robustness; pair with --sub-test N to deep-test one fleet node). Direct probe.\n'
       printf '  --full, --thorough  comprehensive run: enable the opt-in scanners (--scan-covers + --censor-sweep);\n'
       printf '                      everything else already runs by default. NOTE: --censor-sweep fetches censored sites from THIS machine\n'
       printf '  --skip LIST         skip listed probes\n'
@@ -877,6 +882,15 @@ XRAY_COVER_CANDIDATES="${XRAY_COVER_CANDIDATES:-www.microsoft.com www.apple.com 
 XRAY_COVER_SCAN_STATUS=""   # ok / skipped
 XRAY_COVER_SCAN_BEST=""     # best-ranked candidate domain
 XRAY_COVER_SCAN_RESULTS=""  # newline-joined "domain|tls13|h2|cavalid|nonredirect|verdict" for JSON
+
+# ---- connection-limit probe (--conn-test N): server robustness under concurrency ----
+# Opt-in. Opens N simultaneous TLS handshakes to the server and reports how many
+# complete + the handshake-time spread — i.e. does the server CAP / rate-limit /
+# degrade under concurrent connections (a robustness/UX signal, not a censorship one).
+CONN_TEST_N="${CONN_TEST_N:-}"   # "" off; else N concurrent handshakes (clamped 1..128)
+CONN_LIMIT_STATUS=""             # disabled / ok / unreachable / curl-missing / error
+CONN_LIMIT_REQUESTED=""; CONN_LIMIT_SUCC=""; CONN_LIMIT_FAIL=""
+CONN_LIMIT_MINMS=""; CONN_LIMIT_MAXMS=""; CONN_LIMIT_VERDICT=""
 
 # ---- censored-URL sweep (--censor-sweep): OONI-style reachability, direct vs tunnel ----
 # Tests a list of commonly-censored hosts DIRECT and (when the tunnel is up)
@@ -3251,6 +3265,73 @@ probe_host_exposure() {
     add_verdict "Server exposes a proxy-panel port (e.g. x-ui/3x-ui) to the internet — a takeover risk and a detectability tell: a host that impersonates a CDN cover should expose only 443. Bind the panel to localhost (reach it over an SSH tunnel) or firewall it to an admin allowlist"
   fi
   [ "$admin" = "1" ] && info "SSH/RDP reachable — normal for admin, but a real CDN edge doesn't answer it; restricting management to a jump host / firewall allowlist sharpens the host's web-only profile"
+}
+
+# Pure helper (unit-testable): classify a concurrency burst. succeeded/total +
+# min/max handshake ms → one of: all-failed / capped / degraded / clean.
+_classify_conn_limit() {
+  local s="${1:-0}" t="${2:-0}" mn="${3:-0}" mx="${4:-0}"
+  [ "$s" -eq 0 ] && { echo "all-failed"; return; }
+  [ "$s" -lt "$t" ] && { echo "capped"; return; }
+  # all completed: degraded if the slowest handshake ballooned vs the fastest
+  if [ "$mx" -ge 800 ] && [ "$mn" -gt 0 ] && [ "$mx" -ge $(( mn * 3 )) ]; then echo "degraded"; return; fi
+  echo "clean"
+}
+
+# --conn-test N: open N simultaneous TLS handshakes to the server and report how
+# many complete + the handshake-time spread. Tells you whether the server CAPS /
+# rate-limits / degrades under concurrent connections (robustness & real-world UX
+# behind CGNAT / many devices — NOT a censorship signal). Direct (no tunnel), so it
+# works standalone and inside a --sub-test N deep dive. Bounded per-connection by
+# curl --max-time (openssl can't be bounded on macOS). Opt-in; never auto-runs.
+probe_conn_limit() {
+  [ -n "${CONN_TEST_N:-}" ] || { CONN_LIMIT_STATUS="disabled"; return 0; }
+  [ "$CONN_TEST_N" -ge 1 ]   2>/dev/null || CONN_TEST_N=16
+  [ "$CONN_TEST_N" -le 128 ] 2>/dev/null || CONN_TEST_N=128   # safety cap — not a flood tool
+  local n="$CONN_TEST_N"
+  hdr "Connection-limit probe (${n} concurrent TLS handshakes)"
+  if ! check_cmd curl; then warn "skipping — curl not available"; CONN_LIMIT_STATUS="curl-missing"; return 0; fi
+  if ! _nc_tcp_probe "$VPN_HOST" "$VPN_PORT_TCP"; then
+    warn "skipping — ${VPN_HOST}:${VPN_PORT_TCP} not reachable (TCP)"; CONN_LIMIT_STATUS="unreachable"; return 0
+  fi
+  local sni; sni=$(_xray_cover_sni 2>/dev/null); [ -z "$sni" ] && sni="$VPN_HOST"
+  local t=$(( TIMEOUT + 3 )) d i
+  d=$(mktemp -d -t detect_blocking.conn.XXXXXX) || { CONN_LIMIT_STATUS="error"; return 0; }
+  # Fire all N at once (same instant) so a concurrency cap actually triggers.
+  for i in $(seq 1 "$n"); do
+    ( curl -k -sS --max-time "$t" --connect-to "${sni}:443:${VPN_HOST}:${VPN_PORT_TCP}" \
+        "https://${sni}/" -o /dev/null -w '%{time_appconnect}' 2>/dev/null > "$d/$i" ) &
+  done
+  wait
+  local succ=0 fail=0 minms="" maxms=0 ta ms
+  for i in $(seq 1 "$n"); do
+    ta=$(cat "$d/$i" 2>/dev/null)
+    ms=$(awk -v s="${ta:-0}" 'BEGIN{printf "%d", (s+0)*1000}')
+    if [ "${ms:-0}" -gt 0 ]; then
+      succ=$((succ+1))
+      { [ -z "$minms" ] || [ "$ms" -lt "$minms" ]; } && minms=$ms
+      [ "$ms" -gt "$maxms" ] && maxms=$ms
+    else
+      fail=$((fail+1))
+    fi
+  done
+  rm -rf "$d"
+  [ -z "$minms" ] && minms=0
+  CONN_LIMIT_STATUS="ok"; CONN_LIMIT_REQUESTED="$n"; CONN_LIMIT_SUCC="$succ"; CONN_LIMIT_FAIL="$fail"
+  CONN_LIMIT_MINMS="$minms"; CONN_LIMIT_MAXMS="$maxms"
+  CONN_LIMIT_VERDICT=$(_classify_conn_limit "$succ" "$n" "$minms" "$maxms")
+  case "$CONN_LIMIT_VERDICT" in
+    clean)
+      ok "handled ${succ}/${n} concurrent TLS handshakes (${minms}-${maxms}ms) — no connection cap or throttle observed" ;;
+    capped)
+      warn "only ${succ}/${n} concurrent handshakes completed — the server CAPS or rate-limits concurrent connections; clients behind CGNAT or with many apps/devices will see failures"
+      add_verdict "Server completes only ${succ}/${n} concurrent TLS handshakes — a low concurrent-connection cap / rate-limit. Raise the listener backlog + OS limits (ulimit -n / somaxconn) and check any fail2ban / iptables connection-rate rules [server-side]" ;;
+    degraded)
+      warn "${succ}/${n} completed but the handshake time ballooned ${minms}→${maxms}ms under load — soft throttle / resource contention under concurrency" ;;
+    all-failed)
+      warn "0/${n} concurrent handshakes completed although TCP is open — connections are dropped under concurrency (aggressive cap or SYN-rate protection)"
+      add_verdict "0/${n} concurrent TLS handshakes completed despite an open TCP port — the server drops connections under concurrency. Investigate connection-rate limiting / SYN protections and OS limits [server-side]" ;;
+  esac
 }
 
 # Happ routing-profile recognition. A happ://routing/add/ link carries a
@@ -5733,6 +5814,13 @@ _emit_json() {
     --arg xtp_cfp           "$XRAY_TLSPAR_COVER_FP" \
     --arg hx_status         "$XRAY_HOSTEXP_STATUS" \
     --arg hx_open           "$XRAY_HOSTEXP_OPEN" \
+    --arg cl_status         "$CONN_LIMIT_STATUS" \
+    --arg cl_req            "$CONN_LIMIT_REQUESTED" \
+    --arg cl_succ           "$CONN_LIMIT_SUCC" \
+    --arg cl_fail           "$CONN_LIMIT_FAIL" \
+    --arg cl_minms          "$CONN_LIMIT_MINMS" \
+    --arg cl_maxms          "$CONN_LIMIT_MAXMS" \
+    --arg cl_verdict        "$CONN_LIMIT_VERDICT" \
     --arg hy_status         "$HYSTERIA_STATUS" \
     --arg hy_sni_keyword    "$HYSTERIA_SNI_KEYWORD" \
     --arg hy_sni_explicit   "$HYSTERIA_SNI_EXPLICIT" \
@@ -6007,6 +6095,15 @@ _emit_json() {
           status: opt($hx_status),
           open_ports: (if $hx_open == "" then [] else ($hx_open | split(", ") | map(select(length > 0))) end)
         },
+        conn_limit: {
+          status: opt($cl_status),
+          requested: (if $cl_req == "" then null else ($cl_req | tonumber? // null) end),
+          succeeded: (if $cl_succ == "" then null else ($cl_succ | tonumber? // null) end),
+          failed: (if $cl_fail == "" then null else ($cl_fail | tonumber? // null) end),
+          min_handshake_ms: (if $cl_minms == "" then null else ($cl_minms | tonumber? // null) end),
+          max_handshake_ms: (if $cl_maxms == "" then null else ($cl_maxms | tonumber? // null) end),
+          verdict: opt($cl_verdict)
+        },
         hysteria: {
           status: opt($hy_status),
           sni_keyword: tri_bool(($hy_sni_keyword | tonumber? // -1)),
@@ -6249,6 +6346,8 @@ fi
 [ -z "${NO_TUNNEL:-}" ] && _should_run xrayjson && probe_xray_speedtest
 { _should_run xray || _should_run xrayjson; } && probe_xray_cover
 { _should_run xray || _should_run xrayjson; } && probe_host_exposure
+# Connection-limit probe: opt-in (--conn-test), direct (runs under --no-tunnel too).
+[ -n "${CONN_TEST_N:-}" ] && probe_conn_limit
 [ -z "${NO_TUNNEL:-}" ] && _should_run xrayjson && probe_xray_egress
 [ -z "${NO_TUNNEL:-}" ] && _should_run xrayjson && probe_xray_stability
 # Lint + clock-skew run in numeric position (after 17, before 20). They're

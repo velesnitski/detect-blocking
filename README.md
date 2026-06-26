@@ -568,6 +568,28 @@ cover is relayed), so the plan collapses them into a handful of fixes, tells you
   same template share it. The fleet table is fingerprint-only — for the full
   tunnel + throughput + stability picture on a specific row, run `--sub-test N`.
 
+### Connection-limit probe (`--conn-test [N]`)
+
+Opt-in robustness check: opens **N simultaneous TLS handshakes** (default 16) to the
+server and reports how many complete + the handshake-time spread, so you can see
+whether the server **caps / rate-limits / degrades under concurrency** — which is
+what clients behind CGNAT or with many devices actually hit. It's a *server
+robustness / UX* signal, not a censorship one.
+
+```
+# standalone against one config/host
+./detect_blocking.sh --xray-config 'vless://…' --conn-test 32
+
+# deep-test one fleet node, including its connection handling
+./detect_blocking.sh --subscription URL --sub-test 7 --conn-test
+```
+
+Verdicts: **clean** (handled N concurrent, stable) · **capped** (only X/N completed
+— a low connection cap / rate-limit) · **degraded** (all completed but handshake
+time ballooned under load) · **all-failed** (TCP open but every handshake dropped).
+It's a direct probe (no tunnel) and never auto-runs — it's not part of `--sub-test
+all`. JSON: `probes.conn_limit`.
+
 ### Probe 13 — data-plane throughput (catches cover-SNI shaping)
 
 Probe 12 confirms the Reality / VLESS handshake succeeds, but says nothing

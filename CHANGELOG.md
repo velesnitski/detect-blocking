@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-06-26
+
+### Added
+
+- **`--conn-test [N]` — server connection-limit probe.** Opt-in. Opens **N
+  simultaneous TLS handshakes** (default 16, capped at 128) to the server and
+  reports how many complete plus the handshake-time spread, classifying the result
+  as **clean** (handled N concurrent, stable), **capped** (only X/N completed — a
+  concurrent-connection cap / rate-limit; clients behind CGNAT or with many devices
+  will see failures), **degraded** (all completed but handshake time ballooned under
+  load), or **all-failed** (TCP open but every handshake dropped). It's a *server
+  robustness / UX* signal, not a censorship one. Direct probe (bounded per-connection
+  by `curl --max-time`, since openssl can't be timed out on macOS), so it works
+  standalone and inside a `--sub-test N` deep dive; it never auto-runs (not part of
+  the fleet walk). JSON: `probes.conn_limit`. Pure classifier `_classify_conn_limit`
+  + `tests/test_conn_limit.sh`.
+
 ## [0.35.0] - 2026-06-18
 
 ### Added

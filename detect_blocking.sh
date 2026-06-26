@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.39.1"
+readonly DETECT_BLOCKING_VERSION="0.39.2"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -3428,9 +3428,11 @@ probe_yt_reach() {
         "https://${host}/" 2>/dev/null > "$d/$i"; : > "$d/$i.done" ) &
     pids="$pids $!"
   done
-  # Live progress (terminal only — suppressed under --json) so a slow/dead tunnel
-  # shows a ticking counter instead of looking frozen.
-  if [ "${LOG_QUIET:-0}" != "1" ]; then
+  # Live progress (interactive terminal only — suppressed under --json, and when
+  # stderr is redirected to a file/pipe/CI so the \r + \033[K cursor codes don't
+  # leak in as literal bytes) so a slow/dead tunnel shows a ticking counter
+  # instead of looking frozen.
+  if [ "${LOG_QUIET:-0}" != "1" ] && [ -t 2 ]; then
     local _el=0 _dn=0
     while [ "$_dn" -lt "$n" ] && [ "$_el" -le "$maxt" ]; do
       _dn=$(find "$d" -name '*.done' 2>/dev/null | grep -c .)

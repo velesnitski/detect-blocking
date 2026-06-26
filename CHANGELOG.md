@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.39.2] - 2026-06-26
+
+### Fixed
+- **YouTube fan-out progress no longer leaks cursor escapes into non-terminal output.** The live `probing… k/N done (Ns)` counter emitted `\r` + `\033[K` whenever it wasn't under `--json`, so redirecting/piping the run (to a file, `tee`, or a CI log) showed literal `…done (2s) ␛[K [OK]` bytes. The progress loop is now additionally gated on `[ -t 2 ]` (stderr is an interactive terminal); when output isn't a TTY the counter is skipped entirely and the verdict prints clean. The connections + bounded `wait` are unchanged. Verified end-to-end against a live tunnel: 6/6 clean, zero escape/CR artifacts in captured output.
+
 ## [0.39.1] - 2026-06-26
 
 ### Fixed

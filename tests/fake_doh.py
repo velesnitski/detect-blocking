@@ -41,5 +41,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    # Bind FIRST, then announce — so a reader of stdout (or a port poll) only
+    # sees "listening" once the socket is actually accepting, closing the
+    # startup race that flaked the macOS CI runner.
+    server = http.server.HTTPServer(("127.0.0.1", PORT), Handler)
     print(f"fake_doh: listening on 127.0.0.1:{PORT}", flush=True)
-    http.server.HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    server.serve_forever()

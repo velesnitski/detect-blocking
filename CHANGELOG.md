@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### CI
+- **Hardened the DoH-compromise test fixture against a cold-runner startup race** (no tool change). On a slow macOS CI runner `python3`'s `http.server` could take longer to bind than the test's 2 s readiness budget, so the tool queried a not-yet-listening fixture, got an empty DoH answer, and the run failed with `expected canary mismatch line` (flaky — the same commit passed on the other runner). Fixes: the fixture now binds **before** announcing "listening"; the test polls readiness with a generous budget and **skips** (not fails) if the fixture never comes up; and it retries once, keying the answered/not-answered decision on the `canary returned` line (the later `DoH returned no A records` warning is expected success behaviour — the tool discards the poisoned answer). The test now only FAILs on a genuine regression (fixture answered but the MITM wasn't flagged).
+
 ## [0.39.2] - 2026-06-26
 
 ### Fixed

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-06-26
+
+### Changed
+
+- **`--yt-test` (YouTube fan-out) is now ON BY DEFAULT for tunnel runs** with a light
+  **N=6** (was opt-in, N=16). Any deep run where the tunnel comes up (a single
+  Reality/VLESS config, or `--sub-test N`) now includes the YouTube reachability check
+  automatically. It **auto-skips inside `--watch` / `--from-file` loops** to avoid
+  repeated YouTube traffic; explicit `--yt-test [N]` forces a thorough run (default 16,
+  runs even in loops); **`--no-yt-test`** disables it. Still a tunnel probe — never the
+  `--sub-test all` fleet walk — and skips gracefully with no tunnel. When it skips
+  (no tunnel up, or a watch/batch loop) it now prints a **visible** header + reason
+  instead of vanishing, so it's clearly "ran but skipped (why)".
+- **Bug fix (found while wiring the above):** `--no-yt-test` set `YT_TEST_N=""` but the
+  default `${YT_TEST_N:-6}` (applied after arg-parsing) re-enabled it because `:-`
+  treats empty as unset. Switched to `${YT_TEST_N-6}` so an explicitly-empty value
+  survives.
+
 ## [0.37.0] - 2026-06-26
 
 ### Added

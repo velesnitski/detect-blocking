@@ -27,9 +27,14 @@ printf '%s' "$out" | jq -e '.probes.youtube_reach.status == "skipped"' >/dev/nul
 printf '%s' "$out" | jq -e '.probes.youtube_reach | has("verdict") and has("requested") and has("max_ttfb_ms")' >/dev/null 2>&1 \
   || fail "youtube_reach JSON block should be well-formed even when skipped"
 
-# without the flag the probe never runs (block present, status null — not skipped)
+# ON BY DEFAULT for tunnel runs: with no flag it still runs (and here skips, no tunnel)
 out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config-json "$tmp/cfg.json" --json 2>/dev/null)
-printf '%s' "$out" | jq -e '.probes.youtube_reach.status == null' >/dev/null 2>&1 \
-  || fail "without --yt-test the probe should not run (status null)"
+printf '%s' "$out" | jq -e '.probes.youtube_reach.status == "skipped"' >/dev/null 2>&1 \
+  || fail "default-on: with no flag the probe should still run (status=skipped without a tunnel)"
 
-echo "PASS: --yt-test is a tunnel probe that skips gracefully with no tunnel and emits a well-formed JSON block"
+# --no-yt-test disables it entirely (never runs → status null)
+out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config-json "$tmp/cfg.json" --no-yt-test --json 2>/dev/null)
+printf '%s' "$out" | jq -e '.probes.youtube_reach.status == null' >/dev/null 2>&1 \
+  || fail "--no-yt-test should disable the probe (status null)"
+
+echo "PASS: --yt-test is default-on for tunnel runs, skips gracefully without a tunnel, and --no-yt-test disables it"

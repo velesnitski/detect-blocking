@@ -593,7 +593,7 @@ all`. JSON: `probes.conn_limit`.
 ### YouTube reachability under fan-out (`--yt-test [N]`)
 
 The *destination-side* companion to `--conn-test`: opens **N concurrent connections
-through the tunnel** (default 16) to real YouTube-infra hosts (`www.youtube.com`,
+through the tunnel** to real YouTube-infra hosts (`www.youtube.com`,
 `youtubei.googleapis.com`, `i.ytimg.com`, `yt3.ggpht.com` — override with
 `XRAY_YT_HOSTS`) and reports how many complete + the TTFB spread. That's the
 parallel-origin fan-out real playback actually generates, so it catches the "VPN
@@ -601,14 +601,21 @@ connects but YouTube buffers / won't load" case a single-stream throughput test
 misses — and **empirically** confirms what probe 16 only *infers* (googlevideo
 throttles datacenter/VPN egress IPs).
 
+**On by default** for any tunnel run (a light **N=6**), including `--sub-test N`:
+
 ```
-./detect_blocking.sh --subscription URL --sub-test 7 --yt-test     # deep-test one node's YouTube UX
+./detect_blocking.sh --xray-config 'vless://…'                 # YouTube fan-out runs automatically (N=6)
+./detect_blocking.sh --subscription URL --sub-test 7          # …and on a deep-tested fleet node
+./detect_blocking.sh --xray-config 'vless://…' --yt-test 32   # force a thorough run (32 conns)
+./detect_blocking.sh --xray-config 'vless://…' --no-yt-test   # disable it
 ```
 
-Same verdicts as `--conn-test` (clean / capped / degraded / all-failed). It's a
-**tunnel** probe (needs probe 12's tunnel up), so it's deep-test only — never the
-fleet walk — and skips gracefully if the tunnel isn't up. Egress-quality / QoE
-signal, not a censorship one. JSON: `probes.youtube_reach`.
+It **auto-skips inside `--watch` / `--from-file` loops** (so a monitoring cadence
+doesn't hammer YouTube every iteration); pass `--yt-test` to force it there. Same
+verdicts as `--conn-test` (clean / capped / degraded / all-failed). It's a **tunnel**
+probe (needs probe 12's tunnel up), so it never runs in the `--sub-test all` fleet
+walk and skips gracefully if the tunnel isn't up. Egress-quality / QoE signal, not a
+censorship one. JSON: `probes.youtube_reach`.
 
 ### Probe 13 — data-plane throughput (catches cover-SNI shaping)
 

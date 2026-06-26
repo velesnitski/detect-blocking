@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.37.0"
+readonly DETECT_BLOCKING_VERSION="0.38.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -160,8 +160,9 @@ while [ $# -gt 0 ]; do
     --censor-sweep=*) XRAY_CENSOR_SWEEP="${1#--censor-sweep=}"; shift ;;
     --conn-test) case "${2:-}" in ""|-*|*[!0-9]*) CONN_TEST_N=16; shift ;; *) CONN_TEST_N="$2"; shift 2 ;; esac ;;
     --conn-test=*) CONN_TEST_N="${1#--conn-test=}"; case "$CONN_TEST_N" in ''|*[!0-9]*) CONN_TEST_N=16 ;; esac; shift ;;
-    --yt-test) case "${2:-}" in ""|-*|*[!0-9]*) YT_TEST_N=16; shift ;; *) YT_TEST_N="$2"; shift 2 ;; esac ;;
-    --yt-test=*) YT_TEST_N="${1#--yt-test=}"; case "$YT_TEST_N" in ''|*[!0-9]*) YT_TEST_N=16 ;; esac; shift ;;
+    --yt-test) YT_TEST_FORCE=1; case "${2:-}" in ""|-*|*[!0-9]*) YT_TEST_N=16; shift ;; *) YT_TEST_N="$2"; shift 2 ;; esac ;;
+    --yt-test=*) YT_TEST_FORCE=1; YT_TEST_N="${1#--yt-test=}"; case "$YT_TEST_N" in ''|*[!0-9]*) YT_TEST_N=16 ;; esac; shift ;;
+    --no-yt-test) YT_TEST_N=""; shift ;;
     --full|--thorough)
       # Umbrella: turn on the two opt-in scanners (everything else already runs by
       # default for a config). Explicit by design — --censor-sweep fetches
@@ -233,9 +234,10 @@ while [ $# -gt 0 ]; do
       printf '  --conn-test [N]     open N (default 16) simultaneous TLS handshakes to the server and report how\n'
       printf '                      many complete — does it cap / rate-limit / degrade under concurrency (server\n'
       printf '                      robustness; pair with --sub-test N to deep-test one fleet node). Direct probe.\n'
-      printf '  --yt-test [N]       open N (default 16) concurrent connections THROUGH the tunnel to real YouTube\n'
-      printf '                      hosts and report how many complete + TTFB — does YouTube survive the connection\n'
-      printf '                      fan-out real playback needs (egress quality / buffering). Tunnel probe.\n'
+      printf '  --yt-test [N]       YouTube fan-out: open N concurrent connections THROUGH the tunnel to real\n'
+      printf '                      YouTube hosts + report how many complete + TTFB (egress quality / buffering).\n'
+      printf '                      ON BY DEFAULT for tunnel runs (N=6, auto-skipped in --watch/--from-file loops);\n'
+      printf '                      --yt-test [N] forces a thorough run (default 16); --no-yt-test disables it.\n'
       printf '  --full, --thorough  comprehensive run: enable the opt-in scanners (--scan-covers + --censor-sweep);\n'
       printf '                      everything else already runs by default. NOTE: --censor-sweep fetches censored sites from THIS machine\n'
       printf '  --skip LIST         skip listed probes\n'
@@ -903,7 +905,10 @@ CONN_LIMIT_MINMS=""; CONN_LIMIT_MAXMS=""; CONN_LIMIT_VERDICT=""
 # how many complete + TTFB spread — empirically confirms YouTube works through this
 # egress under load, vs probe 16 which only INFERS it from the egress IP reputation.
 # Egress-quality / QoE signal, not a censorship-of-the-VPN one.
-YT_TEST_N="${YT_TEST_N:-}"       # "" off; else N concurrent conns (clamped 1..128)
+# NOTE: '-' (not ':-') so --no-yt-test, which sets YT_TEST_N="" BEFORE this default
+# runs, SURVIVES — ':-' would treat the empty value as unset and re-enable it.
+YT_TEST_N="${YT_TEST_N-6}"       # default 6 concurrent conns (on by default for tunnel runs); "" = off (--no-yt-test); clamped 1..128
+YT_TEST_FORCE="${YT_TEST_FORCE:-0}"  # 1 = run even inside --watch / --from-file loops (set by explicit --yt-test)
 XRAY_YT_HOSTS="${XRAY_YT_HOSTS:-www.youtube.com youtubei.googleapis.com i.ytimg.com yt3.ggpht.com}"
 YT_REACH_STATUS=""               # disabled / ok / skipped / curl-missing / error
 YT_REACH_REQUESTED=""; YT_REACH_SUCC=""; YT_REACH_FAIL=""
@@ -3359,15 +3364,25 @@ probe_conn_limit() {
 # (googlevideo throttles datacenter egress IPs). Needs the tunnel up (probe 12); reuses
 # the same clean/capped/degraded/all-failed buckets as --conn-test. Opt-in; tunnel-only.
 probe_yt_reach() {
-  [ -n "${YT_TEST_N:-}" ] || { YT_REACH_STATUS="disabled"; return 0; }
-  if [ "${XRAY_JSON_STATUS:-}" != "ok" ]; then
-    YT_REACH_STATUS="skipped"; return 0   # no tunnel → nothing to test through
-  fi
-  check_cmd curl || { YT_REACH_STATUS="curl-missing"; return 0; }
+  [ -n "${YT_TEST_N:-}" ] || { YT_REACH_STATUS="disabled"; return 0; }   # --no-yt-test → fully silent
   [ "$YT_TEST_N" -ge 1 ]   2>/dev/null || YT_TEST_N=16
   [ "$YT_TEST_N" -le 128 ] 2>/dev/null || YT_TEST_N=128
-  local n="$YT_TEST_N" port="$XRAY_JSON_SOCKS_PORT"
+  local n="$YT_TEST_N" port="${XRAY_JSON_SOCKS_PORT:-}"
+  # Print the header even when we skip, so it's visibly "ran but skipped (why)" rather
+  # than silently absent — it's on by default, users expect to see it.
   hdr "YouTube reachability under fan-out (${n} concurrent connections via the tunnel)"
+  # On by default for tunnel runs, but auto-skip inside --watch / --from-file loops
+  # so a monitoring cadence doesn't hammer YouTube every iteration. Force with --yt-test.
+  if [ "${YT_TEST_FORCE:-0}" != "1" ] \
+     && { [ "${_WATCH_CHILD:-0}" = "1" ] || [ "${_BATCH_CHILD:-0}" = "1" ]; }; then
+    info "skipped in watch/batch loop to avoid repeated YouTube traffic — pass --yt-test to force"
+    YT_REACH_STATUS="skipped-loop"; return 0
+  fi
+  if [ "${XRAY_JSON_STATUS:-}" != "ok" ]; then
+    info "skipped — the tunnel isn't up (see probe 12), so there's nothing to test YouTube through"
+    YT_REACH_STATUS="skipped"; return 0
+  fi
+  check_cmd curl || { warn "skipping — curl not available"; YT_REACH_STATUS="curl-missing"; return 0; }
   local ha; read -ra ha <<< "$XRAY_YT_HOSTS"
   local nh=${#ha[@]}; [ "$nh" -ge 1 ] || { YT_REACH_STATUS="error"; return 0; }
   # Each SOCKS connection opens a fresh tunnel hop, so the budget must clear the

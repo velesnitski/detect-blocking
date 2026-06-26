@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.38.0"
+readonly DETECT_BLOCKING_VERSION="0.39.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -3361,8 +3361,11 @@ probe_conn_limit() {
 # This is the connection FAN-OUT real playback generates (parallel chunk/thumbnail/API
 # origins), so it catches the "VPN connects but YouTube buffers/won't load" case that a
 # single-stream throughput test misses — and empirically confirms what probe 16 infers
-# (googlevideo throttles datacenter egress IPs). Needs the tunnel up (probe 12); reuses
-# the same clean/capped/degraded/all-failed buckets as --conn-test. Opt-in; tunnel-only.
+# (googlevideo throttles datacenter egress IPs). Reuses probe 12's tunnel INBOUND (xray
+# + SOCKS port) but runs INDEPENDENTLY of probe 12's pass/fail verdict — so a Cloudflare
+# block (probe 12's target) doesn't suppress the YouTube measurement, and a divergence
+# between the two becomes its own signal. Reuses --conn-test's clean/capped/degraded/
+# all-failed buckets. On by default for tunnel runs.
 probe_yt_reach() {
   [ -n "${YT_TEST_N:-}" ] || { YT_REACH_STATUS="disabled"; return 0; }   # --no-yt-test → fully silent
   [ "$YT_TEST_N" -ge 1 ]   2>/dev/null || YT_TEST_N=16
@@ -3370,7 +3373,7 @@ probe_yt_reach() {
   local n="$YT_TEST_N" port="${XRAY_JSON_SOCKS_PORT:-}"
   # Print the header even when we skip, so it's visibly "ran but skipped (why)" rather
   # than silently absent — it's on by default, users expect to see it.
-  hdr "YouTube reachability under fan-out (${n} concurrent connections via the tunnel)"
+  hdr "YouTube reachability under fan-out (via the tunnel)"
   # On by default for tunnel runs, but auto-skip inside --watch / --from-file loops
   # so a monitoring cadence doesn't hammer YouTube every iteration. Force with --yt-test.
   if [ "${YT_TEST_FORCE:-0}" != "1" ] \
@@ -3378,23 +3381,57 @@ probe_yt_reach() {
     info "skipped in watch/batch loop to avoid repeated YouTube traffic — pass --yt-test to force"
     YT_REACH_STATUS="skipped-loop"; return 0
   fi
-  if [ "${XRAY_JSON_STATUS:-}" != "ok" ]; then
-    info "skipped — the tunnel isn't up (see probe 12), so there's nothing to test YouTube through"
+  # INDEPENDENT of probe 12's verdict: we only need its tunnel INBOUND (the xray
+  # process + SOCKS port) to be up — NOT for its Cloudflare reachability to have
+  # passed. probe 12 leaves xray running on failure (killed only at EXIT), so if
+  # Cloudflare was blocked/reset but YouTube works (or vice versa), we still measure
+  # it. Only skip if there's genuinely no tunnel inbound to send through.
+  if ! { [ -n "${XRAY_JSON_XRAY_PID:-}" ] && kill -0 "$XRAY_JSON_XRAY_PID" 2>/dev/null && [ -n "$port" ]; }; then
+    info "skipped — no tunnel inbound is up (xray-core didn't start; see probe 12)"
     YT_REACH_STATUS="skipped"; return 0
   fi
+  [ "${XRAY_JSON_STATUS:-}" = "ok" ] || info "probe 12 (Cloudflare) failed, but the tunnel inbound is up — testing YouTube independently through it"
   check_cmd curl || { warn "skipping — curl not available"; YT_REACH_STATUS="curl-missing"; return 0; }
   local ha; read -ra ha <<< "$XRAY_YT_HOSTS"
   local nh=${#ha[@]}; [ "$nh" -ge 1 ] || { YT_REACH_STATUS="error"; return 0; }
-  # Each SOCKS connection opens a fresh tunnel hop, so the budget must clear the
-  # Reality handshake RTT (≈ probe-12 RTT) on top of $TIMEOUT (same as probe 16).
+  # Each SOCKS connection opens a fresh tunnel hop, so the budget clears the Reality
+  # handshake RTT (≈ probe-12 RTT) on top of $TIMEOUT — but CAPPED: this is a quick
+  # reachability test, it must not inherit probe 12's slow-handshake-retry RTT (which
+  # can be ~20s) or a broken/silent tunnel would make every connection hang that long.
   local maxt; maxt=$(( ( ${XRAY_JSON_RTT_MS:-3000} + 999 ) / 1000 + TIMEOUT ))
+  [ "$maxt" -gt 10 ] && maxt=10
+  # If probe 12 already failed, the tunnel is suspect: confirm YouTube quickly (≤6s)
+  # AND with a SINGLE probe — enough to disentangle "Cloudflare-specific block" from
+  # "dead tunnel" without firing a doomed 6-way fan-out (which is what made this hang
+  # on a broken config). The full fan-out only runs when the tunnel works, or when the
+  # user explicitly forces it with --yt-test.
+  if [ "${XRAY_JSON_STATUS:-}" != "ok" ] && [ "${YT_TEST_FORCE:-0}" != "1" ]; then
+    [ "$maxt" -gt 6 ] && maxt=6
+    n=1
+  fi
   local d i host; d=$(mktemp -d -t detect_blocking.yt.XXXXXX) || { YT_REACH_STATUS="error"; return 0; }
+  if [ "$n" = "1" ]; then
+    info "tunnel suspect — quick 1-connection reachability check (up to ${maxt}s; --yt-test forces the full ${YT_TEST_N}-way fan-out)"
+  else
+    info "probing ${n} connection(s) across ${nh} YouTube host(s) via the tunnel (up to ${maxt}s)…"
+  fi
   for i in $(seq 1 "$n"); do
     host="${ha[$(( (i-1) % nh ))]}"
     ( curl -sS --max-time "$maxt" --socks5-hostname "127.0.0.1:$port" \
         -o /dev/null -w '%{time_starttransfer} %{http_code}' \
-        "https://${host}/" 2>/dev/null > "$d/$i" ) &
+        "https://${host}/" 2>/dev/null > "$d/$i"; : > "$d/$i.done" ) &
   done
+  # Live progress (terminal only — suppressed under --json) so a slow/dead tunnel
+  # shows a ticking counter instead of looking frozen.
+  if [ "${LOG_QUIET:-0}" != "1" ]; then
+    local _el=0 _dn=0
+    while [ "$_dn" -lt "$n" ] && [ "$_el" -le "$maxt" ]; do
+      _dn=$(find "$d" -name '*.done' 2>/dev/null | grep -c .)
+      printf '\r          probing… %s/%s done (%ss)   ' "$_dn" "$n" "$_el" >&2
+      [ "$_dn" -lt "$n" ] && { sleep 1; _el=$((_el+1)); }
+    done
+    printf '\r\033[K' >&2
+  fi
   wait
   local succ=0 fail=0 minms="" maxms=0 line ttfb code ms
   for i in $(seq 1 "$n"); do
@@ -3423,6 +3460,17 @@ probe_yt_reach() {
       warn "0/${n} — YouTube is unreachable through the tunnel; the egress IP is likely blocked/listed by Google, or routing drops these destinations"
       add_verdict "YouTube: 0/${n} connections completed through the tunnel — the egress IP is blocked/listed by Google or routing drops YouTube. Verify the egress reputation and that YouTube isn't force-routed to a dead path [server-side]" ;;
   esac
+  # Cross-reference with probe 12: now that YT runs independently, a divergence is a
+  # real signal — disentangles "dead tunnel" from "one destination blocked".
+  if [ "${XRAY_JSON_STATUS:-}" != "ok" ]; then
+    case "$YT_REACH_VERDICT" in
+      clean|degraded|capped)
+        info "→ YouTube works through the tunnel even though probe 12's Cloudflare check failed: the tunnel is ALIVE; Cloudflare specifically is blocked/reset at the egress (or was transient), not the whole tunnel"
+        add_verdict "Tunnel carries YouTube but not Cloudflare (probe 12) — a destination-specific egress block on Cloudflare, NOT a dead tunnel; re-check probe 12 against a different target before concluding the config is broken" ;;
+      all-failed)
+        info "→ both Cloudflare (probe 12) and YouTube fail through the tunnel: the tunnel itself isn't passing traffic — most likely the Reality outbound/auth failed (verify UUID / keys / flow / target SNI), not a per-site block" ;;
+    esac
+  fi
 }
 
 # Happ routing-profile recognition. A happ://routing/add/ link carries a

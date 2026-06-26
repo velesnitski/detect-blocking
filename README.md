@@ -612,10 +612,16 @@ throttles datacenter/VPN egress IPs).
 
 It **auto-skips inside `--watch` / `--from-file` loops** (so a monitoring cadence
 doesn't hammer YouTube every iteration); pass `--yt-test` to force it there. Same
-verdicts as `--conn-test` (clean / capped / degraded / all-failed). It's a **tunnel**
-probe (needs probe 12's tunnel up), so it never runs in the `--sub-test all` fleet
-walk and skips gracefully if the tunnel isn't up. Egress-quality / QoE signal, not a
-censorship one. JSON: `probes.youtube_reach`.
+verdicts as `--conn-test` (clean / capped / degraded / all-failed).
+
+It reuses probe 12's tunnel **inbound** but runs **independently of probe 12's
+verdict** — a failure to reach *Cloudflare* (probe 12's target) no longer suppresses
+the YouTube measurement, and a divergence is its own signal: *YouTube works but
+Cloudflare doesn't* → the tunnel is alive and Cloudflare is blocked at the egress;
+*both fail* → the tunnel itself isn't passing traffic (Reality auth/handshake — verify
+UUID/keys/flow). It never runs in the `--sub-test all` fleet walk, skips only if
+there's no tunnel inbound at all, and is bounded (~10s) so a dead/silent tunnel can't
+hang it. Egress-quality / QoE signal, not a censorship one. JSON: `probes.youtube_reach`.
 
 ### Probe 13 — data-plane throughput (catches cover-SNI shaping)
 

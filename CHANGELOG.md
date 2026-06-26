@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.39.0] - 2026-06-26
+
+### Changed
+
+- **`--yt-test` now runs independently of probe 12's verdict.** It reuses probe 12's
+  tunnel **inbound** (the xray process + SOCKS port, which probe 12 leaves running on
+  failure) but no longer skips just because probe 12's *Cloudflare* reachability check
+  failed. So a Cloudflare-specific block no longer suppresses the YouTube measurement,
+  and a **divergence becomes a signal**: YouTube works but Cloudflare doesn't → the
+  tunnel is alive, Cloudflare is blocked at the egress (re-check probe 12 before
+  declaring the config broken); both fail → the tunnel itself isn't passing traffic
+  (Reality auth/handshake — verify UUID/keys/flow). It only skips now if there's
+  genuinely no tunnel inbound up.
+
+### Fixed
+
+- **`--yt-test` could hang (and get killed) on a broken/slow tunnel.** Three fixes:
+  (1) per-connection budget is **capped at 10s** (it was inheriting probe 12's
+  slow-handshake-retry RTT, up to ~20s); (2) when probe 12 has **already failed**, the
+  tunnel is suspect, so it now does a **single quick reachability probe (≤6s)** instead
+  of a doomed 6-way fan-out — enough to tell "Cloudflare blocked" from "dead tunnel";
+  the full fan-out runs only when the tunnel works or `--yt-test` is explicitly passed;
+  (3) a **live progress line** (`probing… k/N done (Ns)`, terminal-only) so a slow probe
+  shows a ticking counter instead of looking frozen.
+
 ## [0.38.0] - 2026-06-26
 
 ### Changed

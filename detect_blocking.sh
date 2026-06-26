@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.36.0"
+readonly DETECT_BLOCKING_VERSION="0.37.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -160,6 +160,8 @@ while [ $# -gt 0 ]; do
     --censor-sweep=*) XRAY_CENSOR_SWEEP="${1#--censor-sweep=}"; shift ;;
     --conn-test) case "${2:-}" in ""|-*|*[!0-9]*) CONN_TEST_N=16; shift ;; *) CONN_TEST_N="$2"; shift 2 ;; esac ;;
     --conn-test=*) CONN_TEST_N="${1#--conn-test=}"; case "$CONN_TEST_N" in ''|*[!0-9]*) CONN_TEST_N=16 ;; esac; shift ;;
+    --yt-test) case "${2:-}" in ""|-*|*[!0-9]*) YT_TEST_N=16; shift ;; *) YT_TEST_N="$2"; shift 2 ;; esac ;;
+    --yt-test=*) YT_TEST_N="${1#--yt-test=}"; case "$YT_TEST_N" in ''|*[!0-9]*) YT_TEST_N=16 ;; esac; shift ;;
     --full|--thorough)
       # Umbrella: turn on the two opt-in scanners (everything else already runs by
       # default for a config). Explicit by design — --censor-sweep fetches
@@ -231,6 +233,9 @@ while [ $# -gt 0 ]; do
       printf '  --conn-test [N]     open N (default 16) simultaneous TLS handshakes to the server and report how\n'
       printf '                      many complete — does it cap / rate-limit / degrade under concurrency (server\n'
       printf '                      robustness; pair with --sub-test N to deep-test one fleet node). Direct probe.\n'
+      printf '  --yt-test [N]       open N (default 16) concurrent connections THROUGH the tunnel to real YouTube\n'
+      printf '                      hosts and report how many complete + TTFB — does YouTube survive the connection\n'
+      printf '                      fan-out real playback needs (egress quality / buffering). Tunnel probe.\n'
       printf '  --full, --thorough  comprehensive run: enable the opt-in scanners (--scan-covers + --censor-sweep);\n'
       printf '                      everything else already runs by default. NOTE: --censor-sweep fetches censored sites from THIS machine\n'
       printf '  --skip LIST         skip listed probes\n'
@@ -891,6 +896,18 @@ CONN_TEST_N="${CONN_TEST_N:-}"   # "" off; else N concurrent handshakes (clamped
 CONN_LIMIT_STATUS=""             # disabled / ok / unreachable / curl-missing / error
 CONN_LIMIT_REQUESTED=""; CONN_LIMIT_SUCC=""; CONN_LIMIT_FAIL=""
 CONN_LIMIT_MINMS=""; CONN_LIMIT_MAXMS=""; CONN_LIMIT_VERDICT=""
+
+# ---- YouTube reachability-under-fan-out (--yt-test N): real-destination concurrency ----
+# Opt-in TUNNEL probe. Opens N concurrent connections THROUGH the tunnel to real
+# YouTube-infra hosts (the multi-origin fan-out actual playback generates) and reports
+# how many complete + TTFB spread — empirically confirms YouTube works through this
+# egress under load, vs probe 16 which only INFERS it from the egress IP reputation.
+# Egress-quality / QoE signal, not a censorship-of-the-VPN one.
+YT_TEST_N="${YT_TEST_N:-}"       # "" off; else N concurrent conns (clamped 1..128)
+XRAY_YT_HOSTS="${XRAY_YT_HOSTS:-www.youtube.com youtubei.googleapis.com i.ytimg.com yt3.ggpht.com}"
+YT_REACH_STATUS=""               # disabled / ok / skipped / curl-missing / error
+YT_REACH_REQUESTED=""; YT_REACH_SUCC=""; YT_REACH_FAIL=""
+YT_REACH_MINMS=""; YT_REACH_MAXMS=""; YT_REACH_VERDICT=""
 
 # ---- censored-URL sweep (--censor-sweep): OONI-style reachability, direct vs tunnel ----
 # Tests a list of commonly-censored hosts DIRECT and (when the tunnel is up)
@@ -3331,6 +3348,65 @@ probe_conn_limit() {
     all-failed)
       warn "0/${n} concurrent handshakes completed although TCP is open — connections are dropped under concurrency (aggressive cap or SYN-rate protection)"
       add_verdict "0/${n} concurrent TLS handshakes completed despite an open TCP port — the server drops connections under concurrency. Investigate connection-rate limiting / SYN protections and OS limits [server-side]" ;;
+  esac
+}
+
+# --yt-test N: open N concurrent connections THROUGH the tunnel to real YouTube-infra
+# hosts (round-robin over XRAY_YT_HOSTS) and report how many complete + TTFB spread.
+# This is the connection FAN-OUT real playback generates (parallel chunk/thumbnail/API
+# origins), so it catches the "VPN connects but YouTube buffers/won't load" case that a
+# single-stream throughput test misses — and empirically confirms what probe 16 infers
+# (googlevideo throttles datacenter egress IPs). Needs the tunnel up (probe 12); reuses
+# the same clean/capped/degraded/all-failed buckets as --conn-test. Opt-in; tunnel-only.
+probe_yt_reach() {
+  [ -n "${YT_TEST_N:-}" ] || { YT_REACH_STATUS="disabled"; return 0; }
+  if [ "${XRAY_JSON_STATUS:-}" != "ok" ]; then
+    YT_REACH_STATUS="skipped"; return 0   # no tunnel → nothing to test through
+  fi
+  check_cmd curl || { YT_REACH_STATUS="curl-missing"; return 0; }
+  [ "$YT_TEST_N" -ge 1 ]   2>/dev/null || YT_TEST_N=16
+  [ "$YT_TEST_N" -le 128 ] 2>/dev/null || YT_TEST_N=128
+  local n="$YT_TEST_N" port="$XRAY_JSON_SOCKS_PORT"
+  hdr "YouTube reachability under fan-out (${n} concurrent connections via the tunnel)"
+  local ha; read -ra ha <<< "$XRAY_YT_HOSTS"
+  local nh=${#ha[@]}; [ "$nh" -ge 1 ] || { YT_REACH_STATUS="error"; return 0; }
+  # Each SOCKS connection opens a fresh tunnel hop, so the budget must clear the
+  # Reality handshake RTT (≈ probe-12 RTT) on top of $TIMEOUT (same as probe 16).
+  local maxt; maxt=$(( ( ${XRAY_JSON_RTT_MS:-3000} + 999 ) / 1000 + TIMEOUT ))
+  local d i host; d=$(mktemp -d -t detect_blocking.yt.XXXXXX) || { YT_REACH_STATUS="error"; return 0; }
+  for i in $(seq 1 "$n"); do
+    host="${ha[$(( (i-1) % nh ))]}"
+    ( curl -sS --max-time "$maxt" --socks5-hostname "127.0.0.1:$port" \
+        -o /dev/null -w '%{time_starttransfer} %{http_code}' \
+        "https://${host}/" 2>/dev/null > "$d/$i" ) &
+  done
+  wait
+  local succ=0 fail=0 minms="" maxms=0 line ttfb code ms
+  for i in $(seq 1 "$n"); do
+    line=$(cat "$d/$i" 2>/dev/null); ttfb=${line%% *}; code=${line##* }
+    case "$code" in [1-5][0-9][0-9])
+        succ=$((succ+1)); ms=$(awk -v s="${ttfb:-0}" 'BEGIN{printf "%d", (s+0)*1000}')
+        { [ -z "$minms" ] || [ "$ms" -lt "$minms" ]; } && minms=$ms
+        [ "$ms" -gt "$maxms" ] && maxms=$ms ;;
+      *) fail=$((fail+1)) ;;
+    esac
+  done
+  rm -rf "$d"; [ -z "$minms" ] && minms=0
+  YT_REACH_STATUS="ok"; YT_REACH_REQUESTED="$n"; YT_REACH_SUCC="$succ"; YT_REACH_FAIL="$fail"
+  YT_REACH_MINMS="$minms"; YT_REACH_MAXMS="$maxms"
+  YT_REACH_VERDICT=$(_classify_conn_limit "$succ" "$n" "$minms" "$maxms")
+  case "$YT_REACH_VERDICT" in
+    clean)
+      ok "YouTube handled ${succ}/${n} concurrent connections via the tunnel (${minms}-${maxms}ms TTFB) — loads fine under realistic fan-out" ;;
+    capped)
+      warn "only ${succ}/${n} concurrent YouTube connections completed through the tunnel — it can't sustain the connection fan-out real playback needs (partial loads / buffering likely)"
+      add_verdict "YouTube: only ${succ}/${n} concurrent connections completed through the tunnel — the tunnel/server caps concurrency or the egress is partially blocked by Google. Check server connection limits (mux/ulimit) and the egress IP's reputation [server-side]" ;;
+    degraded)
+      warn "${succ}/${n} completed but TTFB ballooned ${minms}→${maxms}ms under load — Google is likely throttling the egress IP (datacenter egress); expect buffering"
+      add_verdict "YouTube reachable but TTFB degrades badly under concurrency (${minms}→${maxms}ms) — googlevideo throttles datacenter/VPN egress IPs. Route YouTube via a residential/clean egress for usable playback [server-side]" ;;
+    all-failed)
+      warn "0/${n} — YouTube is unreachable through the tunnel; the egress IP is likely blocked/listed by Google, or routing drops these destinations"
+      add_verdict "YouTube: 0/${n} connections completed through the tunnel — the egress IP is blocked/listed by Google or routing drops YouTube. Verify the egress reputation and that YouTube isn't force-routed to a dead path [server-side]" ;;
   esac
 }
 
@@ -5821,6 +5897,13 @@ _emit_json() {
     --arg cl_minms          "$CONN_LIMIT_MINMS" \
     --arg cl_maxms          "$CONN_LIMIT_MAXMS" \
     --arg cl_verdict        "$CONN_LIMIT_VERDICT" \
+    --arg yt_status         "$YT_REACH_STATUS" \
+    --arg yt_req            "$YT_REACH_REQUESTED" \
+    --arg yt_succ           "$YT_REACH_SUCC" \
+    --arg yt_fail           "$YT_REACH_FAIL" \
+    --arg yt_minms          "$YT_REACH_MINMS" \
+    --arg yt_maxms          "$YT_REACH_MAXMS" \
+    --arg yt_verdict        "$YT_REACH_VERDICT" \
     --arg hy_status         "$HYSTERIA_STATUS" \
     --arg hy_sni_keyword    "$HYSTERIA_SNI_KEYWORD" \
     --arg hy_sni_explicit   "$HYSTERIA_SNI_EXPLICIT" \
@@ -6104,6 +6187,15 @@ _emit_json() {
           max_handshake_ms: (if $cl_maxms == "" then null else ($cl_maxms | tonumber? // null) end),
           verdict: opt($cl_verdict)
         },
+        youtube_reach: {
+          status: opt($yt_status),
+          requested: (if $yt_req == "" then null else ($yt_req | tonumber? // null) end),
+          succeeded: (if $yt_succ == "" then null else ($yt_succ | tonumber? // null) end),
+          failed: (if $yt_fail == "" then null else ($yt_fail | tonumber? // null) end),
+          min_ttfb_ms: (if $yt_minms == "" then null else ($yt_minms | tonumber? // null) end),
+          max_ttfb_ms: (if $yt_maxms == "" then null else ($yt_maxms | tonumber? // null) end),
+          verdict: opt($yt_verdict)
+        },
         hysteria: {
           status: opt($hy_status),
           sni_keyword: tri_bool(($hy_sni_keyword | tonumber? // -1)),
@@ -6349,6 +6441,8 @@ fi
 # Connection-limit probe: opt-in (--conn-test), direct (runs under --no-tunnel too).
 [ -n "${CONN_TEST_N:-}" ] && probe_conn_limit
 [ -z "${NO_TUNNEL:-}" ] && _should_run xrayjson && probe_xray_egress
+# YouTube fan-out probe: opt-in, needs the tunnel (probe 12) up.
+[ -n "${YT_TEST_N:-}" ] && [ -z "${NO_TUNNEL:-}" ] && _should_run xrayjson && probe_yt_reach
 [ -z "${NO_TUNNEL:-}" ] && _should_run xrayjson && probe_xray_stability
 # Lint + clock-skew run in numeric position (after 17, before 20). They're
 # static/cheap and their findings also surface in the consolidated verdict.

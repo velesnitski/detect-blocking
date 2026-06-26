@@ -97,7 +97,7 @@ jobs:
         # placeholders against loopback closed ports, plus the pure helpers behind
         # the tells / remediation plan / table alignment. No real infra, no secrets.
         run: |
-          for t in test_subscription test_subscription_http test_fleet_tells test_fleet_plan test_signal_matrix test_conn_limit test_wpad; do
+          for t in test_subscription test_subscription_http test_fleet_tells test_fleet_plan test_signal_matrix test_conn_limit test_yt_reach test_wpad; do
             echo "== $t =="; bash "tests/$t.sh" || exit 1
           done
         timeout-minutes: 3

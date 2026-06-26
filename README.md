@@ -590,6 +590,26 @@ time ballooned under load) · **all-failed** (TCP open but every handshake dropp
 It's a direct probe (no tunnel) and never auto-runs — it's not part of `--sub-test
 all`. JSON: `probes.conn_limit`.
 
+### YouTube reachability under fan-out (`--yt-test [N]`)
+
+The *destination-side* companion to `--conn-test`: opens **N concurrent connections
+through the tunnel** (default 16) to real YouTube-infra hosts (`www.youtube.com`,
+`youtubei.googleapis.com`, `i.ytimg.com`, `yt3.ggpht.com` — override with
+`XRAY_YT_HOSTS`) and reports how many complete + the TTFB spread. That's the
+parallel-origin fan-out real playback actually generates, so it catches the "VPN
+connects but YouTube buffers / won't load" case a single-stream throughput test
+misses — and **empirically** confirms what probe 16 only *infers* (googlevideo
+throttles datacenter/VPN egress IPs).
+
+```
+./detect_blocking.sh --subscription URL --sub-test 7 --yt-test     # deep-test one node's YouTube UX
+```
+
+Same verdicts as `--conn-test` (clean / capped / degraded / all-failed). It's a
+**tunnel** probe (needs probe 12's tunnel up), so it's deep-test only — never the
+fleet walk — and skips gracefully if the tunnel isn't up. Egress-quality / QoE
+signal, not a censorship one. JSON: `probes.youtube_reach`.
+
 ### Probe 13 — data-plane throughput (catches cover-SNI shaping)
 
 Probe 12 confirms the Reality / VLESS handshake succeeds, but says nothing

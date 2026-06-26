@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.37.0] - 2026-06-26
+
+### Added
+
+- **`--yt-test [N]` — YouTube reachability under connection fan-out.** Opt-in
+  **tunnel** probe: opens N concurrent connections (default 16) *through the tunnel*
+  to real YouTube-infra hosts (`www.youtube.com`, `youtubei.googleapis.com`,
+  `i.ytimg.com`, `yt3.ggpht.com`; override with `XRAY_YT_HOSTS`) and reports how many
+  complete + the TTFB spread. This is the parallel-origin fan-out real playback
+  generates, so it catches the "VPN connects but YouTube buffers / won't load" case a
+  single-stream throughput test misses — and **empirically** confirms what probe 16
+  only infers (googlevideo throttles datacenter egress IPs). Same
+  clean/capped/degraded/all-failed buckets as `--conn-test` (`_classify_conn_limit`).
+  Needs the tunnel up (probe 12) → deep-test only (`--sub-test N` / a single config),
+  never the fleet walk; skips gracefully with no tunnel. JSON: `probes.youtube_reach`.
+
 ## [0.36.0] - 2026-06-26
 
 ### Added

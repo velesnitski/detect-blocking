@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.39.2"
+readonly DETECT_BLOCKING_VERSION="0.40.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -260,6 +260,8 @@ while [ $# -gt 0 ]; do
       printf '                      full suite on one config (--sub-test N, default 0; --sub-ua to set the UA).\n'
       printf '                      --sub-test all → score EVERY server (fast fingerprint-only fleet table,\n'
       printf '                      probed concurrently; --sub-jobs N sets the batch size, default 8, 1=serial)\n'
+      printf '                      --sub-test all --yt-test → also add a per-node YouTube column (spins a\n'
+      printf '                      tunnel per node → slower; batch defaults to 3 to avoid xray thrash)\n'
       printf '  --no-tunnel         skip tunnel/data-plane probes (no xray spawn, no throughput); run only the\n'
       printf '                      direct fingerprint probes (cover/active-probe/TLS-parity/detectability)\n'
       printf '  --outbound TAG      for a multi-outbound JSON config, narrow to the outbound with this\n'
@@ -427,7 +429,11 @@ if [ -n "$SUB_URL" ]; then
   [ "${SUB_COUNT:-0}" -ge 1 ] 2>/dev/null || { printf 'error: --subscription: no configs found in the response\n' >&2; exit 1; }
   if [ "$SUB_TEST" = "all" ]; then
     SUB_WALK=1
-    printf 'note: --subscription fetched %s config(s); scoring ALL (fingerprint-only fleet walk, no tunnel)\n' "$SUB_COUNT" >&2
+    if [ "${YT_TEST_FORCE:-0}" = "1" ]; then
+      printf 'note: --subscription fetched %s config(s); scoring ALL with a per-node tunnel + YouTube fan-out (slower — one xray per node)\n' "$SUB_COUNT" >&2
+    else
+      printf 'note: --subscription fetched %s config(s); scoring ALL (fingerprint-only fleet walk, no tunnel)\n' "$SUB_COUNT" >&2
+    fi
   else
     case "$SUB_TEST" in ''|*[!0-9]*) SUB_TEST=0 ;; esac
     [ "$SUB_TEST" -ge "$SUB_COUNT" ] && SUB_TEST=0
@@ -3697,8 +3703,9 @@ _fleet_row_fields() {
 # job so a whole fleet probes concurrently; the parent renders the rows in order.
 # All attacker-influenced values are _safe-sanitised before they reach the row.
 _walk_one() {
-  local f="$1" pad idx remarks host port cover server j score band fp tells detect kind
+  local f="$1" pad idx remarks host port cover server j score band fp tells detect kind yt
   pad=$(basename "$f" .json); idx=$((10#$pad))
+  yt="-"   # YouTube fan-out result; stays "-" unless YT-mode walk runs a per-node tunnel
   remarks=$(_safe "$(jq -r '.remarks // .name // "?"' "$f" 2>/dev/null)")
   host=$(_safe "$(jq -r 'first(.outbounds[]? | select(.settings.vnext != null or .settings.servers != null) | (.settings.vnext // .settings.servers)[0].address) // empty' "$f" 2>/dev/null)")
   port=$(_safe "$(jq -r 'first(.outbounds[]? | select(.settings.vnext != null or .settings.servers != null) | (.settings.vnext // .settings.servers)[0].port) // empty' "$f" 2>/dev/null)")
@@ -3712,9 +3719,29 @@ _walk_one() {
     if ! _nc_tcp_probe "$host" "$port"; then
       kind=dead; detect="unreachable"; fp="-"; tells="TCP refused/filtered"; band=""
     else
-      # --only xray,xrayjson skips transport probes (0-10); --no-tunnel skips the
-      # xray-spawning/data probes → just the direct fingerprint.
-      j=$(bash "$0" --xray-config-json "$f" --only xray,xrayjson --no-tunnel --json 2>/dev/null)
+      if [ "${YT_TEST_FORCE:-0}" = "1" ]; then
+        # YT-mode walk (--sub-test all --yt-test): spin a per-node tunnel so probe 12
+        # comes up and the YouTube fan-out runs (default N=6). --xray-only skips
+        # transport 0-10, --no-speedtest skips the heavy multi-stream pull. Slower
+        # (one xray per node) — that's why it's opt-in. Detectability is then
+        # tunnel-aware (includes egress/stability), not just the direct fingerprint.
+        j=$(bash "$0" --xray-config-json "$f" --xray-only --no-speedtest --json 2>/dev/null)
+        yt=$(printf '%s' "$j" | jq -r '
+          (.probes.youtube_reach // {}) as $y
+          | if $y.status == "ok"
+            then (($y.succeeded|tostring) + "/" + ($y.requested|tostring) + " "
+                  + (if   $y.verdict == "clean"      then "ok"
+                     elif $y.verdict == "degraded"   then "slow"
+                     elif $y.verdict == "capped"     then "capped"
+                     elif $y.verdict == "all-failed" then "fail"
+                     else ($y.verdict // "?") end))
+            else "-" end' 2>/dev/null)
+        yt="${yt:--}"
+      else
+        # --only xray,xrayjson skips transport probes (0-10); --no-tunnel skips the
+        # xray-spawning/data probes → just the direct fingerprint.
+        j=$(bash "$0" --xray-config-json "$f" --only xray,xrayjson --no-tunnel --json 2>/dev/null)
+      fi
       IFS=$'\t' read -r score band fp tells <<EOF
 $(_fleet_row_fields "$j")
 EOF
@@ -3727,8 +3754,8 @@ EOF
   # but non-fatal "012.row: No such file or directory"). mkdir -p is idempotent and
   # cheap, and guarantees the write target exists regardless of the transient.
   [ -d "$SUB_DIR" ] || mkdir -p "$SUB_DIR" 2>/dev/null
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$idx" "$kind" "$remarks" "$server" "$cover" "$detect" "$fp" "$tells" "$band" > "$SUB_DIR/$pad.row" 2>/dev/null
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$idx" "$kind" "$remarks" "$server" "$cover" "$detect" "$fp" "$tells" "$band" "$yt" > "$SUB_DIR/$pad.row" 2>/dev/null
 }
 
 # --sub-test all: score EVERY config in the sub with a fast no-tunnel fingerprint
@@ -3742,18 +3769,32 @@ probe_subscription_walk() {
   # column here — they're a ~100-char string that repeats across same-template nodes
   # and overran the line. They're shown deduplicated under "node profiles" below.
   # remarks via _wpad (multibyte display-width), server:port via _ep_fit (port kept).
-  local rw=24 sw=38 fmt='          %-3s %s %-38s %-16.16s %-13s %s\n'
-  hdr "Subscription fleet scan — ${SUB_COUNT} configs (fingerprint-only, no tunnel)"
-  info "fp = deployment template (same fp = same server build); per-node signals are in the 'signal matrix' below"
-  # shellcheck disable=SC2059
-  printf "$fmt" "#" "$(_wpad remarks "$rw")" "server:port" "cover" "detect" "fp"
+  # YT mode (--sub-test all --yt-test): per-node tunnel + YouTube fan-out, extra
+  # "YouTube" column. Opt-in because it spawns one xray per node (much slower).
+  local yt_mode=0; [ "${YT_TEST_FORCE:-0}" = "1" ] && yt_mode=1
+  local rw=24 sw=38 fmt
+  if [ "$yt_mode" = 1 ]; then
+    fmt='          %-3s %s %-38s %-16.16s %-13s %-11s %s\n'
+    hdr "Subscription fleet scan — ${SUB_COUNT} configs (tunnel + YouTube per node)"
+    info "fp = deployment template; YouTube = succeeded/requested + verdict (ok / slow=throttled / capped / fail) via a per-node tunnel"
+    # shellcheck disable=SC2059
+    printf "$fmt" "#" "$(_wpad remarks "$rw")" "server:port" "cover" "detect" "YouTube" "fp"
+  else
+    fmt='          %-3s %s %-38s %-16.16s %-13s %s\n'
+    hdr "Subscription fleet scan — ${SUB_COUNT} configs (fingerprint-only, no tunnel)"
+    info "fp = deployment template (same fp = same server build); per-node signals are in the 'signal matrix' below"
+    # shellcheck disable=SC2059
+    printf "$fmt" "#" "$(_wpad remarks "$rw")" "server:port" "cover" "detect" "fp"
+  fi
 
   # Probe the fleet CONCURRENTLY in batches of $jobs (each _walk_one writes its own
   # row file → no shared state, no interleaved output). A 28-node fleet goes from
-  # minutes to seconds; --sub-jobs 1 forces serial.
-  local jobs="${SUB_JOBS:-8}"
-  case "$jobs" in ''|*[!0-9]*) jobs=8 ;; esac
-  [ "$jobs" -ge 1 ] || jobs=8
+  # minutes to seconds; --sub-jobs 1 forces serial. In YT mode each job spawns a
+  # full tunnel, so default to a smaller batch (3) to avoid xray thrash.
+  local _defjobs=8; [ "$yt_mode" = 1 ] && _defjobs=3
+  local jobs="${SUB_JOBS:-$_defjobs}"
+  case "$jobs" in ''|*[!0-9]*) jobs=$_defjobs ;; esac
+  [ "$jobs" -ge 1 ] || jobs=$_defjobs
   local f running=0
   for f in "$SUB_DIR"/[0-9][0-9][0-9].json; do
     [ -f "$f" ] || continue
@@ -3764,13 +3805,17 @@ probe_subscription_walk() {
   wait
 
   # Render the row files in index order and tally as we go.
-  local rf idx kind remarks server cover detect fp tells band
+  local rf idx kind remarks server cover detect fp tells band yt
   local crit=0 high=0 mod=0 low=0 dead=0 plan_lines="" fp_counts=""
   for rf in "$SUB_DIR"/[0-9][0-9][0-9].row; do
     [ -f "$rf" ] || continue
-    IFS=$'\t' read -r idx kind remarks server cover detect fp tells band < "$rf"
+    IFS=$'\t' read -r idx kind remarks server cover detect fp tells band yt < "$rf"
     # shellcheck disable=SC2059
-    printf "$fmt" "$idx" "$(_wpad "$remarks" "$rw")" "$(_ep_fit "$server" "$sw")" "$cover" "$detect" "$fp"
+    if [ "$yt_mode" = 1 ]; then
+      printf "$fmt" "$idx" "$(_wpad "$remarks" "$rw")" "$(_ep_fit "$server" "$sw")" "$cover" "$detect" "${yt:--}" "$fp"
+    else
+      printf "$fmt" "$idx" "$(_wpad "$remarks" "$rw")" "$(_ep_fit "$server" "$sw")" "$cover" "$detect" "$fp"
+    fi
     case "$kind" in
       dead) dead=$((dead+1)) ;;
       scored)

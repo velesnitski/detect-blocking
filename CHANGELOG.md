@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-06-26
+
+### Added
+- **`--sub-test all --yt-test` — per-node YouTube column in the fleet walk.** The default `--sub-test all` stays a fast, no-tunnel fingerprint scan. Adding `--yt-test` switches it to a per-node tunnel pass: each config spins a short-lived xray tunnel (`--xray-only --no-speedtest`, so transport probes 0–10 and the heavy multi-stream pull are skipped) and runs the YouTube fan-out (6 concurrent connections through the tunnel), surfacing a **YouTube** column — `succeeded/requested` + verdict (`ok` / `slow`=throttled / `capped` / `fail`). Because it spawns one xray per node it's much slower than the fingerprint walk, so it's opt-in and the concurrency batch defaults to 3 (vs 8) to avoid xray thrash; override with `--sub-jobs N`. Detectability in this mode is tunnel-aware (includes egress/stability), not just the direct fingerprint. Verified live against a 5-node subscription.
+
 ### CI
 - **Hardened the DoH-compromise test fixture against a cold-runner startup race** (no tool change). On a slow macOS CI runner `python3`'s `http.server` could take longer to bind than the test's 2 s readiness budget, so the tool queried a not-yet-listening fixture, got an empty DoH answer, and the run failed with `expected canary mismatch line` (flaky — the same commit passed on the other runner). Fixes: the fixture now binds **before** announcing "listening"; the test polls readiness with a generous budget and **skips** (not fails) if the fixture never comes up; and it retries once, keying the answered/not-answered decision on the `canary returned` line (the later `DoH returned no A records` warning is expected success behaviour — the tool discards the poisoned answer). The test now only FAILs on a genuine regression (fixture answered but the MITM wasn't flagged).
 

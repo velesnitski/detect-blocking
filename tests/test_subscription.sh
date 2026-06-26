@@ -65,4 +65,17 @@ rows_ser=$(TIMEOUT=2 bash "$SCRIPT" --subscription "file://$tmp/arr.json" --sub-
 [ -n "$rows_par" ] || fail "parallel walk produced no data rows"
 [ "$rows_par" = "$rows_ser" ] || fail "parallel (--sub-jobs 8) and serial (--sub-jobs 1) walks must render identically"
 
-echo "PASS: --subscription decodes/inventories/selects; --no-tunnel keeps fingerprint only; --sub-test all walks the fleet (parallel == serial)"
+# --- default walk has NO YouTube column (regression: YT stays opt-in) ---
+out=$(TIMEOUT=2 bash "$SCRIPT" --subscription "file://$tmp/arr.json" --sub-test all 2>&1)
+printf '%s' "$out" | grep -q 'fingerprint-only, no tunnel' || fail "default walk header should say fingerprint-only/no tunnel"
+printf '%s' "$out" | grep -q 'YouTube' && fail "default walk must NOT add a YouTube column"
+
+# --- --sub-test all --yt-test → YT-mode walk adds a YouTube column. Fixture nodes
+#     are closed loopback ports, so the nc precheck marks them dead BEFORE any xray
+#     spawns → no tunnel/network needed; dead rows show "-" in the YouTube cell. ---
+out=$(TIMEOUT=2 bash "$SCRIPT" --subscription "file://$tmp/arr.json" --sub-test all --yt-test 2>&1)
+printf '%s' "$out" | grep -q 'tunnel + YouTube per node' || fail "--sub-test all --yt-test should switch the walk to YT mode"
+printf '%s' "$out" | grep -qE '#.*remarks.*YouTube' || fail "YT-mode fleet table should have a YouTube column header"
+printf '%s' "$out" | grep -q 'fleet detectability:' || fail "YT-mode walk should still print the detectability summary"
+
+echo "PASS: --subscription decodes/inventories/selects; --no-tunnel keeps fingerprint only; --sub-test all walks the fleet (parallel == serial); --yt-test adds the YouTube column (opt-in)"

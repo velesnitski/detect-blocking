@@ -509,6 +509,15 @@ no data pull, so a whole fleet is just TLS handshakes, probed **concurrently**
 ./detect_blocking.sh --subscription 'https://example.com/sub/<token>' --sub-test all
 ```
 
+Add `--yt-test` to also get a per-node **YouTube** column — each node spins a
+short-lived tunnel and runs a 6-connection YouTube fan-out (`ok` / `slow`=throttled
+/ `capped` / `fail`). This spawns one xray per node, so it's much slower than the
+fingerprint walk (batch defaults to 3; `--sub-jobs N` to change):
+
+```
+./detect_blocking.sh --subscription 'https://example.com/sub/<token>' --sub-test all --yt-test
+```
+
 ```
 == Subscription fleet scan — 28 configs (fingerprint-only, no tunnel) ==
   fp = deployment template (same fp = same server build); per-node signals are in the 'signal matrix' below

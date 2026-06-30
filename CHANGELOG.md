@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.40.1] - 2026-06-26
+
+### Changed
+- **`--sub-test all --yt-test` is much faster.** The per-node tunnel pass now also passes `--no-stability --no-bufferbloat` (on top of `--no-speedtest`), dropping the slow data-plane QoE probes (14/17/22) that dominated wall time — one flaky node's held-session stability pulses alone took ~100 s — and that feed nothing into the fleet table (they don't move the detectability score). Detectability stays tunnel-aware via the cover/active-probe/TLS-parity/egress probes. Verified concurrency-safe: each per-node tunnel binds a random ephemeral SOCKS port (`_find_free_port`), so the default batch of 3 doesn't collide.
+
 ## [0.40.0] - 2026-06-26
 
 ### Added

@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.40.0"
+readonly DETECT_BLOCKING_VERSION="0.40.1"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -3722,10 +3722,13 @@ _walk_one() {
       if [ "${YT_TEST_FORCE:-0}" = "1" ]; then
         # YT-mode walk (--sub-test all --yt-test): spin a per-node tunnel so probe 12
         # comes up and the YouTube fan-out runs (default N=6). --xray-only skips
-        # transport 0-10, --no-speedtest skips the heavy multi-stream pull. Slower
-        # (one xray per node) — that's why it's opt-in. Detectability is then
-        # tunnel-aware (includes egress/stability), not just the direct fingerprint.
-        j=$(bash "$0" --xray-config-json "$f" --xray-only --no-speedtest --json 2>/dev/null)
+        # transport 0-10; --no-speedtest/--no-stability/--no-bufferbloat drop the slow
+        # data-plane QoE probes (14/17/22) — they dominated wall time (one flaky node's
+        # stability pulses alone took ~100s) and feed NOTHING in the fleet table (they
+        # don't move the detectability score). Still slower than the fingerprint walk
+        # (one xray per node) — hence opt-in. Detectability stays tunnel-aware via the
+        # cover/active-probe/parity/egress probes, just without the QoE measurements.
+        j=$(bash "$0" --xray-config-json "$f" --xray-only --no-speedtest --no-stability --no-bufferbloat --json 2>/dev/null)
         yt=$(printf '%s' "$j" | jq -r '
           (.probes.youtube_reach // {}) as $y
           | if $y.status == "ok"

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.41.0] - 2026-07-03
+
+### Added
+- **SNI privacy / ECH posture (advisory).** A new stealth axis, orthogonal to the probe-26 detectability score: the score rates the *quality* of the cleartext cover SNI but treats its *visibility* as fixed — this asks whether that SNI can be **hidden at all** (Encrypted ClientHello) and whether the transport allows it. Transport-aware: **Reality** relies on a cleartext cover *by design* (ECH N/A → the cover-quality score is the lever), whereas a **TLS-over-CDN** transport (ws/gRPC/xHTTP behind a front) *can* use ECH — so the probe looks up whether the front publishes an ECH config in DNS (`HTTPS`/SVCB `ech=` param via `dig`, with a DoH-JSON fallback for old resolvers) and classifies the posture `reality` / `ech-available-unused` / `ech-unpublished` / `ech-unknown`. `ech-available-unused` (front offers ECH but the client still leaks the SNI) is the actionable tell — the highest-leverage SNI fix for a CDN-fronted transport. Runs after probe 26 as an **unnumbered advisory** (26 stays the last *scored* probe) and is **never folded into the score** (ECH is a censor-/time-dependent tradeoff, like the uTLS fp). Share-safe; emitted in `--json` under `.probes.xray_sni_privacy`. The pure classifier `_sni_privacy_advisory` is unit-tested (reality/ECH matrix), plus an offline integration check that the advisory doesn't displace probe 26.
+
 ## [0.40.1] - 2026-06-26
 
 ### Changed

@@ -1012,6 +1012,37 @@ clean bill — it's flagged and named:
 The breakdown is always printed, so the score is never a black box — every
 signal that did (and didn't) fire is shown with its points.
 
+#### SNI privacy / ECH posture (advisory)
+
+Probe 26 scores the *quality* of the cleartext cover SNI but treats its
+**visibility** as fixed. This advisory adds the orthogonal axis: **can that SNI
+be hidden at all** (Encrypted ClientHello), and does the transport allow it? It
+runs after probe 26 (unnumbered, so 26 stays the last *scored* probe, like the
+volume-throttle advisory) and is **never folded into the score** — ECH adoption
+isn't universal and Reality forgoes it by design, the same *"tradeoff, not
+scored"* treatment the uTLS fp gets.
+
+The posture is transport-aware:
+
+- **Reality** → the cleartext cover SNI *is* the mechanism, so ECH does not
+  apply. The lever is cover-SNI *quality* (probe 26), not encryption. Reported as
+  `posture: reality`.
+- **TLS-over-CDN** (ws/gRPC/xHTTP behind a front — the pattern where the SNI is
+  your *own* fronted domain) → ECH **applies**, and the probe checks whether the
+  front actually publishes an ECH config in DNS (an `HTTPS`/SVCB record with an
+  `ech=` param, looked up via `dig` then a DoH-JSON fallback):
+  - front publishes ECH but the client sends the SNI in cleartext →
+    `ech-available-unused` — an available-but-unused mitigation (like a missing
+    vision flow); enabling ECH client-side removes the cleartext-SNI tell entirely;
+  - front publishes no ECH → `ech-unpublished` (front behind a provider that
+    offers it to be able to hide the SNI);
+  - couldn't tell (old `dig`, no DoH) → `ech-unknown` (treated as visible until
+    confirmed — never guessed from raw record bytes).
+
+Share-safe (the cover domain is only shown under `--reveal`); emitted in `--json`
+under `.probes.xray_sni_privacy` (`posture`, `ech_applies`,
+`ech_published_by_cover`, `sni_cleartext`).
+
 #### Baseline / diff — turn the suite into a regression detector
 
 Point-in-time probes answer *"is X true now?"* The higher-value operational

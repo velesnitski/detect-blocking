@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.40.1"
+readonly DETECT_BLOCKING_VERSION="0.41.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -53,6 +53,7 @@ readonly DETECT_BLOCKING_VERSION="0.40.1"
 #                Xray-protocol probes (11-26): protocol,json,throughput,capacity,cover,
 #                  egress,stability,lint,clock,active-probe,fleet,routing,bufferbloat,mtu,
 #                  tls-parity,cover-throttle,detectability(+deployment fingerprint)
+#                  + SNI-privacy/ECH posture (advisory, after 26 — is the cleartext SNI hideable?)
 #                opt-in scanners: probe_cover_scan (--scan-covers), probe_censor_sweep (--censor-sweep)
 #                non-Xray: probe_hysteria (static Hysteria2/QUIC analysis; auto on a Hysteria2 config)
 #                happ://: import→unwrap, probe_happ_routing (routing-profile lint), probe_happ_crypt (encrypted)
@@ -1083,6 +1084,17 @@ XRAY_PASSIVE_COVER_OBSCURE="" # 1 / 0 — cover SNI resolves to a hosting/VPS ne
 XRAY_PASSIVE_VISION=""       # 1 protected / 0 exposed / "" n/a — VLESS-Reality uses xtls-rprx-vision (anti TLS-in-TLS)
 XRAY_TRANSPORT_MUX=""        # 1 / 0 / "" — mux.cool enabled on the proxy outbound (shape/correlation note vs vision)
 XRAY_DEPLOY_FINGERPRINT=""   # short stable hash of the config's identifying shape (provider match)
+
+# ---- SNI privacy / ECH posture (advisory, after probe 26 — NOT scored) ----
+# Orthogonal to probe 26's cover-SNI QUALITY: can the SNI be HIDDEN at all
+# (Encrypted ClientHello), and does the transport allow it? Reality forgoes ECH
+# by design (cleartext cover IS the mechanism); a TLS-over-CDN transport can use
+# it, and major CDNs publish ECH configs in DNS (HTTPS RR ech=).
+XRAY_SNIPRIV_STATUS=""       # ok, skipped
+XRAY_SNIPRIV_CLEARTEXT=""    # 1 — SNI travels in cleartext today (Reality by design; plain-TLS unless ECH)
+XRAY_SNIPRIV_ECH_APPLIES=""  # 1 / 0 — ECH is applicable to this transport (0 for Reality)
+XRAY_SNIPRIV_ECH_COVER=""    # 1 / 0 / unknown — the cover/front publishes an ECH config in DNS (HTTPS RR)
+XRAY_SNIPRIV_CODE=""         # classifier code: reality | ech-available-unused | ech-unpublished | ech-unknown | na
 
 # ---- baseline / diff mode (longitudinal regression detection) ----
 # --save-baseline FILE writes this run's share-safe JSON; --diff-baseline FILE
@@ -5342,6 +5354,72 @@ probe_xray_coverthrottle() {
   fi
 }
 
+# Probe 27 — SNI privacy / ECH posture (advisory; unnumbered header so probe 26
+# stays the last SCORED probe, exactly like the volume-throttle advisory). Probe
+# 26 scores the QUALITY of the cleartext cover SNI but treats its visibility as
+# fixed. This adds the orthogonal axis the KB names as the step after DoH: CAN the
+# SNI be hidden (Encrypted ClientHello), and does the transport allow it? Reality
+# relies on a cleartext cover BY DESIGN (ECH N/A); a TLS-over-CDN transport (the
+# ByeDPI/Cloudflare pattern) CAN use ECH, and major CDNs publish ECH configs in
+# DNS (HTTPS RR ech=). Advisory only — not folded into the score. Share-safe: the
+# cover domain is shown only via reveal().
+probe_xray_sni_privacy() {
+  local sec net sni q=""
+  sec=$(_xray_cfg_field security '.outbounds[0].streamSettings.security')
+  net=$(_xray_cfg_field type     '.outbounds[0].streamSettings.network')
+  sni=$(_xray_cover_sni)
+  [ -z "$sni" ] && sni=$(_xray_cfg_field sni '.outbounds[0].streamSettings.tlsSettings.serverName')
+  # share-link fallback when there's no JSON config
+  if [ -n "$XRAY_CONFIG" ]; then
+    case "$XRAY_CONFIG" in *\?*) q=${XRAY_CONFIG#*\?}; q=${q%%#*} ;; esac
+    [ -z "$sec" ] && sec=$(_qp "$q" security)
+    [ -z "$net" ] && net=$(_qp "$q" type)
+    [ -z "$sni" ] && sni=$(_qp "$q" sni)
+  fi
+  [ -z "$net" ] && net=tcp
+  if [ -z "$sni" ] || { [ "$sec" != "reality" ] && [ "$sec" != "tls" ]; }; then
+    XRAY_SNIPRIV_STATUS="skipped"; return 0
+  fi
+
+  hdr "SNI privacy / ECH posture (advisory)"
+
+  XRAY_SNIPRIV_CLEARTEXT=1
+  local ech_applies
+  if [ "$sec" = "reality" ]; then ech_applies=0; else ech_applies=1; fi
+  XRAY_SNIPRIV_ECH_APPLIES="$ech_applies"
+
+  # Only spend a DNS lookup where ECH could actually apply (a TLS transport).
+  local ech_cover="unknown"
+  [ "$ech_applies" = "1" ] && ech_cover=$(_ech_dns_probe "$sni")
+  XRAY_SNIPRIV_ECH_COVER="$ech_cover"
+
+  local _r code msg
+  _r=$(_sni_privacy_advisory "$sec" "$ech_cover")
+  code=${_r%%|*}; msg=${_r#*|}
+  XRAY_SNIPRIV_CODE="$code"
+  XRAY_SNIPRIV_STATUS="ok"
+
+  info "SNI is sent in cleartext in the ClientHello$( [ "$sec" = "reality" ] && printf ' (Reality: that cover IS the mechanism)' )"
+  case "$code" in
+    reality)
+      ok "cover-SNI model — ECH N/A; cover QUALITY (probe 26) is the lever, not encryption"
+      info "$msg" ;;
+    ech-available-unused)
+      warn "the front already publishes an ECH config, yet the SNI is still sent in cleartext"
+      add_verdict "SNI privacy (advisory): the endpoint's front publishes an Encrypted-ClientHello (ECH) config, but the client still sends the cover SNI in cleartext — a SNI-blocklist DPI (the cheap default: a national domain registry, or provider-level SNI blocking seen in some regions) can match it. Enabling ECH client-side removes the cleartext SNI entirely — the highest-leverage SNI fix for a TLS/WS-over-CDN transport. Not folded into the detectability score (ECH is a censor-/time-dependent tradeoff, like the uTLS fp)" ;;
+    ech-unpublished)
+      warn "SNI stays visible — the front does not offer ECH"
+      info "$msg" ;;
+    ech-unknown)
+      info "$msg" ;;
+    *) info "$msg" ;;
+  esac
+  if [ "$sec" != "reality" ] && [ "$ech_cover" != "1" ]; then
+    reveal "front/cover serverName = \"$sni\" — its DNS shows no usable ECH config; to hide the SNI, front behind a provider that publishes ECH"
+  fi
+  info "advisory only — not scored (ECH adoption isn't universal and Reality forgoes it by design; probe 26 scores the cover-SNI quality that matters today)"
+}
+
 # Pure scorers for two probe-26 active signals, split out so the "don't score
 # what you couldn't observe" rule is unit-testable without a live (un)reachable
 # server. Each echoes "points|description".
@@ -5377,6 +5455,52 @@ _score_active() {                # status cover_status nxnote
     no-baseline) printf '5|UNVERIFIED%s' "${nx:- (no genuine cover to baseline)}" ;;
     *)        printf '0|not evaluated (%s)' "${st:-skipped}" ;;
   esac
+}
+
+# SNI-privacy / ECH advisory (probe 27). Pure, so it's unit-testable like the
+# scorers above. Echoes "code|message". Deliberately NOT scored — ECH adoption
+# isn't universal and Reality forgoes it by design (same "tradeoff, not scored"
+# treatment the uTLS fp gets in probe 26); this only names WHICH lever removes
+# the cleartext-SNI exposure for THIS transport. Inputs:
+#   sec       — streamSettings.security (reality | tls)
+#   ech_cover — 1 | 0 | unknown : does the cover/front publish an ECH config (DNS)
+_sni_privacy_advisory() {        # sec ech_cover
+  local sec="$1" ech="${2:-unknown}"
+  case "$sec" in
+    reality)
+      printf 'reality|SNI is cleartext BY DESIGN (Reality cover) — ECH does not apply; the mitigation is cover-SNI quality (probe 26). A SNI-inspecting DPI acts on the cover domain, so the cover must be popular AND not itself SNI-blocked in-region' ;;
+    tls)
+      case "$ech" in
+        1) printf 'ech-available-unused|the front publishes an ECH config but the ClientHello still sends the SNI in cleartext — enabling ECH client-side removes the SNI tell entirely (an available-but-unused mitigation, like a missing vision flow)' ;;
+        0) printf 'ech-unpublished|the front does NOT publish an ECH config, so the SNI stays visible in every ClientHello — front the endpoint behind a provider that offers ECH (e.g. a major CDN) to be able to hide it' ;;
+        *) printf 'ech-unknown|could not determine whether the front publishes an ECH config (needs a modern dig HTTPS lookup or DoH) — treat the SNI as visible until confirmed' ;;
+      esac ;;
+    *)
+      printf 'na|not a TLS/Reality outbound — no cleartext-SNI exposure to assess' ;;
+  esac
+}
+
+# Best-effort: does <domain> publish an ECH config? Looks for the "ech=" SvcParam
+# in an HTTPS/SVCB (type 65) record — dig (HTTPS then TYPE65), then a DoH-JSON
+# fallback for where local dig is too old to format type 65. Echoes 1 (ech=
+# present) / 0 (an HTTPS RR was formatted but carries no ech=) / unknown (couldn't
+# tell). Never guesses ECH out of raw "\# <hex>" rdata — inconclusive stays unknown.
+_ech_dns_probe() {               # domain
+  local host="$1" rr="" ans=""
+  if check_cmd dig; then
+    rr=$( { dig +short -t HTTPS "$host" 2>/dev/null; dig +short -t TYPE65 "$host" 2>/dev/null; } )
+    if printf '%s' "$rr" | grep -qi 'ech='; then echo 1; return; fi
+    # A modern dig formats the SvcParams (alpn=/ipv4hint=…). Seeing those but no
+    # ech= means the RR genuinely lacks ECH → 0. Raw "\# <hex>" from an old dig is
+    # unreadable → don't guess; fall through to DoH / unknown.
+    if printf '%s' "$rr" | grep -qiE 'alpn=|ipv4hint=|ipv6hint=|port=|mandatory='; then echo 0; return; fi
+  fi
+  if check_cmd curl; then
+    ans=$(curl -sS --max-time "$TIMEOUT" \
+          "https://dns.google/resolve?name=${host}&type=HTTPS" 2>/dev/null)
+    printf '%s' "$ans" | grep -qi 'ech=' && { echo 1; return; }
+  fi
+  echo unknown
 }
 
 # Cross-probe TEMPORAL synthesis (pure, so it's unit-testable). Did the tunnel
@@ -6048,6 +6172,11 @@ _emit_json() {
     --arg xpf_utls_rare     "$XRAY_PASSIVE_UTLS_RARE" \
     --arg xpf_utls_fp       "$XRAY_PASSIVE_UTLS_FP" \
     --arg xpf_vision        "$XRAY_PASSIVE_VISION" \
+    --arg xsp_status        "$XRAY_SNIPRIV_STATUS" \
+    --arg xsp_cleartext     "$XRAY_SNIPRIV_CLEARTEXT" \
+    --arg xsp_ech_applies   "$XRAY_SNIPRIV_ECH_APPLIES" \
+    --arg xsp_ech_cover     "$XRAY_SNIPRIV_ECH_COVER" \
+    --arg xsp_code          "$XRAY_SNIPRIV_CODE" \
     --arg xtr_mux           "$XRAY_TRANSPORT_MUX" \
     --arg xd_deployfp       "$XRAY_DEPLOY_FINGERPRINT" \
     --argjson verdicts      "$verdicts_json" '
@@ -6331,6 +6460,13 @@ _emit_json() {
           cover_bytes_per_second: (if $xct_cover == "" then null else ($xct_cover | tonumber? // null) end),
           baseline_bytes_per_second: (if $xct_base == "" then null else ($xct_base | tonumber? // null) end)
         },
+        xray_sni_privacy: {
+          status: opt($xsp_status),
+          sni_cleartext: tri_bool(($xsp_cleartext | tonumber? // -1)),
+          ech_applies: tri_bool(($xsp_ech_applies | tonumber? // -1)),
+          ech_published_by_cover: (if $xsp_ech_cover == "1" then true elif $xsp_ech_cover == "0" then false else null end),
+          posture: opt($xsp_code)
+        },
         xray_detectability: {
           status: opt($xd_status),
           score: (if $xd_score == "" then null else ($xd_score | tonumber? // null) end),
@@ -6582,6 +6718,9 @@ fi
 # Detectability is the FINAL synthesis (active probes 15/20/24 + passive
 # port / SNI↔IP signals) — always run it last.
 { _should_run xray || _should_run xrayjson; } && probe_xray_detectability
+# SNI-privacy / ECH posture — advisory, runs AFTER the probe-26 synthesis (like
+# the volume advisory) so 26 stays the last SCORED probe. Not folded into score.
+{ _should_run xray || _should_run xrayjson; } && probe_xray_sni_privacy
 # Cross-probe temporal synthesis — runs after the data-plane + sustained-use
 # probes so it can compare early-vs-late tunnel behaviour. Advisory only.
 [ -z "${NO_TUNNEL:-}" ] && _should_run xrayjson && probe_volume_synthesis

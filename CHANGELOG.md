@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-07-03
+
+First stable release. detect-blocking has been dogfooded against real infrastructure across 40+ iterations with a 51-test suite; the interface is now considered stable and versioned under [Semantic Versioning](https://semver.org).
+
+### Stability contract
+- **Stable** — a breaking change here requires a major (2.0.0) bump:
+  - CLI flag names and their argument semantics; process exit codes.
+  - The top-level `--json` object shape (`schema_version` / `version` / `timestamp` / `target` / `probes` / `verdicts`), signalled by `schema_version` (now `1`; bumped only on a breaking JSON change).
+  - The **share-safety guarantee**: default and `--json` output never carry raw endpoint IPs, cover domains, or secrets — only booleans / country / codes / bucketed numbers. Offending values appear solely under `--reveal`, which is never logged and never emitted.
+- **Not a contract** — may change in any minor/patch release:
+  - Exact detectability **score** values and bands, and verdict / recommendation wording (heuristics, tuned continuously).
+  - Which probes run by default, and probe numbering.
+  - **Additive** JSON fields under existing objects — consumers must ignore unknown keys. This is how new signals (e.g. `xray_sni_privacy`, `xray_lint.vless_encryption`) ship without a major bump.
+  - Human-readable console formatting.
+
+### Notes
+- No functional change from 0.42.0 — this release declares the interface stable and documents the contract. The pre-1.0 flag/knob audit found the surface already consistent (kebab-case; `--sub-*` / `--compare-*` / `--no-*` families; paired toggles) and the JSON already carrying `schema_version`, so nothing was renamed.
+
 ## [0.42.0] - 2026-07-03
 
 ### Added

@@ -89,6 +89,27 @@ needs a Reality/Xray tunnel).
 
 ---
 
+## Stability & versioning
+
+As of **1.0.0** the tool follows [Semantic Versioning](https://semver.org). What that promises:
+
+- **Stable** (a break here means a major bump): **CLI flag names** and their argument
+  semantics, **exit codes**, the **top-level `--json` shape** (`schema_version` /
+  `version` / `timestamp` / `target` / `probes` / `verdicts`), and the
+  **share-safety guarantee** — default and `--json` output never contain raw
+  endpoint IPs, cover domains, or secrets; offending values appear only under
+  `--reveal`, which is never logged or emitted. The JSON carries `schema_version`
+  (currently `1`), bumped only on a breaking schema change.
+- **Not a contract** (changes in any minor/patch): exact detectability **score**
+  values and verdict wording (heuristics, tuned continuously), which probes run,
+  probe numbering, **additive** JSON fields under existing objects (ignore unknown
+  keys), and human-readable console formatting.
+
+If you script against the output, key off `schema_version` and the boolean/status
+fields — not the score number or the prose.
+
+---
+
 ## Sample output
 
 Running against the IANA demo target (`www.example.com`):

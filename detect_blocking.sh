@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="0.41.0"
+readonly DETECT_BLOCKING_VERSION="0.42.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -966,6 +966,9 @@ XRAY_STABILITY_RESULTS=""   # "size|state|rtt ..." for JSON
 XRAY_LINT_STATUS=""         # ok, warn, skipped
 XRAY_LINT_FINDINGS=""       # newline-joined short codes for JSON
 XRAY_FET_EXPOSED=""         # 1 / 0 / "" — fully-encrypted (no TLS/HTTP framing) → GFW entropy classifier (USENIX'23)
+XRAY_VLESS_ENC=""           # none | native | xorpub | random | invalid | "" — VLESS Encryption method (mlkem768x25519plus.*, Xray 2025+)
+XRAY_VLESS_ENC_PADDING=""   # 1 / 0 / "" — VLESS Encryption has padding/delay blocks (anti flow-shape analysis)
+XRAY_VLESS_FLOW_DEPRECATED="" # 1 / 0 / "" — VLESS without flow= (deprecated upstream, XTLS/Xray-core #5568)
 XRAY_ID_UUID=""             # 1 / 0 / "" — client id is a canonical UUID (vs a hand-assigned/non-UUID string; share-safe: format only)
 
 # ---- probe 19: clock skew (Reality auth is time-windowed) ----
@@ -4357,6 +4360,22 @@ _xray_cfg_field() {
 # Probe 18 — config pre-flight lint (static, no network). Surfaces common
 # Reality/VLESS misconfigs that otherwise masquerade as DPI. Advisory: each
 # finding names the protocol knob, never the secret value.
+# Classify a VLESS `encryption` field, pure so it's unit-testable. Classic VLESS
+# uses encryption=none; Xray (2025+) added a native post-quantum VLESS Encryption
+# layer, encryption="mlkem768x25519plus.<method>.<session>[+padding][+delay]" where
+# <method> = native (raw/structured) | xorpub (obfuscated pubkey) | random (full
+# random, VMess/SS-like). Echoes: none | native | xorpub | random | invalid.
+_vless_enc_method() {            # encryption-string
+  local e="$1" m
+  case "$e" in
+    ""|none) echo none ;;
+    mlkem768x25519plus*|mlkem768x25519*)
+      m="${e#*.}"; m="${m%%.*}"; m="${m%%+*}"
+      case "$m" in native|xorpub|random) echo "$m" ;; *) echo native ;; esac ;;
+    *) echo invalid ;;
+  esac
+}
+
 probe_xray_lint() {
   if [ -z "$XRAY_CONFIG" ] && [ -z "$XRAY_JSON_CONFIG" ]; then
     XRAY_LINT_STATUS="skipped"
@@ -4399,9 +4418,44 @@ $1"
     fi
   }
 
-  # flow=vision requires raw TCP transport ("raw" is the current name for "tcp").
-  if [ -n "$flow" ] && { [ "$net" != "tcp" ] && [ "$net" != "raw" ]; }; then
-    _lint_add "flow=$flow requires raw TCP transport (network=tcp/raw), but network=$net — handshake will fail"
+  # VLESS Encryption (Xray 2025+): a NATIVE post-quantum crypto layer (ML-KEM-768 +
+  # X25519), encryption="mlkem768x25519plus.<native|xorpub|random>.<session>[+pad]".
+  # Recognize it (classic VLESS is encryption=none), record method + padding — both
+  # feed the FET check and probe 26's vision logic — and DON'T false-error on it.
+  local _isv=0
+  case "$XRAY_CONFIG" in vless://*) _isv=1 ;; esac
+  [ "$_isv" = 0 ] && [ -n "$XRAY_JSON_CONFIG" ] && [ "$(_xray_cfg_field protocol '.outbounds[0].protocol')" = "vless" ] && _isv=1
+  if [ "$_isv" = 1 ]; then
+    XRAY_VLESS_ENC=$(_vless_enc_method "$enc")
+    case "$enc" in *+*) XRAY_VLESS_ENC_PADDING=1 ;; *) XRAY_VLESS_ENC_PADDING=0 ;; esac
+    case "$XRAY_VLESS_ENC" in
+      none) : ;;
+      invalid) _lint_add "vless encryption='$enc' is neither 'none' nor a recognized VLESS Encryption string (mlkem768x25519plus.<native|xorpub|random>…) — likely a typo" ;;
+      *)
+        info "VLESS Encryption enabled — post-quantum ML-KEM-768 + X25519, method=${XRAY_VLESS_ENC}$( [ "$XRAY_VLESS_ENC_PADDING" = 1 ] && printf ' + traffic padding' || printf ', no padding blocks' ) (a native crypto layer, independent of TLS/Reality)"
+        [ "$XRAY_VLESS_ENC_PADDING" = 0 ] && info "VLESS Encryption has no padding/delay blocks — padding blunts packet-length/timing (flow-shape) analysis; worth adding for the RU/CN frontier"
+        ;;
+    esac
+  fi
+
+  # flow=vision requires raw TCP transport ("raw" = current name for "tcp") — UNLESS
+  # VLESS Encryption is configured, which lifts the transport restriction (vision
+  # then runs on any transport: the VLESSENC + XHTTP + vision frontier config).
+  if [ -n "$flow" ] && { [ "$net" != "tcp" ] && [ "$net" != "raw" ]; } \
+     && { [ -z "$XRAY_VLESS_ENC" ] || [ "$XRAY_VLESS_ENC" = "none" ] || [ "$XRAY_VLESS_ENC" = "invalid" ]; }; then
+    _lint_add "flow=$flow requires raw TCP transport (network=tcp/raw), but network=$net and no VLESS Encryption — the handshake will fail (VLESS Encryption would lift this restriction)"
+  fi
+
+  # VLESS without a flow is deprecated upstream (Xray-core is migrating to
+  # VLESS-with-flow; XTLS/Xray-core discussion #5568). A forward-looking warning,
+  # not a misconfig — so it's a plain warn (visible), not a _lint_add (which frames
+  # findings as likely typos). The probe-26 vision +15 already drives the actionable
+  # fix on a REALITY+raw config; this catches the CDN/non-raw configs too.
+  if [ "$_isv" = 1 ] && [ -z "$flow" ]; then
+    XRAY_VLESS_FLOW_DEPRECATED=1
+    warn "VLESS without flow= is deprecated upstream (Xray is migrating to VLESS-with-flow; #5568) — plan flow=xtls-rprx-vision (raw TCP) or VLESS Encryption + flow (CDN transport)"
+  elif [ "$_isv" = 1 ]; then
+    XRAY_VLESS_FLOW_DEPRECATED=0
   fi
   if [ "$sec" = "reality" ]; then
     [ -z "$pbk" ] && _lint_add "security=reality but publicKey (pbk) is missing"
@@ -4421,12 +4475,8 @@ $1"
     fi
     [ -z "$fp" ] && _lint_add "no uTLS fingerprint (fp) set — a real-browser fp is recommended for Reality"
   fi
-  # vless wants encryption=none.
-  if [ -n "$enc" ] && [ "$enc" != "none" ]; then
-    case "$XRAY_CONFIG$XRAY_JSON_CONFIG" in
-      vless*|*vless*) _lint_add "vless requires encryption=none, got encryption=$enc" ;;
-    esac
-  fi
+  # (VLESS encryption handled above — classic 'none' vs the new VLESS Encryption
+  # layer; a modern encryption=mlkem768x25519plus.* is valid, not an error.)
   # allowInsecure / insecure=true — a static red flag that needs no network, so
   # it fires even against an unreachable node: the client accepts ANY server
   # cert, which (a) masks a cover cert that won't validate for the SNI — itself
@@ -4454,14 +4504,33 @@ $1"
     ss|shadowsocks) fet=1 ;;                       # fully-encrypted, no framing
     vmess|vless|trojan)
       case "$sec" in
-        ""|none) case "$net" in tcp|raw) fet=1 ;; *) fet=0 ;; esac ;;  # raw=exposed; ws/grpc/xhttp carry HTTP framing
-        *) fet=0 ;;                                # tls/reality → TLS exemption
+        ""|none)
+          case "$net" in
+            tcp|raw)
+              # Classic security=none + raw TCP = random from byte 0 → exposed. VLESS
+              # Encryption changes it: 'random' is STILL full-random (VMess/SS-like →
+              # exposed); 'native'/'xorpub' reshape the wire, so their FET-resistance
+              # is method-dependent — don't ASSERT a block (report, don't over-claim).
+              case "$XRAY_VLESS_ENC" in
+                random)        fet=1 ;;
+                native|xorpub) fet=0 ;;
+                *)             fet=1 ;;   # no VLESS Encryption (none/"") → classic FET exposure
+              esac ;;
+            *) fet=0 ;;                   # ws/grpc/xhttp carry HTTP framing
+          esac ;;
+        *) fet=0 ;;                       # tls/reality → TLS exemption
       esac ;;
   esac
   XRAY_FET_EXPOSED="$fet"
   if [ "$fet" = "1" ]; then
     case "$proto" in
       ss|shadowsocks) warn "GFW fully-encrypted-traffic exposure: Shadowsocks has no TLS/HTTP framing → random from byte 0, so the GFW entropy classifier (USENIX'23) blocks it unless a plugin/SS-2022 prefix breaks the popcount band" ;;
+      vless)
+        if [ "$XRAY_VLESS_ENC" = "random" ]; then
+          warn "GFW fully-encrypted-traffic exposure: VLESS Encryption method='random' emits full-random bytes (VMess/SS-like) with no TLS/HTTP framing on raw TCP → the GFW entropy classifier (USENIX'23) blocks it. Use method 'native'/'xorpub', or wrap in TLS/REALITY"
+        else
+          warn "GFW fully-encrypted-traffic exposure: vless+raw-TCP with security=none has no TLS/HTTP framing → the GFW entropy classifier (USENIX'23) blocks fully-random traffic"
+        fi ;;
       *)              warn "GFW fully-encrypted-traffic exposure: ${proto}+raw-TCP with security=none has no TLS/HTTP framing → the GFW entropy classifier (USENIX'23) blocks fully-random traffic" ;;
     esac
     add_verdict "GFW fully-encrypted-traffic (FET) exposure: this transport sends fully-encrypted bytes with no TLS record header or HTTP framing, so it is random from the first byte. Since 2021 the GFW exempts traffic that looks like a known protocol (TLS / HTTP / mostly-printable) and BLOCKS the rest via an entropy test (set bits per byte ~3.4-4.6). Give it a recognizable shape: wrap in TLS or switch to REALITY (matches the TLS exemption), use a transport with plaintext HTTP framing (ws / xhttp), or for Shadowsocks add an obfs/TLS plugin or a printable prefix + padding. UDP transports (mKCP/QUIC) are not covered by this TCP classifier"
@@ -5764,33 +5833,53 @@ probe_xray_detectability() {
   # discouraged for exactly this. Detected statically from flow/transport — no
   # tshark needed: we detect the MITIGATION, not the packet signature. NOT a
   # tradeoff like the uTLS fp — vision is near-universally correct, so it scores.
-  local vis_pts=0 vis_desc="n/a (not a REALITY proxy)" v_sec v_net v_flow v_mux
+  local vis_pts=0 vis_desc="n/a (not a REALITY / VLESS-Encryption proxy)" v_sec v_net v_flow v_mux v_encmode=""
   v_sec=$(_xray_cfg_field security '.outbounds[0].streamSettings.security')
   v_net=$(_xray_cfg_field type     '.outbounds[0].streamSettings.network')
   v_flow=$(_xray_cfg_field flow    '.outbounds[0].settings.vnext[0].users[0].flow')
   [ -z "$v_net" ] && v_net=tcp
-  if [ "$v_sec" = "reality" ]; then   # REALITY is VLESS-only → vision applies on raw TCP
+  # VLESS Encryption (Xray 2025+) lifts vision's raw-TCP restriction — vision runs
+  # on ANY transport when it's present (the VLESSENC + XHTTP + vision frontier).
+  case "${XRAY_VLESS_ENC:-}" in native|xorpub|random) v_encmode=1 ;; esac
+  if [ "$v_sec" = "reality" ] || [ "$v_encmode" = "1" ]; then
     # Match the whole vision FAMILY, not just the bare value: xtls-rprx-vision-udp443
     # (which additionally lets UDP/443 through) splices/pads the stream against
     # TLS-in-TLS identically, so an exact "= xtls-rprx-vision" test wrongly reads a
     # valid -udp443 config as "no vision" and over-scores +15.
     case "$v_flow" in
       xtls-rprx-vision|xtls-rprx-vision-udp443)
-        XRAY_PASSIVE_VISION=1; vis_desc="${v_flow} present (anti TLS-in-TLS)" ;;
+        XRAY_PASSIVE_VISION=1
+        if [ "$v_encmode" = "1" ] && [ "$v_net" != "tcp" ] && [ "$v_net" != "raw" ]; then
+          vis_desc="${v_flow} over ${v_net} via VLESS Encryption (anti TLS-in-TLS)"
+        else
+          vis_desc="${v_flow} present (anti TLS-in-TLS)"
+        fi ;;
       *)
       case "$v_net" in
         tcp|raw)
-          # Raw TCP and no vision = a clear, available mitigation left unused.
-          XRAY_PASSIVE_VISION=0; vis_pts=15
-          vis_desc="no vision flow on REALITY+TCP — TLS-in-TLS exposure" ;;
+          if [ "$v_sec" = "reality" ]; then
+            # Raw TCP + REALITY and no vision = a clear, available mitigation unused.
+            XRAY_PASSIVE_VISION=0; vis_pts=15
+            vis_desc="no vision flow on REALITY+TCP — TLS-in-TLS exposure"
+          else
+            # VLESS Encryption on raw TCP, no vision: no outer TLS, so the classic
+            # TLS-in-TLS length signature doesn't apply — vision would still add
+            # inner-handshake padding. Advisory, not scored.
+            XRAY_PASSIVE_VISION=2
+            vis_desc="VLESS Encryption on raw TCP, no vision — inner-handshake padding available (not scored)"
+          fi ;;
         *)
-          # Non-raw transport (gRPC/ws/xhttp) CAN'T use vision — that's a
-          # censor-dependent TRADEOFF, not a misconfig, so it's NOT scored (the
-          # fp=qq lesson). HTTP/2-framed transports are often LESS targeted than
-          # raw+vision against current censors; no consensus, time-dependent
-          # (XTLS #2593). State 2 → JSON tls_in_tls_protected:null (neither).
+          # Non-raw transport. Without VLESS Encryption, REALITY can't use vision —
+          # a censor-dependent TRADEOFF, not scored (the fp=qq lesson; XTLS #2593).
+          # WITH VLESS Encryption, vision IS available here (encryption lifts the
+          # raw-TCP limit) but isn't enabled — still not scored (no outer-TLS
+          # TLS-in-TLS to erase). State 2 → JSON tls_in_tls_protected:null.
           XRAY_PASSIVE_VISION=2
-          vis_desc="REALITY over ${v_net} — vision N/A on a non-raw transport (tradeoff, not scored)" ;;
+          if [ "$v_encmode" = "1" ]; then
+            vis_desc="VLESS Encryption over ${v_net}, no vision — vision is available (encryption lifts the raw-TCP limit), not scored"
+          else
+            vis_desc="REALITY over ${v_net} — vision N/A on a non-raw transport (tradeoff, not scored)"
+          fi ;;
       esac
       ;;
     esac
@@ -5866,6 +5955,8 @@ probe_xray_detectability() {
   if [ "${XRAY_PASSIVE_VISION:-}" = "0" ]; then
     warn "TLS-in-TLS exposure: VLESS-Reality without xtls-rprx-vision — advanced censors (e.g. the GFW) detect this passively"
     add_verdict "VLESS-Reality without flow=\"xtls-rprx-vision\" → TLS-in-TLS exposure: when an HTTPS site is proxied, the inner TLS records carry a length/timing signature visible inside the outer Reality TLS, which advanced censors detect passively (REALITY with a non-XTLS flow is officially discouraged for this reason). Set the user 'flow' to \"xtls-rprx-vision\" on BOTH client and server (it requires raw TCP transport, network=tcp/raw). If you must use a CDN-frontable transport (ws/grpc/xhttp) where vision can't apply, prefer XHTTP with padding to blunt the traffic-shape signature$( [ "${XRAY_TRANSPORT_MUX:-}" = "1" ] && printf '%s' '; and disable mux.cool — with vision it is unnecessary and adds a correlation surface' )"
+  elif [ "${XRAY_PASSIVE_VISION:-}" = "2" ] && [ "${v_encmode:-}" = "1" ]; then
+    info "VLESS Encryption lifts vision's raw-TCP restriction, so vision CAN run on ${v_net} here — it isn't enabled, but with VLESS Encryption there's no outer-TLS TLS-in-TLS signature to erase; vision would add inner-handshake random padding. Not scored."
   elif [ "${XRAY_PASSIVE_VISION:-}" = "2" ]; then
     info "REALITY over ${v_net}: vision (anti-TLS-in-TLS) only works on raw TCP, so it's N/A here — a tradeoff, not a flaw. An HTTP-framed transport (gRPC/XHTTP) is often LESS targeted than raw+vision against current censors, though it's censor- and time-dependent (no consensus; XTLS #2593). For raw TCP, vision stays the recommended anti-TLS-in-TLS choice; on gRPC/XHTTP, padding is the lever instead. Not scored."
   elif [ "${XRAY_PASSIVE_VISION:-}" = "1" ] && [ "${XRAY_TRANSPORT_MUX:-}" = "1" ]; then
@@ -6099,6 +6190,9 @@ _emit_json() {
     --arg xl_status         "$XRAY_LINT_STATUS" \
     --arg xl_findings       "$XRAY_LINT_FINDINGS" \
     --arg xl_fet            "$XRAY_FET_EXPOSED" \
+    --arg xl_venc           "$XRAY_VLESS_ENC" \
+    --arg xl_vencpad        "$XRAY_VLESS_ENC_PADDING" \
+    --arg xl_vflowdep       "$XRAY_VLESS_FLOW_DEPRECATED" \
     --arg xl_iduuid         "$XRAY_ID_UUID" \
     --arg xck_status        "$XRAY_CLOCK_STATUS" \
     --arg xck_skew          "$XRAY_CLOCK_SKEW_S" \
@@ -6364,6 +6458,9 @@ _emit_json() {
         xray_lint: {
           status: opt($xl_status),
           fet_exposed: tri_bool(($xl_fet | tonumber? // -1)),
+          vless_encryption: (if $xl_venc == "" then null else $xl_venc end),
+          vless_encryption_padding: tri_bool(($xl_vencpad | tonumber? // -1)),
+          vless_flow_deprecated: tri_bool(($xl_vflowdep | tonumber? // -1)),
           id_uuid: tri_bool(($xl_iduuid | tonumber? // -1)),
           findings: (if $xl_findings == "" then [] else ($xl_findings | split("\n") | map(select(length > 0))) end)
         },

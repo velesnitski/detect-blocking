@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.42.0] - 2026-07-03
+
+### Added
+- **VLESS Encryption awareness (Xray 2025+ post-quantum layer).** Xray added a native VLESS Encryption layer — `encryption: "mlkem768x25519plus.<method>.<session>[+padding][+delay]"` (ML-KEM-768 + X25519). The tool now recognizes it and reads the **method**: `native`/`xorpub` (structured) vs `random` (full-random, VMess/SS-like). Probe 18 reports the method + whether traffic padding is configured (padding blunts packet-length/timing analysis). New pure classifier `_vless_enc_method` (unit-tested). JSON: `.probes.xray_lint.vless_encryption` + `vless_encryption_padding`.
+- **VLESS-without-flow deprecation lint (probe 18).** Xray-core is migrating VLESS-without-flow → VLESS-with-flow (XTLS/Xray-core #5568). Flow-less VLESS now warns with the migration path. JSON: `.probes.xray_lint.vless_flow_deprecated`.
+
+### Changed
+- **FET check is now VLESS-Encryption-method-aware (correctness).** The GFW fully-encrypted-traffic check (probe 18) no longer assumes `encryption=none`: on raw TCP with no TLS, `random` is still exposed (kept), while `native`/`xorpub` reshape the wire so a block is **not asserted** (method-dependent — report, don't over-claim).
+- **Vision now recognized on non-raw transports when VLESS Encryption is present (correctness).** VLESS Encryption lifts XTLS Vision's raw-TCP restriction ("no transport restrictions"), so the frontier `VLESSENC + XHTTP + xtls-rprx-vision` config is read as vision-protected in probe 26 — not the old "vision N/A on a non-raw transport (tradeoff)". The probe-18 `flow=… requires raw TCP → handshake will fail` lint is likewise suppressed when VLESS Encryption is configured.
+
+### Fixed
+- **False-positive lint removed.** Probe 18 used to emit `vless requires encryption=none, got encryption=<x>` — wrong for a modern `encryption=mlkem768x25519plus.*` (valid VLESS Encryption). Now recognized as valid; only a genuinely unrecognized string is flagged as a likely typo.
+
 ## [0.41.0] - 2026-07-03
 
 ### Added

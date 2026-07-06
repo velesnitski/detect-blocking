@@ -851,14 +851,23 @@ states, `kill_at_bytes`, RTT range).
 **Probe 18 — config pre-flight lint** is static and instant, and catches the
 misconfigs that otherwise masquerade as DPI: `flow=xtls-rprx-vision` without
 `network=tcp`, a non-hex or over-long `shortId`, a bare-IP `serverName`, a
-missing `publicKey`, vless `encryption≠none`, no uTLS fingerprint. It also flags
-`allowInsecure=true` (a.k.a. `"insecure": true`) — the client accepts any cert,
-which masks a cover cert that won't validate for the SNI (a strong active-probe
-tell) and is MITM-able; because the check is static it fires **even against an
-unreachable node**. Each finding names the protocol knob, never the secret
-value. This is the cheapest, highest-leverage probe — half the "is it DPI?"
-scares this tool was built to diagnose turn out to be a typo (its findings also
-surface in the consolidated verdict block).
+missing `publicKey`, no uTLS fingerprint. It also flags `allowInsecure=true`
+(a.k.a. `"insecure": true`) — the client accepts any cert, which masks a cover
+cert that won't validate for the SNI (a strong active-probe tell) and is
+MITM-able; because the check is static it fires **even against an unreachable
+node**. Each finding names the protocol knob, never the secret value. This is
+the cheapest, highest-leverage probe — half the "is it DPI?" scares this tool
+was built to diagnose turn out to be a typo (its findings also surface in the
+consolidated verdict block).
+
+It's also **VLESS-Encryption-aware** (Xray 2025+): the native post-quantum layer
+`encryption: "mlkem768x25519plus.<native|xorpub|random>.<session>[+padding]"` is
+recognized (not mistaken for an error), the method is reported, and it feeds two
+downstream checks — the FET check treats `random` as still-exposed but does not
+assert a block for `native`/`xorpub`, and probe 26 recognizes that VLESS
+Encryption lifts XTLS Vision's raw-TCP restriction (so vision on XHTTP/gRPC *is*
+protected, not a tradeoff). Flow-less VLESS gets a **deprecation** notice —
+Xray-core is migrating VLESS-without-flow → VLESS-with-flow ([#5568](https://github.com/XTLS/Xray-core/discussions/5568)).
 
 **Probe 19 — clock skew** checks a failure mode nobody thinks to: Reality
 authentication is time-windowed, so a client clock off by minutes makes the

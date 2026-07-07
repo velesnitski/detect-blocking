@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-07-07
+
+### Added
+- **`--panel-probe [IP]` — audit an origin IP for an exposed x-ui/3x-ui panel.** Host-exposure only `nc`-scans the resolved IP, which on a CDN-fronted config is the CDN edge — so it can't see the origin's panel. `--panel-probe` actively fetches the known panel ports+paths (54321, 2053/`/panel/`, 8080/`/panel/`/`/dashboard/`, 8081, 9000, 2083/2087/8443) on a **backend you name** and classifies each: **x-ui/3x-ui login** (brand marker / login form) vs **CDN edge** (server=cloudflare/akamai/…) vs plain **web** vs **closed**. GETs only, share-safe. Pure `_panel_classify` (unit-tested). JSON: `.probes.panel_probe.{status,panel_found}`.
+
+### Changed
+- **Host-exposure no longer false-positives on CDN-fronted configs.** When the resolved IP is a CDN edge (Cloudflare/Akamai/Fastly/…), the "proxy-panel port exposed" finding is **downgraded**: a CDN serves many alt-ports by design (Cloudflare: 8080/2053/2087/8443), so those aren't the origin's panel. The scary takeover verdict is suppressed and replaced with a pointer to `--panel-probe <origin-ip>` to audit the real backend. `_is_cdn_ip` reuses the probe-26 org-keyword detection. JSON: `.probes.host_exposure.cdn_edge`.
+
 ## [1.2.1] - 2026-07-07
 
 ### Fixed

@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="1.2.1"
+readonly DETECT_BLOCKING_VERSION="1.3.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -164,6 +164,8 @@ while [ $# -gt 0 ]; do
     --xray-only)   ONLY_PROBES="xray,xrayjson"; XRAY_ONLY=1; shift ;;
     --scan-covers) case "${2:-}" in ""|-*) XRAY_SCAN_COVERS=default; shift ;; *) XRAY_SCAN_COVERS="$2"; shift 2 ;; esac ;;
     --scan-covers=*) XRAY_SCAN_COVERS="${1#--scan-covers=}"; shift ;;
+    --panel-probe) case "${2:-}" in ""|-*) PANEL_PROBE=1; shift ;; *) PANEL_PROBE="$2"; shift 2 ;; esac ;;
+    --panel-probe=*) PANEL_PROBE="${1#--panel-probe=}"; shift ;;
     --censor-sweep) case "${2:-}" in ""|-*) XRAY_CENSOR_SWEEP=default; shift ;; *) XRAY_CENSOR_SWEEP="$2"; shift 2 ;; esac ;;
     --censor-sweep=*) XRAY_CENSOR_SWEEP="${1#--censor-sweep=}"; shift ;;
     --conn-test) case "${2:-}" in ""|-*|*[!0-9]*) CONN_TEST_N=16; shift ;; *) CONN_TEST_N="$2"; shift 2 ;; esac ;;
@@ -240,6 +242,9 @@ while [ $# -gt 0 ]; do
       printf '  --xray-only         only the Xray-protocol probes (11-26 + routing/egress); skips transport probes 0-10 (alias for --only xray,xrayjson; needs --xray-config / --xray-config-json)\n'
       printf '  --scan-covers[=LIST] rank candidate Reality dest/serverName covers (TLSv1.3 + H2 + CA-valid + non-redirect); LIST is comma-separated, or omit for a built-in set\n'
       printf '  --censor-sweep[=LIST] reachability of commonly-censored hosts, direct vs through the tunnel (does the tunnel unblock them?); LIST is comma-separated, or omit for a built-in set\n'
+      printf '  --panel-probe [IP]  audit an ORIGIN IP for an exposed x-ui/3x-ui admin panel (checks the known\n'
+      printf '                      panel ports+paths, classifies each login/CDN/web/closed). Point it at the\n'
+      printf '                      backend behind the CDN — the fronted domain only reaches the CDN edge\n'
       printf '  --conn-test [N]     open N (default 16) simultaneous TLS handshakes to the server and report how\n'
       printf '                      many complete — does it cap / rate-limit / degrade under concurrency (server\n'
       printf '                      robustness; pair with --sub-test N to deep-test one fleet node). Direct probe.\n'
@@ -903,6 +908,7 @@ XRAY_EGRESS_DNS_COUNTRY=""  # country of the DNS resolver seen through the tunne
 # counterpart to "your cover is self-owned/obscure". Opt-in (it probes the
 # candidates directly). Default list = neutral, globally-popular CDN/cloud sites.
 XRAY_SCAN_COVERS="${XRAY_SCAN_COVERS:-}"   # "" off; "default"/"1" built-in list; or a comma-separated list
+PANEL_PROBE="${PANEL_PROBE:-}"             # --panel-probe [IP]: audit an origin IP for an exposed x-ui/3x-ui panel
 XRAY_COVER_CANDIDATES="${XRAY_COVER_CANDIDATES:-www.microsoft.com www.apple.com dl.google.com www.amazon.com www.cloudflare.com www.bing.com}"
 XRAY_COVER_SCAN_STATUS=""   # ok / skipped
 XRAY_COVER_SCAN_BEST=""     # best-ranked candidate domain
@@ -1061,6 +1067,9 @@ XRAY_TLSPAR_COVER_FP=""     # same, for the genuine cover (compare → does the 
 # ---- host exposure (whole-host disguise: does the server look like only a web host?) ----
 XRAY_HOSTEXP_STATUS=""      # ok / skipped
 XRAY_HOSTEXP_OPEN=""        # giveaway ports found open beyond 443 (e.g. "22(SSH), 54321(x-ui-panel)")
+XRAY_HOSTEXP_CDN=""         # 1 / 0 / "" — the resolved IP is a CDN edge (panel ports are the CDN's, not the origin)
+PANEL_STATUS=""             # --panel-probe: ok / skipped
+PANEL_FOUND=""              # 1 / 0 / "" — an x-ui/3x-ui panel was found exposed on the target
 # ---- Hysteria2 static analysis (QUIC/UDP — set by probe_hysteria) ----
 HYSTERIA_STATUS=""          # ok / skipped
 HYSTERIA_SNI_KEYWORD=""     # 1/0 — effective TLS SNI carries a protocol/circumvention keyword
@@ -3295,6 +3304,38 @@ ${h}|${dirok}|na|${verdict}"
   fi
 }
 
+# Is <ip> a CDN edge? Reuses the probe-26 org-keyword approach (HTTPS-first, ip-api
+# fallback). A CDN edge is shared and answers many ports BY DESIGN, so "panel ports
+# open" there is the CDN's own alt-ports, not the origin's panel. Returns 0 = CDN.
+_is_cdn_ip() {
+  local ip="$1" info
+  [ -n "$ip" ] && check_cmd curl || return 1
+  info=$(curl -sS --max-time "$TIMEOUT" "https://ipinfo.io/${ip}/json" 2>/dev/null)
+  [ -z "$info" ] && info=$(curl -sS --max-time "$TIMEOUT" "http://ip-api.com/json/${ip}?fields=org,as,isp" 2>/dev/null)
+  printf '%s' "$info" | tr '[:upper:]' '[:lower:]' \
+    | grep -qE 'cloudflare|akamai|fastly|cloudfront|edgecast|edgio|g.?core|bunny|stackpath|cdn77|incapsula|sucuri|netlify|vercel|fbcdn|limelight|lumen' \
+    && return 0
+  return 1
+}
+
+# Classify a panel-port response (pure, unit-testable). Args: httpcode server-header
+# body-snippet(lowercased). Echoes: closed | cdn | panel | login | web.
+#   panel = x-ui/3x-ui brand marker in the body (an exposed panel)
+#   login = a login form on a panel port (panel-likely, no brand string)
+#   cdn   = a CDN edge answered (not the origin)
+_panel_classify() {
+  local code="${1:-000}" srv="${2:-}" body="${3:-}"
+  case "$code" in 000|""|connection*|couldnt*) echo closed; return ;; esac
+  case "$(printf '%s' "$srv" | tr '[:upper:]' '[:lower:]')" in
+    *cloudflare*|*akamai*|*fastly*|*cloudfront*|*varnish*|*"amazons3"*) echo cdn; return ;;
+  esac
+  case "$body" in
+    *x-ui*|*xui*|*"xray panel"*) echo panel; return ;;
+  esac
+  case "$body" in *'type="password"'*|*'type=password'*|*"name=\"password\""*) echo login; return ;; esac
+  echo web
+}
+
 # Host exposure (whole-host disguise) — does the server answer anything beyond
 # :443? A real CDN edge (the cover it impersonates) answers ONLY 443. An open
 # proxy PANEL (x-ui/3x-ui) is both a takeover risk and a loud tell to any scanner
@@ -3324,10 +3365,70 @@ probe_host_exposure() {
   fi
   info "open beyond 443: ${open}"
   if [ "$panel" = "1" ]; then
-    warn "server exposes a likely proxy-PANEL port to the internet — a takeover risk AND a strong tell (a host impersonating a CDN cover should answer only 443; a scanner profiling the IP sees a proxy panel instead)"
-    add_verdict "Server exposes a proxy-panel port (e.g. x-ui/3x-ui) to the internet — a takeover risk and a detectability tell: a host that impersonates a CDN cover should expose only 443. Bind the panel to localhost (reach it over an SSH tunnel) or firewall it to an admin allowlist"
+    # A CDN edge shares one IP and serves many alt-ports BY DESIGN (Cloudflare:
+    # 8080/2053/2087/8443…), so "panel port open" here is the CDN's, not the
+    # origin's — the classic false positive on a CDN-fronted config. Downgrade it
+    # and point at --panel-probe against the real backend IP.
+    if _is_cdn_ip "$ip"; then
+      XRAY_HOSTEXP_CDN=1
+      info "…but the resolved IP is a CDN edge — those are the CDN's own alt-ports (e.g. Cloudflare serves 8080/2053/2087/8443), NOT an exposed x-ui/3x-ui panel. Origin panel exposure can't be seen through the CDN; audit the backend directly with: --panel-probe <origin-ip>"
+    else
+      XRAY_HOSTEXP_CDN=0
+      warn "server exposes a likely proxy-PANEL port to the internet — a takeover risk AND a strong tell (a host impersonating a CDN cover should answer only 443; a scanner profiling the IP sees a proxy panel instead)"
+      add_verdict "Server exposes a proxy-panel port (e.g. x-ui/3x-ui) to the internet — a takeover risk and a detectability tell: a host that impersonates a CDN cover should expose only 443. Bind the panel to localhost (reach it over an SSH tunnel) or firewall it to an admin allowlist. Confirm which ports serve a real panel with: --panel-probe ${ip}"
+    fi
   fi
   [ "$admin" = "1" ] && info "SSH/RDP reachable — normal for admin, but a real CDN edge doesn't answer it; restricting management to a jump host / firewall allowlist sharpens the host's web-only profile"
+}
+
+# --panel-probe [IP]: audit an ORIGIN IP for an exposed x-ui/3x-ui admin panel.
+# Host-exposure only nc-scans the resolved IP (= the CDN edge on a fronted config);
+# this actively fetches the known panel ports/paths on a backend you name and
+# classifies each (x-ui/3x-ui login vs a CDN edge vs a plain web server vs closed),
+# so it's a repeatable fleet audit. GETs only (share-safe: booleans/codes only).
+probe_panel() {
+  [ -n "${PANEL_PROBE:-}" ] || { PANEL_STATUS="skipped"; return 0; }
+  check_cmd curl || { warn "--panel-probe needs curl"; PANEL_STATUS="skipped"; return 0; }
+  local tgt
+  case "$PANEL_PROBE" in 1|default|"") tgt="${RESOLVED_IP:-$VPN_HOST}" ;; *) tgt="$PANEL_PROBE" ;; esac
+  { [ -n "$tgt" ] && [ "$tgt" != "www.example.com" ]; } || { warn "--panel-probe: no target (pass --panel-probe <origin-ip>)"; PANEL_STATUS="skipped"; return 0; }
+
+  hdr "Panel probe (x-ui / 3x-ui exposure) — target ${tgt}"
+  if _is_cdn_ip "$tgt"; then
+    warn "${tgt} is a CDN edge, not an origin — panel ports here are the CDN's own (e.g. Cloudflare 8080/2053/2087/8443). Point --panel-probe at the BACKEND/origin IP behind the CDN to audit the real panel"
+  fi
+
+  # port:scheme:path — the default x-ui/3x-ui/marzban surfaces + CF-style panel ports.
+  local checks="54321:http:/ 2053:https:/ 2053:https:/panel/ 8080:http:/ 8080:http:/panel/ 8080:http:/dashboard/ 8081:http:/ 9000:http:/ 2083:https:/panel/ 2087:https:/panel/ 8443:https:/panel/"
+  local any=0 found=0 spec port rest scheme path url code srv body verdict tmp
+  tmp=$(mktemp 2>/dev/null) || tmp="/tmp/_panel.$$"
+  for spec in $checks; do
+    port=${spec%%:*}; rest=${spec#*:}; scheme=${rest%%:*}; path=${rest#*:}
+    if [[ "$OSTYPE" == darwin* ]]; then nc -z -G 2 "$tgt" "$port" 2>/dev/null || continue
+    else nc -z -w 2 "$tgt" "$port" 2>/dev/null || continue; fi
+    any=1
+    url="${scheme}://${tgt}:${port}${path}"
+    code=$(curl -sS -k --max-time "$TIMEOUT" -o "$tmp" -w '%{http_code}|%header{server}' "$url" 2>/dev/null)
+    srv=${code#*|}; code=${code%%|*}
+    body=$(head -c 4000 "$tmp" 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d '\000')
+    verdict=$(_panel_classify "$code" "$srv" "$body")
+    case "$verdict" in
+      panel) fail  "  ${url} → x-ui/3x-ui PANEL (HTTP ${code}) — EXPOSED"; found=1 ;;
+      login) warn  "  ${url} → login form (HTTP ${code}) — likely a panel"; found=1 ;;
+      cdn)   info  "  ${url} → CDN edge (HTTP ${code}, server=${srv}) — not your origin" ;;
+      web)   info  "  ${url} → responds (HTTP ${code}), no panel markers" ;;
+      closed) info "  ${url} → open TCP but no HTTP response" ;;
+    esac
+  done
+  rm -f "$tmp" 2>/dev/null
+  PANEL_STATUS="ok"; PANEL_FOUND="$found"
+  if [ "$any" = "0" ]; then
+    ok "no panel ports open on ${tgt} — clean (nothing beyond the tested surface answers)"
+  elif [ "$found" = "1" ]; then
+    add_verdict "Panel probe: an x-ui/3x-ui admin panel is reachable on ${tgt} (see the panel/login rows) — a takeover risk (auth-bypass/RCE CVEs, default creds) AND a scanner tell. Bind it to 127.0.0.1 (reach it over an SSH tunnel), firewall the port to an admin allowlist, set a non-default webBasePath, and rotate off default credentials"
+  else
+    ok "no exposed x-ui/3x-ui panel found on ${tgt} at the default ports/paths — a hardened panel (custom webBasePath / localhost-bound) wouldn't show here, so confirm server-side too"
+  fi
 }
 
 # Pure helper (unit-testable): classify a concurrency burst. succeeded/total +
@@ -6399,6 +6500,9 @@ _emit_json() {
     --arg xtp_cfp           "$XRAY_TLSPAR_COVER_FP" \
     --arg hx_status         "$XRAY_HOSTEXP_STATUS" \
     --arg hx_open           "$XRAY_HOSTEXP_OPEN" \
+    --arg hx_cdn            "$XRAY_HOSTEXP_CDN" \
+    --arg pp_status         "$PANEL_STATUS" \
+    --arg pp_found          "$PANEL_FOUND" \
     --arg cl_status         "$CONN_LIMIT_STATUS" \
     --arg cl_req            "$CONN_LIMIT_REQUESTED" \
     --arg cl_succ           "$CONN_LIMIT_SUCC" \
@@ -6695,7 +6799,12 @@ _emit_json() {
         },
         host_exposure: {
           status: opt($hx_status),
-          open_ports: (if $hx_open == "" then [] else ($hx_open | split(", ") | map(select(length > 0))) end)
+          open_ports: (if $hx_open == "" then [] else ($hx_open | split(", ") | map(select(length > 0))) end),
+          cdn_edge: tri_bool(($hx_cdn | tonumber? // -1))
+        },
+        panel_probe: {
+          status: opt($pp_status),
+          panel_found: tri_bool(($pp_found | tonumber? // -1))
         },
         conn_limit: {
           status: opt($cl_status),
@@ -6972,6 +7081,8 @@ _start_stub_dialer
 { _should_run xray || _should_run xrayjson; } && probe_host_exposure
 # Connection-limit probe: opt-in (--conn-test), direct (runs under --no-tunnel too).
 [ -n "${CONN_TEST_N:-}" ] && probe_conn_limit
+# Panel probe: opt-in (--panel-probe [IP]), direct — audits an origin for x-ui/3x-ui.
+[ -n "${PANEL_PROBE:-}" ] && probe_panel
 [ -z "${NO_TUNNEL:-}" ] && _should_run xrayjson && probe_xray_egress
 # YouTube fan-out probe: opt-in, needs the tunnel (probe 12) up.
 [ -n "${YT_TEST_N:-}" ] && [ -z "${NO_TUNNEL:-}" ] && _should_run xrayjson && probe_yt_reach

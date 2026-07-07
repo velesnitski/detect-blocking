@@ -75,4 +75,19 @@ outr=$(TIMEOUT=2 bash "$SCRIPT" --xray-config-json "$TMP/local.json" --xray-only
 printf '%s' "$outr" | grep -q 'LOCAL dialerProxy' \
   || fail "a tunnel failure with a local dialerProxy should name the chain as a likely cause"
 
-echo "PASS: dialerProxy chain recognized (local desync vs remote vs broken vs none), JSON flags, tunnel-failure caveat"
+# ---- fleet detection must EXCLUDE dialerProxy helpers (they aren't endpoints) ----
+eval "$(awk '/^_fleet_tags\(\)/,/^}/' "$SCRIPT")"
+# proxy dials through byedpi-out → the fleet is just [proxy], NOT [proxy, byedpi-out].
+[ "$(_fleet_tags "$TMP/local.json" | tr '\n' ' ')" = "proxy " ] \
+  || fail "_fleet_tags should exclude the dialerProxy helper (got: $(_fleet_tags "$TMP/local.json" | tr '\n' ' '))"
+# a genuine 2-endpoint fleet (no dialer) keeps both.
+cat > "$TMP/twofleet.json" <<EOF
+{ "outbounds": [
+  {"tag":"a","protocol":"vless","settings":{"vnext":[{"address":"192.0.2.1","port":443,"users":[{"id":"$u"}]}]}},
+  {"tag":"b","protocol":"vless","settings":{"vnext":[{"address":"192.0.2.2","port":443,"users":[{"id":"$u"}]}]}},
+  {"tag":"direct","protocol":"freedom"} ] }
+EOF
+[ "$(_fleet_tags "$TMP/twofleet.json" | tr '\n' ' ')" = "a b " ] \
+  || fail "_fleet_tags should keep both endpoints of a real 2-node fleet (got: $(_fleet_tags "$TMP/twofleet.json" | tr '\n' ' '))"
+
+echo "PASS: dialerProxy chain recognized (local/remote/broken/none), JSON flags, tunnel-failure caveat, fleet excludes the dialer helper"

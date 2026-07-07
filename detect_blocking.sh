@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="1.3.0"
+readonly DETECT_BLOCKING_VERSION="1.3.1"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -567,12 +567,18 @@ if [ -n "${XRAY_JSON_CONFIG:-}" ] && [ -r "$XRAY_JSON_CONFIG" ] && command -v jq
     if ! jq -e --arg t "$OUTBOUND_TAG" 'any(.outbounds[]?; .tag == $t and (.settings.vnext != null or .settings.servers != null))' "$XRAY_JSON_CONFIG" >/dev/null 2>&1; then
       die "--outbound '$OUTBOUND_TAG' is not a proxy outbound in this config. Proxy outbounds: ${_proxy_tags:-<none>}"
     fi
-    [ "${_chained:-0}" = "1" ] && printf '%s\n' "note: this config chains outbounds (dialerProxy) — testing '${OUTBOUND_TAG}' standalone may not reflect the chain; omit --outbound to test the full chain via probe 12" >&2
+    [ "${_chained:-0}" = "1" ] && printf '%s\n' "note: '${OUTBOUND_TAG}' chains outbounds (dialerProxy) — its dialer chain is kept in the narrowed config so the standalone test reflects it (a local dialer must be running, or pass --stub-dialer)" >&2
     XRAY_OUTBOUND_PATH=$(mktemp -t detect_blocking.obsel.XXXXXX) \
       || die "could not create a temp file for --outbound"
     chmod 600 "$XRAY_OUTBOUND_PATH" 2>/dev/null || true
     if jq --arg t "$OUTBOUND_TAG" '
-          .outbounds = ([ .outbounds[] | select(.tag == $t) ] + [ {protocol:"freedom", tag:"direct"} ])
+          .outbounds as $all
+          | (reduce range(0;6) as $_ ([$t]; . as $have
+               | ($have + [ $all[] | select(.tag as $x | ($have | index($x)))
+                            | (.streamSettings.sockopt.dialerProxy // empty), (.proxySettings.tag // empty) ] | unique))) as $keep
+          | .outbounds = ([ $all[] | select(.tag == $t) ]
+              + [ $all[] | select((.tag != $t) and (.tag as $x | ($keep | index($x)))) ]
+              + [ {protocol:"freedom", tag:"direct"} ])
           | del(.routing) | del(.balancers)
         ' "$XRAY_JSON_CONFIG" > "$XRAY_OUTBOUND_PATH" 2>/dev/null && [ -s "$XRAY_OUTBOUND_PATH" ]; then
       XRAY_JSON_CONFIG="$XRAY_OUTBOUND_PATH"
@@ -4978,7 +4984,13 @@ _fleet_test_one() {
   if ! mv "$base" "$patched" 2>/dev/null; then rm -f "$base"; printf 'fail'; return 0; fi
   if ! jq --arg t "$tag" --argjson p "$socks_port" '
         .inbounds = [{ tag:"socks", listen:"127.0.0.1", port:$p, protocol:"socks", settings:{auth:"noauth", udp:true} }]
-        | .outbounds = ([ .outbounds[] | select(.tag == $t) ] + [ {protocol:"freedom", tag:"direct"} ])
+        | .outbounds as $all
+        | (reduce range(0;6) as $_ ([$t]; . as $have
+             | ($have + [ $all[] | select(.tag as $x | ($have | index($x)))
+                          | (.streamSettings.sockopt.dialerProxy // empty), (.proxySettings.tag // empty) ] | unique))) as $keep
+        | .outbounds = ([ $all[] | select(.tag == $t) ]
+            + [ $all[] | select((.tag != $t) and (.tag as $x | ($keep | index($x)))) ]
+            + [ {protocol:"freedom", tag:"direct"} ])
         | del(.routing) | del(.observatory)
       ' "$cfg_src" > "$patched" 2>/dev/null; then
     rm -f "$patched"; printf 'fail'; return 0
@@ -5014,6 +5026,20 @@ _fleet_test_one() {
 # Probe 21 — per-outbound fleet health matrix (opt-in --fleet). For a
 # multi-outbound JSON config, tunnel-test each proxy outbound and print a
 # health table keyed by the operator-defined tag (never address/port).
+# Endpoint tags for the fleet matrix: proxy outbounds (vnext/servers) EXCLUDING
+# dialerProxy / proxySettings HELPERS (e.g. a local ByeDPI socks) — those are chain
+# plumbing, not fleet endpoints. Counting them inflates the fleet AND mislabels the
+# real endpoint as "down" (isolating it drops the dangling dialer). $1 = json path.
+_fleet_tags() {
+  jq -r '
+    (.outbounds // []) as $o
+    | [ $o[] | (.streamSettings.sockopt.dialerProxy // empty), (.proxySettings.tag // empty) ] as $helpers
+    | $o
+    | map(select((.settings.vnext != null or .settings.servers != null)
+                 and ((.tag // "") as $t | ($helpers | index($t)) | not)))
+    | .[].tag // empty' "$1" 2>/dev/null
+}
+
 probe_xray_fleet() {
   if [ "$XRAY_FLEET" = "0" ]; then
     XRAY_FLEET_STATUS="disabled"
@@ -5031,7 +5057,7 @@ probe_xray_fleet() {
   fi
 
   local tags count
-  tags=$(jq -r '.outbounds // [] | map(select(.settings.vnext != null or .settings.servers != null)) | .[].tag // empty' "$XRAY_JSON_CONFIG" 2>/dev/null)
+  tags=$(_fleet_tags "$XRAY_JSON_CONFIG")
   count=$(printf '%s\n' "$tags" | grep -c .)
   if [ -z "$tags" ] || [ "$count" -le 1 ]; then
     # Single-outbound (or none) — not a fleet; nothing to do, stay quiet.

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-07-07
+
+### Fixed
+- **Fleet matrix (probe 21) mislabeled a dialerProxy config.** It counted a `dialerProxy`/`proxySettings` **helper** (e.g. a local ByeDPI socks) as a fleet endpoint, and reported the real proxy as "down" — because isolating it via `--outbound` dropped the dangling dialer — producing a false *"1 of N outbounds pass"* that contradicted probe 12 (which proved the tunnel works). Two-part fix, extended from v1.1.0's dialerProxy awareness to probe 21:
+  - **Fleet detection excludes dialerProxy helpers** (`_fleet_tags`, unit-tested) — they're chain plumbing, not endpoints. A single real endpoint + a dialer helper is now correctly *not* a fleet (the matrix stays quiet; probe 12 already tested it).
+  - **`--outbound` isolation now keeps the dialer chain** (transitively) — narrowing to a chained outbound includes its `dialerProxy`/`proxySettings` targets, so the standalone test reflects the real chain instead of failing on a dangling reference. No-op for non-chained configs (byte-identical extraction).
+
 ## [1.3.0] - 2026-07-07
 
 ### Added

@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="1.2.0"
+readonly DETECT_BLOCKING_VERSION="1.2.1"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -7068,6 +7068,7 @@ else
   for v in "${VERDICTS[@]}"; do
     case "$v" in
       *"Detectability "*|*"Passive Reality/Xray fingerprint"*) rec="stealth/fingerprint finding, not a live block — make the server blend in: serve the cover SNI on 443, point Reality 'dest'/'serverNames' at a real CA-valid cover, and choose a cover hosted on the server's own network (or a large shared CDN). The structural fix for the SNI↔IP mismatch and entry/egress co-location tells is CDN-fronting: put the entry behind a CDN (e.g. Cloudflare) so the cover SNI resolves to the CDN's own IPs and the connection terminates on the CDN — eliminating both tells at the source. (Or a 'self-steal' REALITY setup: the server fronts its OWN real site via realitySettings.target + its own serverNames, so the cover resolves to the server itself — no mismatch.) Run with --scan-covers to rank candidate cover domains (TLSv1.3 + H2 + CA-valid + non-redirect)." ;;
+      *"Encrypted-ClientHello (ECH)"*) rec="enable ECH (Encrypted ClientHello) in the client — the front already publishes an ECH config, so this hides the cover SNI outright; a chained client-side desync (dialerProxy) also fragments the ClientHello, but ECH is unconditional. This config is ALREADY CDN-fronted, so 'switch to Reality' would be a different architecture, not an upgrade" ;;
       *"SNI"*)                    rec="try Reality / domain fronting / ECH-enabled client" ;;
       *"System DNS failure"*)     rec="use DoH inside the VPN client and check router/provider DNS" ;;
       *"DNS sinkhole"*)           rec="use DoH inside the VPN client, not system resolver" ;;
@@ -7117,7 +7118,7 @@ else
       *"rejected (reset / closed pipe)"*) rec="protocol-fingerprint DPI or config drift — verify UUID / keys / flow / target SNI" ;;
       *"Reality cover is fake"*)  rec="server-side fix: point Reality 'dest' at the real cover host:443 and add it to 'serverNames' so unauthenticated probes get relayed to a genuine CA-valid cert (run --scan-covers to rank candidate covers). (For a non-REALITY VLESS+TLS inbound, the equivalent active-probe defense is a 'fallbacks' array routing unauthenticated clients to a real local web server.)" ;;
       *"Reality cover/serverName mismatch"*) rec="align the client 'serverName' with the server's Reality dest / serverNames" ;;
-      *"Egress IP is on datacenter/proxy"*) rec="for streaming / payment / banking, route those flows through a residential or clean-IP egress; for censorship circumvention the current egress is fine" ;;
+      *"Egress is on datacenter/proxy"*) rec="for streaming / payment / banking, route those flows through a residential or clean-IP egress; for censorship circumvention the current egress is fine" ;;
       *"delayed RST"*|*"kill-shaping"*) rec="rotate endpoint / cover SNI, shorten session reuse, or add traffic padding — the handshake is fine, the proven flow is being dropped" ;;
       *"intermittently fails"*)   rec="treat as a flaky path / congested egress, not a hard block; re-test from another vantage" ;;
       *"domainStrategy="*)        rec="set domainStrategy=\"AsIs\" — domain rules match on the sniffed SNI with no local lookup, and 'direct' traffic still resolves locally at the freedom outbound (so you keep the real-user DNS-then-connect pattern); local resolution of PROXIED domains only leaks intent (the censor sees the entry flow, not the proxied destination). If you need geoip routing on domain targets, use a SPLIT-HORIZON 'dns' block: tunneled DoH for foreign/blocked domains (route the resolver's IP to a proxy outbound) + the local resolver for domestic/direct. The canonical China-grade recipe pairs this with routing geosite:cn/geoip:cn → direct and 'fakedns' for the proxied side (no real lookup, no leak, instant routing)" ;;

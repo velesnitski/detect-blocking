@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-07-07
+
+### Fixed
+- **Recommendation engine: two verdict→rec mappings were misfiring.**
+  - The **clean-egress** recommendation never fired — its glob matched `"Egress IP is on datacenter/proxy"` but the verdict had been reworded to `"Egress is on datacenter/proxy…"`. A datacenter-egress finding (streaming/banking will block) produced no one-line rec. Glob realigned to the verdict text.
+  - The probe-27 **ECH / SNI-privacy** advisory fell through to the generic `*"SNI"*` rec (*"try Reality / domain fronting"*), which is wrong for a config that is **already** CDN-fronted. It now maps to an ECH-specific recommendation (enable client ECH; the chained dialerProxy desync also fragments the ClientHello; "switch to Reality" is a different architecture, not an upgrade).
+
 ## [1.2.0] - 2026-07-07
 
 ### Added

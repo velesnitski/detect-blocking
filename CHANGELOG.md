@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-07-07
+
+### Added
+- **dialerProxy / client-side desync chain support (ByeDPI / ciadpi / zapret / GoodbyeDPI).** When an outbound's `sockopt.dialerProxy` points at another outbound, the tool recognizes the chain, and when the target is a **local** socks/http proxy it reports it as a client-side desync layer (probe 18): the whole tunnel TCP+TLS is dialed through it, so it fragments/disorders the ClientHello to defeat SNI/TLS DPI. `tcpKeepAliveInterval` is reported (benign); a broken chain (dialerProxy names a non-existent tag) is a lint error. JSON: `.probes.xray_lint.dialer_proxy` + `desync_chain`.
+
+### Changed
+- **Tunnel-failure reading is now chain-aware.** A `dialerProxy → local proxy` config that fails the tunnel test (probe 12 / fleet) no longer misreads as a shared-config fault (`serverName/keys/flow`) — it names the likely cause: the local desync proxy isn't running (start it and re-test). This removes the "0/N outbounds — fleet-wide failure" false alarm on a ByeDPI config.
+- **SNI-privacy is chain-aware (probe 27).** With a desync dialerProxy present, the cleartext-SNI advisory notes the chain typically fragments the ClientHello (the split-ClientHello evasion), partially hiding the SNI — with ECH still called out as the unconditional fix.
+
 ## [1.0.0] - 2026-07-03
 
 First stable release. detect-blocking has been dogfooded against real infrastructure across 40+ iterations with a 51-test suite; the interface is now considered stable and versioned under [Semantic Versioning](https://semver.org).

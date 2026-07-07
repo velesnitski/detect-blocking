@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="1.0.0"
+readonly DETECT_BLOCKING_VERSION="1.1.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -969,6 +969,8 @@ XRAY_FET_EXPOSED=""         # 1 / 0 / "" — fully-encrypted (no TLS/HTTP framin
 XRAY_VLESS_ENC=""           # none | native | xorpub | random | invalid | "" — VLESS Encryption method (mlkem768x25519plus.*, Xray 2025+)
 XRAY_VLESS_ENC_PADDING=""   # 1 / 0 / "" — VLESS Encryption has padding/delay blocks (anti flow-shape analysis)
 XRAY_VLESS_FLOW_DEPRECATED="" # 1 / 0 / "" — VLESS without flow= (deprecated upstream, XTLS/Xray-core #5568)
+XRAY_DIALER_PROXY=""        # the sockopt.dialerProxy tag the proxy dials through (or "")
+XRAY_DESYNC_CHAIN=""        # 1 / 0 / "" — dialerProxy points at a LOCAL socks/http = client-side desync layer (ByeDPI/zapret/GoodbyeDPI)
 XRAY_ID_UUID=""             # 1 / 0 / "" — client id is a canonical UUID (vs a hand-assigned/non-UUID string; share-safe: format only)
 
 # ---- probe 19: clock skew (Reality auth is time-windowed) ----
@@ -2770,6 +2772,13 @@ probe_xray_json() {
     local _curl_diag
     _curl_diag=$(printf '%s\n' "$trace" | grep -iE 'curl:|error|refused|timed out|unreachable' | head -1 | head -c 200)
     [ -n "$_curl_diag" ] && info "curl says: $_curl_diag"
+    # dialerProxy caveat: if the tunnel dials through a LOCAL desync proxy that
+    # isn't running, the failure is the chain, not the endpoint — say so before
+    # the generic "check keys/flow" verdict misdirects.
+    if [ "$(_dialer_is_local_desync)" = "1" ]; then
+      local _dpd; _dpd=$(_dialer_proxy_target | sed 's/^[^|]*|//')
+      warn "this config dials through a LOCAL dialerProxy ($_dpd) — a client-side desync proxy (ByeDPI/ciadpi/zapret). If it isn't running, THIS failure is the chain, not the endpoint: start it and re-test before trusting the verdict below"
+    fi
     if [ "$XRAY_JSON_FAIL_KIND" = "timeout" ]; then
       # Timeout class implies the SOCKS connect succeeded → reachable-but-slow.
       add_verdict "Xray full-config tunnel timed out (even at $(( TIMEOUT * 4 ))s) — slow or throttled tunnel egress, not a fingerprint block. Raise TIMEOUT, or check the server's upstream/egress health"
@@ -4376,6 +4385,37 @@ _vless_enc_method() {            # encryption-string
   esac
 }
 
+# Resolve a sockopt.dialerProxy chain (JSON-only — a share-link can't express it).
+# An outbound whose sockopt.dialerProxy names another outbound is dialed THROUGH
+# it; when that target is a LOCAL socks/http proxy it's a client-side desync layer
+# (ByeDPI / ciadpi / zapret / GoodbyeDPI) that fragments/disorders the ClientHello.
+# Echoes "tag|proto host:port" (host:port of the dialer target), or "" if none;
+# "tag|missing" if the referenced tag doesn't exist. Share-safe: only ever a
+# loopback endpoint or a tag name.
+_dialer_proxy_target() {
+  [ -n "$XRAY_JSON_CONFIG" ] && [ -r "$XRAY_JSON_CONFIG" ] && command -v jq >/dev/null 2>&1 || return 0
+  jq -r '
+    (.outbounds // []) as $o
+    | ([ $o[] | select(.streamSettings.sockopt.dialerProxy != null)
+         | .streamSettings.sockopt.dialerProxy ] | first) as $t
+    | if $t == null then empty
+      else ($o | map(select(.tag == $t)) | first) as $d
+        | $t + "|" + (if $d == null then "missing"
+            else ($d.protocol // "?") + " "
+               + (($d.settings.servers[0].address // $d.settings.vnext[0].address // "?"))
+               + ":" + (($d.settings.servers[0].port // $d.settings.vnext[0].port // 0)|tostring)
+            end)
+      end' "$XRAY_JSON_CONFIG" 2>/dev/null | head -1
+}
+
+# Is the dialerProxy a LOCAL desync proxy (loopback socks/http)? echoes 1/0.
+_dialer_is_local_desync() {
+  case "$(_dialer_proxy_target)" in
+    *'|'*127.0.0.1*|*'|'*localhost*|*'|'*::1*) echo 1 ;;
+    *) echo 0 ;;
+  esac
+}
+
 probe_xray_lint() {
   if [ -z "$XRAY_CONFIG" ] && [ -z "$XRAY_JSON_CONFIG" ]; then
     XRAY_LINT_STATUS="skipped"
@@ -4456,6 +4496,33 @@ $1"
     warn "VLESS without flow= is deprecated upstream (Xray is migrating to VLESS-with-flow; #5568) — plan flow=xtls-rprx-vision (raw TCP) or VLESS Encryption + flow (CDN transport)"
   elif [ "$_isv" = 1 ]; then
     XRAY_VLESS_FLOW_DEPRECATED=0
+  fi
+
+  # dialerProxy chain (client-side desync layer: ByeDPI / ciadpi / zapret /
+  # GoodbyeDPI). The proxy outbound dials THROUGH another outbound, so the whole
+  # tunnel TCP+TLS goes through it and it can fragment/disorder the ClientHello to
+  # defeat SNI/TLS DPI. This changes how two things read — a tunnel failure (the
+  # dialer must be running) and the cleartext SNI (the dialer may already hide it)
+  # — so probe 12 and probe 27 consume XRAY_DESYNC_CHAIN. JSON-only feature.
+  local _dp _dp_tag _dp_dst
+  _dp=$(_dialer_proxy_target)
+  if [ -n "$_dp" ]; then
+    _dp_tag=${_dp%%|*}; _dp_dst=${_dp#*|}
+    XRAY_DIALER_PROXY="$_dp_tag"
+    if [ "$_dp_dst" = "missing" ]; then
+      XRAY_DESYNC_CHAIN=0
+      _lint_add "sockopt.dialerProxy='$_dp_tag' references no outbound with that tag — the chain is broken (add the '$_dp_tag' outbound or fix the tag)"
+    elif [ "$(_dialer_is_local_desync)" = "1" ]; then
+      XRAY_DESYNC_CHAIN=1
+      info "dialerProxy chain: the tunnel dials through '$_dp_tag' → a LOCAL proxy ($_dp_dst) — a client-side desync layer (ByeDPI / ciadpi / zapret / GoodbyeDPI). The whole tunnel TCP+TLS is dialed through it, so it can fragment/disorder the ClientHello to defeat SNI/TLS DPI. Two consequences: (1) that proxy must be RUNNING locally or the tunnel fails — a 'dead endpoint' reading can actually be the chain; (2) its desync strength (split/disorder/fake/ttl) lives in that process, not this config — verify it there"
+    else
+      XRAY_DESYNC_CHAIN=1
+      info "dialerProxy chain: the tunnel dials through '$_dp_tag' → $_dp_dst (a chained outbound — the connection is proxied through it before reaching the endpoint)"
+    fi
+    # tcpKeepAliveInterval (benign; the user asked) — a keepalive on the dialed socket.
+    local _ka
+    _ka=$(jq -r '[.outbounds[]?.streamSettings.sockopt.tcpKeepAliveInterval // empty] | first // empty' "$XRAY_JSON_CONFIG" 2>/dev/null)
+    [ -n "$_ka" ] && info "sockopt tcpKeepAliveInterval=${_ka}s — TCP keepalive on the dialed socket (keeps the fronted connection warm; benign, a minor traffic-timing signal at most)"
   fi
   if [ "$sec" = "reality" ]; then
     [ -z "$pbk" ] && _lint_add "security=reality but publicKey (pbk) is missing"
@@ -4818,7 +4885,11 @@ EOF
     ok "all ${count} outbounds healthy"
   elif [ "$okc" = "0" ]; then
     fail "0/${count} outbounds reachable — fleet-wide failure (check the shared config knobs: cover/serverName, keys, flow)"
-    add_verdict "Every outbound in the fleet fails the tunnel test — the problem is in the shared configuration (serverName/cover, keys, flow), not a single dead endpoint"
+    if [ "$(_dialer_is_local_desync)" = "1" ]; then
+      add_verdict "Every outbound fails the tunnel test — but this config dials through a LOCAL dialerProxy (client-side desync, ByeDPI/zapret). A fleet-wide failure is the expected symptom when that proxy isn't running (they all share it). Start the desync proxy and re-test BEFORE assuming a shared-config fault (serverName/cover/keys/flow)"
+    else
+      add_verdict "Every outbound in the fleet fails the tunnel test — the problem is in the shared configuration (serverName/cover, keys, flow), not a single dead endpoint"
+    fi
   else
     warn "${okc}/${count} outbounds healthy — partial fleet degradation"
     add_verdict "${okc} of ${count} fleet outbounds pass — the rest are down; rotate or repair the failing endpoints (see the matrix above by tag)"
@@ -5485,6 +5556,11 @@ probe_xray_sni_privacy() {
   esac
   if [ "$sec" != "reality" ] && [ "$ech_cover" != "1" ]; then
     reveal "front/cover serverName = \"$sni\" — its DNS shows no usable ECH config; to hide the SNI, front behind a provider that publishes ECH"
+  fi
+  # dialerProxy desync layer partially covers the cleartext SNI (it fragments the
+  # ClientHello) — name that so ECH reads as belt-and-suspenders, not redundant.
+  if [ "$sec" != "reality" ] && [ "$(_dialer_is_local_desync)" = "1" ]; then
+    info "a client-side desync proxy is chained (dialerProxy) — it typically fragments the ClientHello so a DPI can't reassemble the cleartext SNI (the split-ClientHello evasion). That mitigates the SNI exposure IF the desync actually splits the SNI record; ECH removes it unconditionally, independent of the desync landing"
   fi
   info "advisory only — not scored (ECH adoption isn't universal and Reality forgoes it by design; probe 26 scores the cover-SNI quality that matters today)"
 }
@@ -6193,6 +6269,8 @@ _emit_json() {
     --arg xl_venc           "$XRAY_VLESS_ENC" \
     --arg xl_vencpad        "$XRAY_VLESS_ENC_PADDING" \
     --arg xl_vflowdep       "$XRAY_VLESS_FLOW_DEPRECATED" \
+    --arg xl_dproxy         "$XRAY_DIALER_PROXY" \
+    --arg xl_desync         "$XRAY_DESYNC_CHAIN" \
     --arg xl_iduuid         "$XRAY_ID_UUID" \
     --arg xck_status        "$XRAY_CLOCK_STATUS" \
     --arg xck_skew          "$XRAY_CLOCK_SKEW_S" \
@@ -6461,6 +6539,8 @@ _emit_json() {
           vless_encryption: (if $xl_venc == "" then null else $xl_venc end),
           vless_encryption_padding: tri_bool(($xl_vencpad | tonumber? // -1)),
           vless_flow_deprecated: tri_bool(($xl_vflowdep | tonumber? // -1)),
+          dialer_proxy: (if $xl_dproxy == "" then null else $xl_dproxy end),
+          desync_chain: tri_bool(($xl_desync | tonumber? // -1)),
           id_uuid: tri_bool(($xl_iduuid | tonumber? // -1)),
           findings: (if $xl_findings == "" then [] else ($xl_findings | split("\n") | map(select(length > 0))) end)
         },

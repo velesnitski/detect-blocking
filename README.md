@@ -890,6 +890,14 @@ Encryption lifts XTLS Vision's raw-TCP restriction (so vision on XHTTP/gRPC *is*
 protected, not a tradeoff). Flow-less VLESS gets a **deprecation** notice —
 Xray-core is migrating VLESS-without-flow → VLESS-with-flow ([#5568](https://github.com/XTLS/Xray-core/discussions/5568)).
 
+It also understands **`dialerProxy` chains** — when an outbound dials through a
+**local** socks/http outbound (the ByeDPI / ciadpi / zapret / GoodbyeDPI pattern,
+a client-side desync layer that fragments the ClientHello), it names the chain and
+carries that context downstream: a tunnel failure (probe 12 / fleet) is no longer
+misread as a shared-config fault — it flags that the local desync proxy may simply
+not be running — and probe 27 notes the chain already fragments the cleartext SNI.
+JSON: `xray_lint.dialer_proxy` / `desync_chain`.
+
 **Probe 19 — clock skew** checks a failure mode nobody thinks to: Reality
 authentication is time-windowed, so a client clock off by minutes makes the
 handshake fail *exactly* like a fingerprint block. It compares local time to

@@ -898,6 +898,18 @@ misread as a shared-config fault — it flags that the local desync proxy may si
 not be running — and probe 27 notes the chain already fragments the cleartext SNI.
 JSON: `xray_lint.dialer_proxy` / `desync_chain`.
 
+To **test such a config end-to-end without the real desync proxy up**, pass
+`--stub-dialer`: it spawns a throwaway plain SOCKS5 on the dialer's local port
+(dependency-free — a tiny perl relay; idempotent, loopback-only, auto-cleaned) so
+the tunnel probes run. It applies **no desync**, so it validates the config's
+*carriage + egress/QoE*, not desync efficacy (that needs an in-region DPI vantage)
+— the tool says so on every run.
+
+```bash
+# end-to-end test of a ByeDPI/dialerProxy config with zero setup
+./detect_blocking.sh --xray-config-json client.json --stub-dialer
+```
+
 **Probe 19 — clock skew** checks a failure mode nobody thinks to: Reality
 authentication is time-windowed, so a client clock off by minutes makes the
 handshake fail *exactly* like a fingerprint block. It compares local time to

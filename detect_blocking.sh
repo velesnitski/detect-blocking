@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="1.1.0"
+readonly DETECT_BLOCKING_VERSION="1.2.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -70,6 +70,11 @@ _ORIGINAL_ARGS=("$@")
 
 die()       { printf 'Error: %s\n' "$1" >&2; exit 2; }
 check_cmd() { command -v "$1" >/dev/null 2>&1; }
+# Guard a required-value flag: if its value is missing or looks like another flag,
+# the value was omitted and the flag swallowed the next flag (e.g.
+# `--xray-config-json --stub-dialer <path>`). Die with the correct order. Runs as
+# a statement (not $(...)) so die exits the real shell.
+_req_val() { case "${2:-}" in ''|--*) die "$1 needs a value, but got '${2:-<none>}' — the value was omitted. Put it right after $1, then other flags: e.g. $1 <value> --stub-dialer";; esac; }
 
 # ---------- portability + dependency checks ----------
 
@@ -126,6 +131,8 @@ SUB_COUNT=""                       # number of configs found in the sub
 SUB_WALK=""                        # set when --sub-test all: walk + score every config
 SUB_JOBS="${SUB_JOBS:-8}"          # --sub-test all: concurrent fingerprint probes (1 = serial)
 NO_TUNNEL="${NO_TUNNEL:-}"         # 1 = skip tunnel/data-plane probes, keep direct fingerprint only
+STUB_DIALER="${STUB_DIALER:-}"     # --stub-dialer: serve a local desync dialerProxy chain with a throwaway plain socks
+_STUB_PID=""                       # PID of the stub socks (killed by _cleanup)
 XRAY_ONLY="${XRAY_ONLY:-}"   # 1 = --xray-only (run only the Xray-protocol probes 11-26 + routing/egress)
 SKIP_PROBES="${SKIP_PROBES:-}"
 JSON_MODE="${JSON_MODE:-0}"
@@ -186,7 +193,7 @@ while [ $# -gt 0 ]; do
     --compare-port)   COMPARE_PORT="${2:-}"; shift 2 ;;
     --compare-port=*) COMPARE_PORT="${1#--compare-port=}"; shift ;;
     --port-survey)    PORT_SURVEY=1; shift ;;
-    --xray-config)    XRAY_CONFIG="${2:-}"; shift 2 ;;
+    --xray-config)    _req_val "$1" "${2:-}"; XRAY_CONFIG="${2:-}"; shift 2 ;;
     --xray-config=*)  XRAY_CONFIG="${1#--xray-config=}"; shift ;;
     --subscription|--sub) SUB_URL="${2:-}"; shift 2 ;;
     --subscription=*)     SUB_URL="${1#--subscription=}"; shift ;;
@@ -197,9 +204,10 @@ while [ $# -gt 0 ]; do
     --sub-jobs)    SUB_JOBS="${2:-}"; shift 2 ;;
     --sub-jobs=*)  SUB_JOBS="${1#--sub-jobs=}"; shift ;;
     --no-tunnel)   NO_TUNNEL=1; shift ;;
+    --stub-dialer) STUB_DIALER=1; shift ;;
     --outbound)    OUTBOUND_TAG="${2:-}"; shift 2 ;;
     --outbound=*)  OUTBOUND_TAG="${1#--outbound=}"; shift ;;
-    --xray-config-json)    XRAY_JSON_CONFIG="${2:-}"; shift 2 ;;
+    --xray-config-json)    _req_val "$1" "${2:-}"; XRAY_JSON_CONFIG="${2:-}"; shift 2 ;;
     --xray-config-json=*)  XRAY_JSON_CONFIG="${1#--xray-config-json=}"; shift ;;
     --speedtest)    XRAY_SPEEDTEST=1; XRAY_SPEEDTEST_FORCE=1; shift ;;
     --no-speedtest) XRAY_SPEEDTEST=0; shift ;;
@@ -265,6 +273,9 @@ while [ $# -gt 0 ]; do
       printf '                      tunnel per node → slower; batch defaults to 3 to avoid xray thrash)\n'
       printf '  --no-tunnel         skip tunnel/data-plane probes (no xray spawn, no throughput); run only the\n'
       printf '                      direct fingerprint probes (cover/active-probe/TLS-parity/detectability)\n'
+      printf '  --stub-dialer       if the config dials through a LOCAL dialerProxy (ByeDPI/zapret) that is not\n'
+      printf '                      running, serve it with a throwaway PLAIN socks so the tunnel probes run.\n'
+      printf '                      Tests carriage + egress/QoE, NOT desync efficacy (that needs a DPI vantage)\n'
       printf '  --outbound TAG      for a multi-outbound JSON config, narrow to the outbound with this\n'
       printf '                      tag and test that server standalone (routing dropped); without it the\n'
       printf '                      full config is tested and the first proxy outbound feeds the probes\n'
@@ -4416,6 +4427,85 @@ _dialer_is_local_desync() {
   esac
 }
 
+# Minimal SOCKS5 CONNECT relay, loopback-only, pure perl (a soft-dep the QUIC/IKE
+# probes already use — no install needed). Blocking; run backgrounded. $1 = port.
+# Handles ATYP 1 (IPv4) + 3 (domain); rejects IPv6-upstream (ATYP 4) and non-CONNECT.
+# It applies NO desync — it is plumbing to complete a dialerProxy chain locally.
+_socks5_stub_serve() {
+  perl - "$1" <<'PERL' 2>/dev/null
+use strict; use warnings; use IO::Socket::INET; use IO::Select;
+$SIG{CHLD}='IGNORE'; $SIG{PIPE}='IGNORE';
+my $port = $ARGV[0] or exit 1;
+my $srv = IO::Socket::INET->new(LocalAddr=>'127.0.0.1', LocalPort=>$port,
+          Proto=>'tcp', Listen=>32, ReuseAddr=>1) or exit 1;
+sub rd { my ($fh,$n)=@_; my $b=''; while (length($b)<$n){ my $r=sysread($fh,my $c,$n-length($b)); return undef if !defined $r||$r==0; $b.=$c } $b }
+sub wr { my ($fh,$d)=@_; my $o=0; while ($o<length($d)){ my $w=syswrite($fh,$d,length($d)-$o,$o); return 0 if !defined $w; $o+=$w } 1 }
+my $lsel = IO::Select->new($srv);
+while (1) {
+  exit 0 if getppid() <= 1;              # script gone (even on SIGKILL) → self-terminate
+  next unless $lsel->can_read(5);
+  my $c = $srv->accept or next;
+  my $pid = fork; next if $pid; close $srv; binmode $c;
+  my $g = rd($c,2); exit unless defined $g; my ($v,$nm)=unpack('CC',$g); exit if $v!=5;
+  exit unless defined rd($c,$nm); wr($c, pack('CC',5,0));
+  my $h = rd($c,4); exit unless defined $h; my ($v2,$cmd,$rsv,$at)=unpack('CCCC',$h); exit if $v2!=5;
+  my $host;
+  if ($at==1){ my $a=rd($c,4); exit unless defined $a; $host=join('.',unpack('C4',$a)); }
+  elsif ($at==3){ my $l=rd($c,1); exit unless defined $l; $host=rd($c,unpack('C',$l)); exit unless defined $host; }
+  else { wr($c,pack('CCCCNn',5,8,0,1,0,0)); exit; }
+  my $pb=rd($c,2); exit unless defined $pb; my $dp=unpack('n',$pb);
+  if ($cmd!=1){ wr($c,pack('CCCCNn',5,7,0,1,0,0)); exit; }
+  my $up=IO::Socket::INET->new(PeerAddr=>$host,PeerPort=>$dp,Proto=>'tcp');
+  if (!$up){ wr($c,pack('CCCCNn',5,5,0,1,0,0)); exit; }
+  binmode $up; wr($c,pack('CCCCNn',5,0,0,1,0,0));
+  my $sel=IO::Select->new($c,$up);
+  LOOP: while (1) {
+    my @r=$sel->can_read(120); last unless @r;
+    for my $fh (@r){ my $n=sysread($fh,my $buf,65536); last LOOP if !defined $n||$n==0;
+      my $o=($fh==$c)?$up:$c; last LOOP unless wr($o,$buf); }
+  }
+  close $c; close $up; exit;
+}
+PERL
+}
+
+# --stub-dialer orchestrator: when the config dials through a LOCAL desync
+# dialerProxy that isn't running, spawn a throwaway plain socks on its port so the
+# tunnel probes can run. Idempotent (uses an existing listener), loopback-only.
+# HONEST: plain socks = NO desync → validates carriage + egress/QoE, not efficacy.
+_start_stub_dialer() {
+  [ "${STUB_DIALER:-}" = "1" ] || return 0
+  if [ -n "${NO_TUNNEL:-}" ]; then
+    info "--stub-dialer ignored with --no-tunnel (there are no tunnel probes to serve)"; return 0
+  fi
+  local tgt; tgt=$(_dialer_proxy_target)
+  if [ -z "$tgt" ]; then
+    info "--stub-dialer: this config has no dialerProxy chain — nothing to stub"; return 0
+  fi
+  if [ "$(_dialer_is_local_desync)" != "1" ]; then
+    info "--stub-dialer: the dialerProxy is not a local proxy — not stubbing (a remote hop must be reachable on its own)"; return 0
+  fi
+  local port; port=$(printf '%s' "$tgt" | sed -E 's/.*:([0-9]+)$/\1/')
+  case "$port" in ''|*[!0-9]*) info "--stub-dialer: could not read the dialerProxy port — skipping"; return 0 ;; esac
+  if nc -z 127.0.0.1 "$port" 2>/dev/null; then
+    info "--stub-dialer: 127.0.0.1:$port already has a listener (real desync proxy or a prior stub) — using it, not stubbing"; return 0
+  fi
+  if ! check_cmd perl; then
+    warn "--stub-dialer needs perl (absent) — start a socks on 127.0.0.1:$port yourself (e.g. microsocks -p $port)"; return 0
+  fi
+  _socks5_stub_serve "$port" & _STUB_PID=$!
+  local i=0 up=0
+  while [ "$i" -lt 20 ]; do
+    nc -z 127.0.0.1 "$port" 2>/dev/null && { up=1; break; }
+    sleep 0.1; i=$(( i + 1 ))
+  done
+  if [ "$up" != "1" ]; then
+    warn "--stub-dialer: stub socks failed to bind 127.0.0.1:$port — tunnel probes will fail on the chain"
+    kill "$_STUB_PID" 2>/dev/null; _STUB_PID=""; return 0
+  fi
+  warn "--stub-dialer: serving the dialerProxy chain with a THROWAWAY PLAIN socks on 127.0.0.1:$port (NO desync). This validates the config's CARRIAGE + egress/QoE, NOT desync efficacy — desync only bites a live DPI, so test that from an in-region vantage"
+}
+
 probe_xray_lint() {
   if [ -z "$XRAY_CONFIG" ] && [ -z "$XRAY_JSON_CONFIG" ]; then
     XRAY_LINT_STATUS="skipped"
@@ -6765,6 +6855,9 @@ _cleanup() {
   [ -n "$SUB_DIR" ] && rm -rf "$SUB_DIR" 2>/dev/null
   # Routing-probe xray instance (live split-tunnel test) — don't orphan it.
   [ -n "$XRAY_ROUTING_PID" ] && kill "$XRAY_ROUTING_PID" 2>/dev/null
+  # --stub-dialer throwaway socks — kill the listener (its relay children are
+  # short-lived and end when the tunnel closes).
+  [ -n "${_STUB_PID:-}" ] && kill "$_STUB_PID" 2>/dev/null
 }
 trap _cleanup EXIT
 
@@ -6868,6 +6961,9 @@ fi
 # probes (15 cover-cert, 18 lint, 19 clock, 20 active-probe, 23 MTU, 24 TLS-parity,
 # 26 detectability, + host-exposure) — they connect to the server directly, so a
 # valid detectability score comes back with no tunnel. Powers the fast fleet walk.
+# --stub-dialer: bring up a throwaway plain socks on a local desync dialerProxy's
+# port (if it isn't already running) BEFORE the tunnel probes dial through it.
+_start_stub_dialer
 [ -z "${NO_TUNNEL:-}" ] && _should_run xray    && probe_xray_protocol
 [ -z "${NO_TUNNEL:-}" ] && _should_run xrayjson && probe_xray_json
 [ -z "${NO_TUNNEL:-}" ] && _should_run xrayjson && probe_xray_throughput

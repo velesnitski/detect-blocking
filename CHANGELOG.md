@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-07-07
+
+### Added
+- **`--stub-dialer` — end-to-end test a ByeDPI/dialerProxy config with zero setup.** When a config dials through a **local** desync `dialerProxy` (ByeDPI / ciadpi / zapret / GoodbyeDPI) that isn't running, this spawns a throwaway **plain SOCKS5** on that port (a minimal, dependency-free perl relay — perl is already a soft-dep) so the tunnel probes (12/13/14/16/17…) can run. Idempotent (reuses an existing listener — real ByeDPI or a prior stub), loopback-only, cleaned up on exit, and self-terminates if orphaned. **It applies no desync**, so it validates the config's **carriage + egress/QoE**, not desync efficacy (that needs an in-region DPI vantage) — the tool says so loudly. No-op with `--no-tunnel`, on a chain-less config, or a non-local dialer.
+
+### Changed
+- **Required-value flags now reject a missing value.** `--xray-config-json --stub-dialer <path>` used to swallow the next flag as the "path" and produce a confusing garbage run (`config file not readable: --stub-dialer`). `--xray-config-json` / `--xray-config` now error with the correct order when their value is missing or looks like a flag.
+
 ## [1.1.0] - 2026-07-07
 
 ### Added

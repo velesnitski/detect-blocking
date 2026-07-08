@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-07-08
+
+### Engineering / internals (no behavior change to the probes)
+- **CI now covers the Xray/Reality probes (11–26).** A new `full suite (with xray-core)` job installs xray-core (a single Go binary) and runs the whole suite, so the core stealth probes get regression protection on push — previously only ~13 hermetic tests ran in CI; the ~40 xray-dependent ones were local-only. The fast jobs stay xray-free.
+- **Golden JSON-schema contract test** (`tests/test_json_schema_golden.sh`). Snapshots every `--json` key path (243) and fails if any disappears — enforcing the frozen `schema_version:1` contract (additive keys still allowed) and serving as the safety net for future `_emit_json` refactors.
+- **`scripts/release.sh`** — one-command release: runs the hard gate (syntax + shellcheck + secret-scan), bumps the version, commits with the CHANGELOG notes, fast-forwards `main`, tags, and publishes the GitHub release.
+- **Pure-helper + wrapper ratchet.** Extracted the GFW fully-encrypted-traffic decision into a unit-tested pure `_fet_exposed` (behavior-identical); added a `_curl` wrapper that centralizes the `-sS --max-time` policy (adopted by the IP-reputation / ECH-DNS lookups). Both are patterns to extend on touch, shrinking the 271-global state surface over time.
+
 ## [1.3.1] - 2026-07-07
 
 ### Fixed

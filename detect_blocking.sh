@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="1.3.1"
+readonly DETECT_BLOCKING_VERSION="1.4.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -70,6 +70,11 @@ _ORIGINAL_ARGS=("$@")
 
 die()       { printf 'Error: %s\n' "$1" >&2; exit 2; }
 check_cmd() { command -v "$1" >/dev/null 2>&1; }
+# Standard silent, bounded curl — the common case across the tool. Centralizes the
+# -sS/--max-time policy (and keeps flag choices in one place — e.g. never -D, which
+# a case-insensitive `-d` egress-guard mis-flags). New network calls should use it;
+# existing call sites migrate on touch. Extra flags/URL pass through: _curl -L "$u".
+_curl() { curl -sS --max-time "${TIMEOUT:-10}" "$@"; }
 # Guard a required-value flag: if its value is missing or looks like another flag,
 # the value was omitted and the flag swallowed the next flag (e.g.
 # `--xray-config-json --stub-dialer <path>`). Die with the correct order. Runs as
@@ -3316,8 +3321,8 @@ ${h}|${dirok}|na|${verdict}"
 _is_cdn_ip() {
   local ip="$1" info
   [ -n "$ip" ] && check_cmd curl || return 1
-  info=$(curl -sS --max-time "$TIMEOUT" "https://ipinfo.io/${ip}/json" 2>/dev/null)
-  [ -z "$info" ] && info=$(curl -sS --max-time "$TIMEOUT" "http://ip-api.com/json/${ip}?fields=org,as,isp" 2>/dev/null)
+  info=$(_curl "https://ipinfo.io/${ip}/json" 2>/dev/null)
+  [ -z "$info" ] && info=$(_curl "http://ip-api.com/json/${ip}?fields=org,as,isp" 2>/dev/null)
   printf '%s' "$info" | tr '[:upper:]' '[:lower:]' \
     | grep -qE 'cloudflare|akamai|fastly|cloudfront|edgecast|edgio|g.?core|bunny|stackpath|cdn77|incapsula|sucuri|netlify|vercel|fbcdn|limelight|lumen' \
     && return 0
@@ -4613,6 +4618,32 @@ _start_stub_dialer() {
   warn "--stub-dialer: serving the dialerProxy chain with a THROWAWAY PLAIN socks on 127.0.0.1:$port (NO desync). This validates the config's CARRIAGE + egress/QoE, NOT desync efficacy — desync only bites a live DPI, so test that from an in-region vantage"
 }
 
+# GFW fully-encrypted-traffic (FET) exposure decision — pure/unit-testable. Echoes
+# 1 (random from byte 0, no TLS/HTTP framing → GFW entropy block, USENIX'23), 0
+# (has a recognizable shape), or "" (protocol not evaluated). Args: proto sec net
+# vless_enc (from _vless_enc_method). See the caller for the full rationale.
+_fet_exposed() {
+  local proto="$1" sec="$2" net="$3" venc="${4:-}"
+  case "$proto" in
+    ss|shadowsocks) echo 1 ;;                          # fully-encrypted, no framing
+    vmess|vless|trojan)
+      case "$sec" in
+        ""|none)
+          case "$net" in
+            tcp|raw)
+              case "$venc" in                          # VLESS Encryption method matters
+                random)        echo 1 ;;               # full-random (VMess/SS-like) → exposed
+                native|xorpub) echo 0 ;;               # reshapes the wire → don't assert a block
+                *)             echo 1 ;;               # classic security=none, no VLESS Enc
+              esac ;;
+            *) echo 0 ;;                               # ws/grpc/xhttp carry HTTP framing
+          esac ;;
+        *) echo 0 ;;                                   # tls/reality → TLS exemption
+      esac ;;
+    *) echo ;;                                         # other protocol → not evaluated ("")
+  esac
+}
+
 probe_xray_lint() {
   if [ -z "$XRAY_CONFIG" ] && [ -z "$XRAY_JSON_CONFIG" ]; then
     XRAY_LINT_STATUS="skipped"
@@ -4764,27 +4795,11 @@ $1"
   if [ -n "$XRAY_CONFIG" ]; then proto=${XRAY_CONFIG%%://*}
   else proto=$(_xray_cfg_field protocol '.outbounds[0].protocol'); fi
   proto=$(printf '%s' "$proto" | tr '[:upper:]' '[:lower:]')
-  case "$proto" in
-    ss|shadowsocks) fet=1 ;;                       # fully-encrypted, no framing
-    vmess|vless|trojan)
-      case "$sec" in
-        ""|none)
-          case "$net" in
-            tcp|raw)
-              # Classic security=none + raw TCP = random from byte 0 → exposed. VLESS
-              # Encryption changes it: 'random' is STILL full-random (VMess/SS-like →
-              # exposed); 'native'/'xorpub' reshape the wire, so their FET-resistance
-              # is method-dependent — don't ASSERT a block (report, don't over-claim).
-              case "$XRAY_VLESS_ENC" in
-                random)        fet=1 ;;
-                native|xorpub) fet=0 ;;
-                *)             fet=1 ;;   # no VLESS Encryption (none/"") → classic FET exposure
-              esac ;;
-            *) fet=0 ;;                   # ws/grpc/xhttp carry HTTP framing
-          esac ;;
-        *) fet=0 ;;                       # tls/reality → TLS exemption
-      esac ;;
-  esac
+  # Classic security=none + raw TCP is random from byte 0 → exposed. VLESS Encryption
+  # changes it by method: 'random' is STILL full-random (exposed); 'native'/'xorpub'
+  # reshape the wire so their FET-resistance is method-dependent — report, don't
+  # over-claim. Decision extracted to the pure _fet_exposed (unit-tested).
+  fet=$(_fet_exposed "$proto" "$sec" "$net" "$XRAY_VLESS_ENC")
   XRAY_FET_EXPOSED="$fet"
   if [ "$fet" = "1" ]; then
     case "$proto" in
@@ -5858,8 +5873,7 @@ _ech_dns_probe() {               # domain
     if printf '%s' "$rr" | grep -qiE 'alpn=|ipv4hint=|ipv6hint=|port=|mandatory='; then echo 0; return; fi
   fi
   if check_cmd curl; then
-    ans=$(curl -sS --max-time "$TIMEOUT" \
-          "https://dns.google/resolve?name=${host}&type=HTTPS" 2>/dev/null)
+    ans=$(_curl "https://dns.google/resolve?name=${host}&type=HTTPS" 2>/dev/null)
     printf '%s' "$ans" | grep -qi 'ech=' && { echo 1; return; }
   fi
   echo unknown

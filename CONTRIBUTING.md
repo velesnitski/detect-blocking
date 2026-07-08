@@ -54,6 +54,25 @@ Pattern:
   (`www.example.com`).
 - Negative scenarios use the `tests/fake_doh.py` fixture (or extend it) to
   simulate a hostile network locally — no external dependencies.
+- **Prefer pure helpers for logic.** Put decisions in a small arg-in / echo-out
+  function (`_score_cover_cert`, `_fet_exposed`, `_panel_classify`, `_fleet_tags`)
+  and unit-test it by extracting the body: `eval "$(awk '/^_fn\(\)/,/^}/' "$SCRIPT")"`.
+  This keeps `probe_*()` thin and shrinks the shared-global surface.
+- **Never rename/remove a `--json` key** without bumping `schema_version`.
+  `tests/test_json_schema_golden.sh` enforces this; after an *additive* change,
+  refresh the snapshot with `bash tests/test_json_schema_golden.sh --update`.
+
+## Releasing
+
+From `dev`, after adding a `## [X.Y.Z]` section to `CHANGELOG.md`:
+
+```sh
+scripts/release.sh X.Y.Z
+```
+
+It runs the gate (syntax + shellcheck + secret-scan), bumps the version constant,
+commits with the changelog notes, fast-forwards `main`, tags `vX.Y.Z`, and
+publishes the GitHub release.
 
 ## Implementation gotchas
 

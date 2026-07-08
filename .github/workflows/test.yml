@@ -36,6 +36,31 @@ jobs:
           SECRET_SCAN_BANNED: ${{ secrets.SECRET_SCAN_BANNED }}
         run: bash scripts/secret-scan.sh
 
+  xray-suite:
+    # Installs xray-core (a single Go binary) so the Xray/Reality stealth probes
+    # (11-26) — the core value of the tool — get real regression coverage on push.
+    # The fast jobs above stay xray-free; this one is allowed to be slower.
+    name: full suite (with xray-core)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Install xray-core
+        run: |
+          go install github.com/xtls/xray-core/main@latest
+          sudo install -m 0755 "$(go env GOPATH)/bin/main" /usr/local/bin/xray
+          xray version | head -n 1
+      - name: Install jq
+        run: command -v jq || { sudo apt-get update && sudo apt-get install -y jq; }
+      - name: Run full test suite
+        # The whole suite; with xray present the tunnel probes actually execute.
+        # test_smoke depends on live DNS to www.example.com and can flake on a
+        # runner with a broken resolver — re-run the job if only smoke fails.
+        run: bash tests/run.sh
+        timeout-minutes: 25
+
   syntax-and-smoke:
     name: syntax + smoke (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

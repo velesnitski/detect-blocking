@@ -17,6 +17,19 @@ command -v jq >/dev/null 2>&1 || { echo "SKIP: jq not installed"; exit 0; }
 fail() { printf 'FAIL: %s\n' "$1" >&2; printf '%s\n' "${out:-}" >&2; exit 1; }
 lf()  { printf '%s' "$1" | jq -r '.probes.xray_lint.fet_exposed'; }
 
+# 0. Unit-test the pure decision (_fet_exposed proto sec net vless_enc → 1/0/"").
+eval "$(awk '/^_fet_exposed\(\)/,/^}/' "$SCRIPT")"
+u() { local g; g=$(_fet_exposed "$2" "$3" "$4" "${5:-}"); [ "$g" = "$1" ] || fail "_fet_exposed($2,$3,$4,${5:-}) = '$g', want '$1'"; }
+u 1 ss "" ""                # shadowsocks: no framing → exposed
+u 1 vless none tcp ""       # classic security=none raw TCP → exposed
+u 1 vless none tcp random   # VLESS Encryption 'random' still full-random → exposed
+u 0 vless none tcp native   # 'native'/'xorpub' reshape the wire → not asserted
+u 0 vless none tcp xorpub
+u 0 vless none ws ""        # ws carries HTTP framing → exempt
+u 0 vless reality tcp ""    # Reality → TLS exemption
+u 0 vmess tls tcp ""
+u "" hysteria2 none tcp ""  # unknown protocol → not evaluated (JSON null, not false)
+
 # 1. VLESS over raw TCP, security=none → fully encrypted, no framing → exposed.
 RAW='{"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"127.0.0.1","port":1,"users":[{"id":"00000000-0000-0000-0000-000000000000","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"none"}}]}'
 out=$(TIMEOUT=2 bash "$SCRIPT" --xray-config-json "$RAW" --only xray --json 2>/dev/null)

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-07-13
+
+### Added
+- **Config-validity check — "config is broken" analytics (probe 18).** Catches the common structural errors that stop xray from *loading at all* — which previously surfaced only as a cryptic probe-12 tunnel failure: **duplicate outbound tags** (xray requires unique tags; routing resolves only the first, the rest never run) and **JSON-string ports** (`"port": "443"` — xray needs the integer `443`). A broken config now gets a clear *"config will NOT load in xray-core"* verdict up front, before any network diagnosis. Pure detectors `_dup_outbound_tags` / `_string_ports_present` (unit-tested); JSON: `.probes.xray_lint.config_valid`. Deliberately the high-confidence, **zero-false-positive** static subset — a full validator is `xray -test`, which also rejects placeholder keys, so it isn't run here to avoid false alarms.
+
 ## [1.4.0] - 2026-07-08
 
 ### Engineering / internals (no behavior change to the probes)

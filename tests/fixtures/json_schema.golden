@@ -150,6 +150,7 @@ probes.xray_full_config.socks_port_used
 probes.xray_full_config.status
 probes.xray_full_config.synthesized_from_url
 probes.xray_lint
+probes.xray_lint.config_valid
 probes.xray_lint.desync_chain
 probes.xray_lint.dialer_proxy
 probes.xray_lint.fet_exposed

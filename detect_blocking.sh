@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="1.4.0"
+readonly DETECT_BLOCKING_VERSION="1.5.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -992,6 +992,7 @@ XRAY_STABILITY_RESULTS=""   # "size|state|rtt ..." for JSON
 # network probes, so an obvious typo surfaces in milliseconds instead of
 # masquerading as DPI. Findings name the protocol knob, never the secret value.
 XRAY_LINT_STATUS=""         # ok, warn, skipped
+XRAY_CONFIG_VALID=""        # 1 / 0 / "" — config loads in xray-core (dup tags / string ports / xray -test)
 XRAY_LINT_FINDINGS=""       # newline-joined short codes for JSON
 XRAY_FET_EXPOSED=""         # 1 / 0 / "" — fully-encrypted (no TLS/HTTP framing) → GFW entropy classifier (USENIX'23)
 XRAY_VLESS_ENC=""           # none | native | xorpub | random | invalid | "" — VLESS Encryption method (mlkem768x25519plus.*, Xray 2025+)
@@ -4618,6 +4619,19 @@ _start_stub_dialer() {
   warn "--stub-dialer: serving the dialerProxy chain with a THROWAWAY PLAIN socks on 127.0.0.1:$port (NO desync). This validates the config's CARRIAGE + egress/QoE, NOT desync efficacy — desync only bites a live DPI, so test that from an in-region vantage"
 }
 
+# Config-validity detectors ($1 = json file). Cheap structural bugs that stop xray
+# from LOADING at all — otherwise they surface only as a cryptic probe-12 failure.
+# _dup_outbound_tags echoes duplicated outbound tags (xray requires unique tags —
+# routing resolves only the first, the rest never run). _string_ports_present echoes
+# "1" if any outbound endpoint port is a JSON string (xray needs a uint16 integer).
+_dup_outbound_tags() {
+  jq -r '[.outbounds[]?.tag // empty] | group_by(.) | map(select(length>1) | .[0]) | .[]' "$1" 2>/dev/null
+}
+_string_ports_present() {
+  jq -r '[ .outbounds[]? | .settings? | (.vnext[]?, .servers[]?) | .port? ]
+         | map(select(type=="string")) | if length>0 then "1" else empty end' "$1" 2>/dev/null
+}
+
 # GFW fully-encrypted-traffic (FET) exposure decision — pure/unit-testable. Echoes
 # 1 (random from byte 0, no TLS/HTTP framing → GFW entropy block, USENIX'23), 0
 # (has a recognizable shape), or "" (protocol not evaluated). Args: proto sec net
@@ -4685,6 +4699,30 @@ $1"
       findings="$1"
     fi
   }
+
+  # --- config validity: structural bugs that stop xray from LOADING ---
+  # Cheap static checks for the common errors that otherwise surface only as a
+  # cryptic probe-12 tunnel failure: duplicate outbound tags + string ports. This is
+  # the high-confidence, zero-false-positive subset (a full validator is `xray -test`,
+  # which also rejects placeholder keys — not run here to keep the check FP-free).
+  # config_valid: 0 = a structural bug found; "" (null) = none of these (NOT a full
+  # validity guarantee). JSON-only.
+  if [ -n "$XRAY_JSON_CONFIG" ] && [ -r "$XRAY_JSON_CONFIG" ] && command -v jq >/dev/null 2>&1; then
+    local _dup _strport
+    _dup=$(_dup_outbound_tags "$XRAY_JSON_CONFIG")
+    _strport=$(_string_ports_present "$XRAY_JSON_CONFIG")
+    if [ -n "$_dup" ]; then
+      XRAY_CONFIG_VALID=0
+      _lint_add "duplicate outbound tag(s): $(printf '%s' "$_dup" | tr '\n' ' ') — xray requires unique outbound tags; routing resolves only the first, the rest never run"
+    fi
+    if [ "$_strport" = "1" ]; then
+      XRAY_CONFIG_VALID=0
+      _lint_add "an outbound 'port' is a JSON string — xray needs an integer (e.g. 443, not \"443\"); the config will not load"
+    fi
+    if [ "$XRAY_CONFIG_VALID" = "0" ]; then
+      add_verdict "Config will NOT load in xray-core as written — fix the structural error(s) above before any network diagnosis (otherwise it surfaces only as a cryptic tunnel failure). Full validation: xray -test -config <file>"
+    fi
+  fi
 
   # VLESS Encryption (Xray 2025+): a NATIVE post-quantum crypto layer (ML-KEM-768 +
   # X25519), encryption="mlkem768x25519plus.<native|xorpub|random>.<session>[+pad]".
@@ -6497,6 +6535,7 @@ _emit_json() {
     --arg xl_status         "$XRAY_LINT_STATUS" \
     --arg xl_findings       "$XRAY_LINT_FINDINGS" \
     --arg xl_fet            "$XRAY_FET_EXPOSED" \
+    --arg xl_valid          "$XRAY_CONFIG_VALID" \
     --arg xl_venc           "$XRAY_VLESS_ENC" \
     --arg xl_vencpad        "$XRAY_VLESS_ENC_PADDING" \
     --arg xl_vflowdep       "$XRAY_VLESS_FLOW_DEPRECATED" \
@@ -6770,6 +6809,7 @@ _emit_json() {
         xray_lint: {
           status: opt($xl_status),
           fet_exposed: tri_bool(($xl_fet | tonumber? // -1)),
+          config_valid: tri_bool(($xl_valid | tonumber? // -1)),
           vless_encryption: (if $xl_venc == "" then null else $xl_venc end),
           vless_encryption_padding: tri_bool(($xl_vencpad | tonumber? // -1)),
           vless_flow_deprecated: tri_bool(($xl_vflowdep | tonumber? // -1)),

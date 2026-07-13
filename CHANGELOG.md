@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.2] - 2026-07-13
+
+### Fixed
+- **Credential-bearing `--outbound` temp file leaked on every run.** The narrowed single-outbound config (mode 0600, holds the outbound's live UUID / Reality keys) is created early during argument resolution and tracked in `XRAY_OUTBOUND_PATH`, but the later state-init block re-initialized that variable to empty — so the `_cleanup` EXIT guard became a permanent no-op and the temp file survived every clean exit, accumulating in `$TMPDIR`. The tracker is now initialized *before* the `--outbound` block and no longer clobbered; the temp config is reaped on exit as intended.
+- **Probes 15 (Reality cover) and 24 (TLS parity) could hang ~75 s on a dead/blackholed endpoint.** Their `openssl s_client` calls had no connect bound — `echo Q` only quits *after* the handshake, and stock macOS has no `timeout`/`gtimeout`, so a null-routed server stalled on the OS TCP connect timeout (probe 24 did it twice). Both now precheck with the same `$TIMEOUT`-bounded `_nc_tcp_probe` the fleet walk and probes 1–2 already use, and report `unreachable` instead of hanging.
+- **Recommendation misfire: a broad `*"SNI"*` glob gave contradictory advice.** It matched *any* verdict mentioning "SNI" — including the Reality cover-SNI, Hysteria2-SNI, and routing/protocol-fingerprint verdicts, which already carry their own fix — and appended "try Reality / domain fronting / ECH", which is nonsensical for a config that already *is* Reality/Hysteria. Narrowed to `*"SNI-based DPI block"*` so only the two genuine SNI-DPI-block verdicts get that recommendation.
+- **Terminal-escape hardening for config-supplied outbound tags.** `_safe()` (the control/ANSI stripper) is now applied to outbound `.tag` values and the panel `Server` response header on the console/log path — a hostile `--subscription` panel could otherwise inject a terminal escape sequence via a crafted tag or header. JSON output was already safe (jq neutralizes control characters).
+
 ## [1.5.1] - 2026-07-13
 
 ### Fixed

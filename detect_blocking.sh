@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="1.5.1"
+readonly DETECT_BLOCKING_VERSION="1.5.2"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -563,9 +563,16 @@ fi
 # standalone; without it we leave the full config and just hint that there's more
 # than one server. Narrowing puts the chosen outbound at index 0, so every existing
 # `.outbounds[0]` read and the first-proxy derivation below target it unchanged.
+# Initialized HERE (not with the other state at the top of the state block) because
+# the --outbound block below sets it while resolving args, which runs BEFORE that
+# block — re-initializing it later would clobber the mktemp path and make _cleanup a
+# no-op, leaking the narrowed temp config (which holds live creds) on every run.
+XRAY_OUTBOUND_PATH=""
 if [ -n "${XRAY_JSON_CONFIG:-}" ] && [ -r "$XRAY_JSON_CONFIG" ] && command -v jq >/dev/null 2>&1 \
    && [ -z "${XRAY_JSON_FORMAT:-}" ] && jq empty "$XRAY_JSON_CONFIG" >/dev/null 2>&1; then
-  _proxy_tags=$(jq -r '[.outbounds[]? | select(.settings.vnext != null or .settings.servers != null) | .tag // "(untagged)"] | join(", ")' "$XRAY_JSON_CONFIG" 2>/dev/null)
+  # _safe: outbound tags come from an operator-supplied (or --subscription-fetched)
+  # config — strip control/ANSI so a hostile tag can't inject a terminal escape here.
+  _proxy_tags=$(_safe "$(jq -r '[.outbounds[]? | select(.settings.vnext != null or .settings.servers != null) | .tag // "(untagged)"] | join(", ")' "$XRAY_JSON_CONFIG" 2>/dev/null)")
   _proxy_n=$(jq -r '[.outbounds[]? | select(.settings.vnext != null or .settings.servers != null)] | length' "$XRAY_JSON_CONFIG" 2>/dev/null)
   _chained=$(jq -r 'if ([.outbounds[]? | select(.streamSettings.sockopt.dialerProxy != null or .proxySettings != null)] | length) > 0 then 1 else 0 end' "$XRAY_JSON_CONFIG" 2>/dev/null)
   if [ -n "$OUTBOUND_TAG" ]; then
@@ -849,7 +856,8 @@ XRAY_JSON_RTT_MS=""      # round-trip via the SOCKS tunnel
 XRAY_JSON_FAIL_KIND=""   # on failure: timeout | reset | other (drives verdict)
 XRAY_JSON_RETRY_USED=0   # 1 if the slow-handshake auto-retry ran
 XRAY_JSON_SYNTH_PATH=""  # temp config synthesized from --xray-config URL (cleaned on exit)
-XRAY_OUTBOUND_PATH=""    # temp config narrowed to one outbound by --outbound (cleaned on exit)
+# XRAY_OUTBOUND_PATH is initialized EARLIER (before the --outbound block) on purpose —
+# see the note there. Do NOT re-init it here; that clobbers the temp path and leaks it.
 XRAY_JSON_FROM_URL=0     # 1 when probe 12 ran off a synthesized share-link config
 
 # ---- probe 13: data-plane throughput through the same SOCKS inbound ----
@@ -3104,8 +3112,15 @@ probe_xray_cover() {
     return 0
   fi
 
-  # `echo Q` makes openssl quit right after the handshake — no `timeout`
-  # wrapper needed (and `timeout`/`gtimeout` aren't present on stock macOS).
+  # Bound the connect: a dead / null-routed VPN_HOST makes openssl s_client block
+  # on the OS TCP connect timeout (~75s) — `echo Q` only quits AFTER the handshake,
+  # so it does NOT bound the connect (and `timeout`/`gtimeout` aren't on stock macOS).
+  # Precheck with a $TIMEOUT-bounded nc, the same guard the fleet walk / probes 1-2 use.
+  if ! _nc_tcp_probe "$VPN_HOST" "$VPN_PORT_TCP"; then
+    fail "no TLS certificate returned — cover unreachable (see probes 2-3)"
+    XRAY_COVER_STATUS="unreachable"
+    return 0
+  fi
   local out subject issuer verify
   out=$(echo Q | openssl s_client -connect "$VPN_HOST:$VPN_PORT_TCP" \
         -servername "$sni" 2>/dev/null)
@@ -3427,7 +3442,7 @@ probe_panel() {
     case "$verdict" in
       panel) fail  "  ${url} → x-ui/3x-ui PANEL (HTTP ${code}) — EXPOSED"; found=1 ;;
       login) warn  "  ${url} → login form (HTTP ${code}) — likely a panel"; found=1 ;;
-      cdn)   info  "  ${url} → CDN edge (HTTP ${code}, server=${srv}) — not your origin" ;;
+      cdn)   info  "  ${url} → CDN edge (HTTP ${code}, server=$(_safe "$srv")) — not your origin" ;;
       web)   info  "  ${url} → responds (HTTP ${code}), no panel markers" ;;
       closed) info "  ${url} → open TCP but no HTTP response" ;;
     esac
@@ -5220,13 +5235,13 @@ probe_xray_routing() {
     ngi=$(jq -r --arg t "$tag" '[.routing.rules[]? | select(.outboundTag==$t) | (.ip // [])[]     | select(startswith("geoip:"))]       | length' "$XRAY_JSON_CONFIG" 2>/dev/null)
     nip=$(jq -r --arg t "$tag" '[.routing.rules[]? | select(.outboundTag==$t) | (.ip // [])[]     | select(startswith("geoip:") | not)] | length' "$XRAY_JSON_CONFIG" 2>/dev/null)
     case " $proxy_tags " in *" $tag "*) kind="proxy" ;; esac
-    info "$(printf '%-14s (%-12s): %s domains · %s geosite · %s geoip · %s ip' "$tag" "$kind" "$nd" "$ng" "$ngi" "$nip")"
+    info "$(printf '%-14s (%-12s): %s domains · %s geosite · %s geoip · %s ip' "$(_safe "$tag")" "$kind" "$nd" "$ng" "$ngi" "$nip")"
   done
-  info "default route → ${default_tag:-<first outbound>}"
+  info "default route → $(_safe "${default_tag:-<first outbound>}")"
 
   if [ -n "$undef" ]; then
-    fail "routing references undefined outboundTag(s): $undef → matched traffic is dropped/misrouted"
-    add_verdict "Routing references outboundTag(s) not defined in outbounds ($undef) — traffic matching those rules is silently dropped or misrouted; fix the tag names"
+    fail "routing references undefined outboundTag(s): $(_safe "$undef") → matched traffic is dropped/misrouted"
+    add_verdict "Routing references outboundTag(s) not defined in outbounds ($(_safe "$undef")) — traffic matching those rules is silently dropped or misrouted; fix the tag names"
   fi
   case " $proxy_tags " in
     *" $default_tag "*) info "default route is a PROXY outbound → ALL traffic tunnels (not just the listed sites)" ;;
@@ -5625,6 +5640,14 @@ probe_xray_tls_parity() {
   # relaying Reality server splices us to the real dest, so its ServerHello
   # (incl. extensions) should be byte-identical to the cover's; a broken/own-TLS
   # server diverges at the extension level even when version/cipher happen to align.
+  # Bound both connects: openssl s_client blocks on the OS TCP connect timeout
+  # (~75s) for a dead server or an NXDOMAIN/unroutable cover — `echo Q` only quits
+  # after the handshake. Precheck both sides with a $TIMEOUT-bounded nc first.
+  if ! _nc_tcp_probe "$VPN_HOST" "$VPN_PORT_TCP" || ! _nc_tcp_probe "$sni" 443; then
+    warn "could not complete both TLS negotiations (server or cover unreachable)"
+    XRAY_TLSPAR_STATUS="unreachable"
+    return 0
+  fi
   local s_out c_out s_ver c_ver s_alpn c_alpn s_ciph c_ciph s_ext c_ext
   s_out=$(echo Q | openssl s_client -connect "$VPN_HOST:$VPN_PORT_TCP" \
           -servername "$sni" -alpn h2,http/1.1 -tlsextdebug 2>/dev/null)
@@ -7260,7 +7283,7 @@ else
     case "$v" in
       *"Detectability "*|*"Passive Reality/Xray fingerprint"*) rec="stealth/fingerprint finding, not a live block — make the server blend in: serve the cover SNI on 443, point Reality 'dest'/'serverNames' at a real CA-valid cover, and choose a cover hosted on the server's own network (or a large shared CDN). The structural fix for the SNI↔IP mismatch and entry/egress co-location tells is CDN-fronting: put the entry behind a CDN (e.g. Cloudflare) so the cover SNI resolves to the CDN's own IPs and the connection terminates on the CDN — eliminating both tells at the source. (Or a 'self-steal' REALITY setup: the server fronts its OWN real site via realitySettings.target + its own serverNames, so the cover resolves to the server itself — no mismatch.) Run with --scan-covers to rank candidate cover domains (TLSv1.3 + H2 + CA-valid + non-redirect)." ;;
       *"Encrypted-ClientHello (ECH)"*) rec="enable ECH (Encrypted ClientHello) in the client — the front already publishes an ECH config, so this hides the cover SNI outright; a chained client-side desync (dialerProxy) also fragments the ClientHello, but ECH is unconditional. This config is ALREADY CDN-fronted, so 'switch to Reality' would be a different architecture, not an upgrade" ;;
-      *"SNI"*)                    rec="try Reality / domain fronting / ECH-enabled client" ;;
+      *"SNI-based DPI block"*)    rec="try Reality / domain fronting / ECH-enabled client" ;;  # NOT a bare *"SNI"* glob: that swallowed Reality-cover / Hysteria / routing verdicts (which already carry their own fix) and gave them contradictory "switch to Reality" advice
       *"System DNS failure"*)     rec="use DoH inside the VPN client and check router/provider DNS" ;;
       *"DNS sinkhole"*)           rec="use DoH inside the VPN client, not system resolver" ;;
       *"DoH path is compromised"*) rec="self-host DoH or use a trusted resolver via VPN tunnel – upstream DoH is intercepted on this network" ;;

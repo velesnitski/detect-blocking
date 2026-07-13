@@ -5,6 +5,7 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
+  workflow_dispatch:   # allow running the full xray-suite on demand (e.g. from dev)
 
 permissions:
   contents: read
@@ -38,8 +39,11 @@ jobs:
 
   xray-suite:
     # Installs xray-core (a single Go binary) so the Xray/Reality stealth probes
-    # (11-26) — the core value of the tool — get real regression coverage on push.
-    # The fast jobs above stay xray-free; this one is allowed to be slower.
+    # (11-26) — the core value of the tool — get real regression coverage. It's the
+    # slow/expensive job, so it runs only on push to MAIN (i.e. per release) and on
+    # manual dispatch — NOT on every dev push (Actions-minute budget). The fast jobs
+    # below cover dev pushes.
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
     name: full suite (with xray-core)
     runs-on: ubuntu-latest
     steps:
@@ -58,8 +62,10 @@ jobs:
         # The whole suite; with xray present the tunnel probes actually execute.
         # test_smoke depends on live DNS to www.example.com and can flake on a
         # runner with a broken resolver — re-run the job if only smoke fails.
+        # Tests must use 127.0.0.1:closed-port for connect-failure fixtures (instant
+        # ECONNREFUSED); TEST-NET 192.0.2.x silently drops and hangs xray ~75s/connect.
         run: bash tests/run.sh
-        timeout-minutes: 25
+        timeout-minutes: 20
 
   syntax-and-smoke:
     name: syntax + smoke (${{ matrix.os }})

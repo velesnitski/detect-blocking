@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-07-13
+
+### Fixed
+- **CI `full suite (with xray-core)` job timed out (25 min).** `test_vision_flow.sh` pointed at a TEST-NET endpoint (`192.0.2.10`) which *silently drops* packets, so xray-core hung ~75 s per connect across the data-plane probes (~13 min for that one test) — the exact "use `127.0.0.1:closed-port`, not TEST-NET" gotcha. It only asserts a **static** probe-26 value (`tls_in_tls_protected`, derived from the flow param — no tunnel needed), so it now uses an instant-refuse endpoint (`127.0.0.1:1`) and `--only xray`: **18 s, was ~13 min**.
+- **CI cost:** the xray-suite job now runs only on push to `main` (i.e. per release) and on manual `workflow_dispatch` — not on every dev push (Actions-minute budget) — and its timeout is tightened to 20 min. The fast jobs still cover every dev push.
+
 ## [1.5.0] - 2026-07-13
 
 ### Added

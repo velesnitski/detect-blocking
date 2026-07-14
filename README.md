@@ -490,6 +490,82 @@ isn't visible in a client config. JSON: `probes.hysteria.{status, sni_keyword,
 sni_explicit, obfs, insecure}` (booleans only — share-safe; the raw SNI prints
 only under `--reveal`).
 
+### OpenVPN — reachability + fingerprintability posture
+
+OpenVPN is one of the easiest protocols for a censor to identify: without
+`tls-crypt`/`tls-auth` the control-channel **opcode is cleartext**, and the
+server **answers an anonymous `HARD_RESET`** — so both passive fingerprinting
+and active probing confirm it on sight (the USENIX '22 result
+[*"OpenVPN is Open to VPN Fingerprinting"*](https://www.usenix.org/conference/usenixsecurity22/presentation/xue-diwen)).
+Probe 7 covers this in two ways.
+
+**Without any config** — just a host. Runs UDP/TCP reachability plus an active
+handshake (a random-session-id `HARD_RESET_CLIENT_V2`), and infers the crypto
+posture from whether the server answers:
+
+```bash
+# defaults to UDP/TCP 1194; override the port with the env knobs
+./detect_blocking.sh --only openvpn vpn.example.com
+OPENVPN_PORT_UDP=443 OPENVPN_PORT_TCP=443 ./detect_blocking.sh --only openvpn vpn.example.com
+```
+
+A reply (`opcode 0x40`) means the endpoint is **reachable but active-probe
+fingerprintable** (no `tls-crypt`/`tls-auth` — a censor's prober confirms it,
+and anyone can enumerate it). Silence with the port open is **ambiguous** from
+one vantage — a DPI drop, no service, *or* a correctly hardened server whose
+`tls-crypt` refuses the unauthenticated probe.
+
+Prefer a one-liner with no tool at all:
+
+```bash
+HOST=vpn.example.com; PORT=1194
+nc -z -G3 "$HOST" "$PORT" 2>/dev/null && echo "TCP reachable" || echo "no TCP"
+perl -e 'print "\x38", map { chr int rand 256 } 1..8' | nc -u -w5 "$HOST" "$PORT" | xxd -p | head -c4
+# prints 40… → OpenVPN answered (not blocked here; no tls-crypt → fingerprintable)
+# prints nothing → silent: DPI-drop, no service, OR tls-crypt/tls-auth (can't tell from one vantage)
+```
+
+**With a client profile** — `--ovpn-config FILE` parses the `.ovpn` for the
+endpoint (remote host/port/proto) and its posture, then classifies
+fingerprintability:
+
+```bash
+./detect_blocking.sh --ovpn-config ~/client.ovpn
+```
+
+| posture | meaning | fix |
+| --- | --- | --- |
+| `exposed` | no `tls-crypt`/`tls-auth` — cleartext opcode **and** answers active probes | enable `tls-crypt-v2`; in hostile regions wrap it (stunnel/scramble) or move to Reality/Xray |
+| `hmac-only` | `tls-auth` refuses active probes, but the opcode is still cleartext (passive fp still works) | upgrade `tls-auth` → `tls-crypt-v2` |
+| `probe-resistant` | `tls-crypt` encrypts the control channel — active-probe resistant (residual: handshake length/timing shape) | add an obfuscation wrapper to remove the residual shape |
+| `wrapped` | obfuscation layer present — opcode **and** handshake shape hidden | — |
+
+The profile's inline `CA`/`cert`/`key`/`tls-crypt` **secrets are never printed**
+(PEM blocks are stripped before parsing); the endpoint host follows the normal
+rule (shown in the console header / `.target`, like any run). JSON:
+`probes.openvpn.{udp_port_accessible, tcp_port_reachable, handshake_replied,
+config_provided, proto, tls_crypt, tls_auth, obfuscated, posture,
+fingerprintable}` — booleans/enums, share-safe.
+
+**Already connected but can't export the config?** Discover the live endpoint
+from the OS, then probe it (the active handshake *infers* the `tls-crypt`
+posture without the profile):
+
+```bash
+# macOS — find the OpenVPN server IP:port your client is talking to
+sudo lsof -nP -iUDP -iTCP | grep -iE 'openvpn|ovpn|vpn'
+# …or the /32 host route the client adds for the server via the physical link:
+netstat -rnf inet | awk 'NR>3 && $1 ~ /^[0-9.]+$/ && $NF ~ /^en[0-9]/ {print $1"  dev "$NF}'
+
+# then, with SERVER_IP + PORT from above:
+OPENVPN_PORT_UDP=PORT OPENVPN_PORT_TCP=PORT ./detect_blocking.sh --only openvpn SERVER_IP
+```
+
+**Honest scope** (same discipline as the Xray probes): from one clean vantage
+this reads reachability, active-probe response, and config posture — **not**
+passive DPI classification or volumetric throttling, which need an in-region
+vantage or a live tunnel.
+
 ### Happ deep links (`happ://`)
 
 [Happ](https://happ.su) is a popular client whose `happ://` deep links wrap

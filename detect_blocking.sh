@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="1.5.2"
+readonly DETECT_BLOCKING_VERSION="1.6.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -216,6 +216,8 @@ while [ $# -gt 0 ]; do
     --outbound=*)  OUTBOUND_TAG="${1#--outbound=}"; shift ;;
     --xray-config-json)    _req_val "$1" "${2:-}"; XRAY_JSON_CONFIG="${2:-}"; shift 2 ;;
     --xray-config-json=*)  XRAY_JSON_CONFIG="${1#--xray-config-json=}"; shift ;;
+    --ovpn-config)    _req_val "$1" "${2:-}"; OVPN_CONFIG="${2:-}"; shift 2 ;;
+    --ovpn-config=*)  OVPN_CONFIG="${1#--ovpn-config=}"; shift ;;
     --speedtest)    XRAY_SPEEDTEST=1; XRAY_SPEEDTEST_FORCE=1; shift ;;
     --no-speedtest) XRAY_SPEEDTEST=0; shift ;;
     --no-egress-check) XRAY_EGRESS_CHECK=0; shift ;;
@@ -274,6 +276,9 @@ while [ $# -gt 0 ]; do
       printf '                      dialerProxy, chained outbounds; needs xray + jq)\n'
       printf '                      also accepts a Hysteria2 client config (YAML or JSON) — runs the\n'
       printf '                      static Hysteria2 analyzer (SNI tell, obfs, QUIC-SNI, UDP/443)\n'
+      printf '  --ovpn-config FILE  parse an OpenVPN .ovpn profile — reachability + active-probe\n'
+      printf '                      response + control-channel fingerprintability posture (tls-crypt/\n'
+      printf '                      tls-auth/obfs); host + inline keys never printed (--reveal to show)\n'
       printf '  --subscription URL  fetch a subscription (cookie-jar + client UA), decode it (JSON array of\n'
       printf '                      Xray configs / single config / base64), inventory the fleet, and run the\n'
       printf '                      full suite on one config (--sub-test N, default 0; --sub-ua to set the UA).\n'
@@ -655,6 +660,37 @@ if [ -n "${XRAY_JSON_CONFIG:-}" ] && [ -z "${VPN_HOST:-}" ] && [ -r "$XRAY_JSON_
   unset _derived_host _derived_port
 fi
 
+# --ovpn-config FILE: parse an OpenVPN client profile (.ovpn) for the endpoint
+# (remote host/port/proto) and its control-channel FINGERPRINTABILITY posture —
+# whether the opcode is wrapped so an anonymous active probe is refused (the
+# USENIX'22 "OpenVPN is Open to VPN Fingerprinting" attack). Booleans only: the
+# profile also carries the server host and inline CA/cert/key/tls-crypt SECRETS,
+# which are never printed (host only under --reveal). PEM/key blocks are stripped
+# before the directive scan so we never grep into a key. Sets OPENVPN_* + OVPN_*
+# (kept by the `:-` state inits) and scopes to env,dns,openvpn when --only is unset.
+if [ -n "${OVPN_CONFIG:-}" ]; then
+  [ -r "$OVPN_CONFIG" ] || die "--ovpn-config: cannot read '$OVPN_CONFIG'"
+  _ovpn_dirs=$(sed -E '/^[[:space:]]*<(ca|cert|key|tls-auth|tls-crypt|tls-crypt-v2)>/,/^[[:space:]]*<\/(ca|cert|key|tls-auth|tls-crypt|tls-crypt-v2)>/d' "$OVPN_CONFIG" 2>/dev/null)
+  _r=$(printf '%s\n' "$_ovpn_dirs" | grep -iE '^[[:space:]]*remote[[:space:]]' | head -1)
+  _rhost=$(printf '%s' "$_r" | awk '{print $2}')
+  _rport=$(printf '%s' "$_r" | awk '{print $3}')
+  _pport=$(printf '%s\n' "$_ovpn_dirs" | grep -iE '^[[:space:]]*port[[:space:]]' | head -1 | awk '{print $2}')
+  case "$(printf '%s\n' "$_ovpn_dirs" | grep -iE '^[[:space:]]*proto[[:space:]]' | head -1 | awk '{print tolower($2)}')${_r:+ }$(printf '%s' "$_r" | awk '{print tolower($4)}')" in
+    *tcp*) OVPN_PROTO=tcp ;;
+    *)     OVPN_PROTO=udp ;;   # OpenVPN default is udp
+  esac
+  _oport="${_pport:-${_rport:-1194}}"; case "$_oport" in ''|*[!0-9]*) _oport=1194 ;; esac
+  if grep -iqE '^[[:space:]]*tls-crypt(-v2)?[[:space:]]|^[[:space:]]*<tls-crypt(-v2)?>' "$OVPN_CONFIG" 2>/dev/null; then OVPN_TLS_CRYPT=1; else OVPN_TLS_CRYPT=0; fi
+  if grep -iqE '^[[:space:]]*tls-auth[[:space:]]|^[[:space:]]*<tls-auth>' "$OVPN_CONFIG" 2>/dev/null; then OVPN_TLS_AUTH=1; else OVPN_TLS_AUTH=0; fi
+  if printf '%s\n' "$_ovpn_dirs" | grep -iqE '^[[:space:]]*(scramble|xormask|xor-?patch|obfuscate)'; then OVPN_OBFS=1; else OVPN_OBFS=0; fi
+  OPENVPN_HOST=$(_safe "${_rhost:-${VPN_HOST:-}}")
+  OPENVPN_PORT_UDP="$_oport"; OPENVPN_PORT_TCP="$_oport"
+  [ -z "${VPN_HOST:-}" ] && [ -n "$_rhost" ] && VPN_HOST=$(_safe "$_rhost")
+  [ -z "${ONLY_PROBES:-}" ] && ONLY_PROBES="env,dns,openvpn"
+  printf '%s\n' "note: --ovpn-config parsed — OpenVPN endpoint on ${OVPN_PROTO}/${_oport}; posture tls-crypt=${OVPN_TLS_CRYPT} tls-auth=${OVPN_TLS_AUTH} obfs=${OVPN_OBFS} (inline CA/cert/key/tls-crypt secrets are never printed)" >&2
+  unset _ovpn_dirs _r _rhost _rport _pport _oport
+fi
+
 # --port-survey: curated list of common alt-VPN/proxy ports, merged into
 # COMPARE_PORT so the compare matrix picks them up. Doesn't override an
 # explicit --compare-port, just extends it.
@@ -831,6 +867,16 @@ UDP_QUIC_BASELINE=""    # QUIC VN result for the known baseline host (vn/respons
 UDP_QUIC_TARGET=""      # QUIC VN result for the target (Hysteria2 server); "" when no UDP endpoint to test
 UDP_QUIC_VERDICT=""     # net-blocked / net-ok / target-quic / net-ok-target-silent
 OPENVPN_HANDSHAKE=""     # raw 2-hex-byte response or empty
+OPENVPN_HS_REPLIED=0     # 1 when the server answered the anonymous reset (opcode 0x40)
+# OpenVPN posture from --ovpn-config (parsed EARLIER, before this block) — `:-` so we
+# keep the parsed values and don't clobber them (see the v1.5.2 --outbound leak fix).
+OVPN_CONFIG="${OVPN_CONFIG:-}"           # path to a .ovpn profile, if given
+OVPN_PROTO="${OVPN_PROTO:-}"             # tcp | udp (generic; from the profile)
+OVPN_TLS_CRYPT="${OVPN_TLS_CRYPT:-}"     # 1 | 0 | "" (unknown — no config)
+OVPN_TLS_AUTH="${OVPN_TLS_AUTH:-}"       # 1 | 0 | ""
+OVPN_OBFS="${OVPN_OBFS:-}"               # 1 | 0 | "" (scramble/xor/obfs fork)
+OVPN_POSTURE="${OVPN_POSTURE:-}"         # wrapped|probe-resistant|hmac-only|exposed
+OVPN_FINGERPRINTABLE="${OVPN_FINGERPRINTABLE:-}"  # yes|partial|no|""
 CONTROL_PASS=0
 CONTROL_TOTAL=0
 CONTROL_BLOCKED=""
@@ -2262,8 +2308,27 @@ probe_udp_protocols() {
   fi
 }
 
+# Pure: OpenVPN control-channel fingerprintability from its posture knobs, ordered
+# most-hardened first. Echoes a class the probe maps to a verdict/recommendation.
+#   wrapped          obfuscation layer (scramble/xor/stunnel) — opcode AND the
+#                    handshake traffic-shape are hidden; best against DPI.
+#   probe-resistant  tls-crypt(-v2) — control channel encrypted, so the opcode is
+#                    hidden and an anonymous active probe is refused. Residual: the
+#                    opening handshake's packet length/timing burst is still a tell.
+#   hmac-only        tls-auth — the HMAC drops an anonymous probe, but the opcode
+#                    is still CLEARTEXT, so a passive opcode fingerprint still flags it.
+#   exposed          neither — cleartext opcode AND the server answers an anonymous
+#                    reset → trivial passive + active fingerprint (USENIX'22).
+_ovpn_fingerprintability() {
+  local tls_crypt="$1" tls_auth="$2" obfs="$3"
+  if [ "$obfs" = "1" ];      then echo "wrapped";         return 0; fi
+  if [ "$tls_crypt" = "1" ]; then echo "probe-resistant"; return 0; fi
+  if [ "$tls_auth" = "1" ];  then echo "hmac-only";       return 0; fi
+  echo "exposed"
+}
+
 probe_openvpn() {
-  hdr "7. OpenVPN reachability + handshake"
+  hdr "7. OpenVPN reachability + posture"
 
   if nc -uz -w "$TIMEOUT" "$OPENVPN_HOST" "$OPENVPN_PORT_UDP" 2>/dev/null; then
     ok "UDP $OPENVPN_PORT_UDP (OpenVPN UDP) port accessible"
@@ -2296,15 +2361,30 @@ probe_openvpn() {
     OPENVPN_HANDSHAKE="$response"
     if [ -n "$response" ]; then
       if [ "${response:0:2}" = "40" ]; then
-        ok "OpenVPN handshake replied (server opcode 0x40 received)"
+        OPENVPN_HS_REPLIED=1
+        # A reply to an UNAUTHENTICATED reset means no tls-crypt/tls-auth is enforced
+        # on this port: reachability is GOOD, but stealth is BAD — the endpoint is
+        # confirmable by the exact active probe a censor uses (USENIX'22) and
+        # enumerable by anyone. The old wording ("handshake replied = good") missed this.
+        ok "OpenVPN server replied to an anonymous reset (opcode 0x40) — reachable"
+        info "but answering an unauthenticated probe means the endpoint is active-probe fingerprintable"
+        [ "${OVPN_TLS_CRYPT:-}" = "1" ] && warn "the profile declares tls-crypt, yet this port answered an unauthenticated reset — tls-crypt may not be active here"
+        add_verdict "OpenVPN answers an unauthenticated HARD_RESET (no tls-crypt/tls-auth in force) — a censor's active prober confirms it is OpenVPN on sight and anyone can enumerate the endpoint (USENIX'22 'OpenVPN is Open to VPN Fingerprinting'). Enable tls-crypt-v2 to encrypt the control channel and refuse anonymous probes"
       else
         warn "got data back but not OpenVPN-shaped: $response"
       fi
     else
       if [ "$OPENVPN_UDP_OK" = "1" ]; then
-        warn "no OpenVPN handshake reply – inconclusive (DPI, no service, or tls-auth/tls-crypt)"
-        if [ "$STRICT_OPENVPN_VERDICT" = "1" ]; then
-          add_verdict "OpenVPN handshake silently dropped – protocol-signature DPI"
+        # Silence with the port open is AMBIGUOUS. If the profile carries an auth
+        # layer, silence is EXPECTED (tls-crypt/tls-auth correctly drops the
+        # unauthenticated probe) — the probe-resistant posture, NOT a block.
+        if [ "${OVPN_TLS_CRYPT:-}" = "1" ] || [ "${OVPN_TLS_AUTH:-}" = "1" ]; then
+          ok "no reply to the anonymous probe — EXPECTED: the profile's tls-crypt/tls-auth refuses it (probe-resistant, not a block)"
+        else
+          warn "no OpenVPN handshake reply – inconclusive (DPI, no service, or an undeclared tls-auth/tls-crypt)"
+          if [ "$STRICT_OPENVPN_VERDICT" = "1" ]; then
+            add_verdict "OpenVPN handshake silently dropped – protocol-signature DPI"
+          fi
         fi
       else
         info "no reply (UDP port likely blocked, see above)"
@@ -2316,6 +2396,36 @@ probe_openvpn() {
 
   if [ "$OPENVPN_TCP_OK" = "1" ] && [ "$TCP_OK" = "0" ]; then
     add_verdict "OpenVPN TCP port open but main port blocked → port/protocol-targeted"
+  fi
+
+  # ---- config fingerprintability posture (only when --ovpn-config was parsed) ----
+  if [ -n "${OVPN_CONFIG:-}" ]; then
+    OVPN_POSTURE=$(_ovpn_fingerprintability "${OVPN_TLS_CRYPT:-0}" "${OVPN_TLS_AUTH:-0}" "${OVPN_OBFS:-0}")
+    info "config posture: proto=${OVPN_PROTO:-?}/${OPENVPN_PORT_UDP} · tls-crypt=${OVPN_TLS_CRYPT:-?} · tls-auth=${OVPN_TLS_AUTH:-?} · obfs=${OVPN_OBFS:-?} → fingerprintability: ${OVPN_POSTURE}"
+    case "$OVPN_POSTURE" in
+      exposed)
+        OVPN_FINGERPRINTABLE="yes"
+        fail "control channel is unwrapped — cleartext opcode + answers active probes"
+        add_verdict "OpenVPN control channel is unwrapped (no tls-crypt/tls-auth): both the passive opcode fingerprint AND active probing identify it on sight (USENIX'22). Enable tls-crypt-v2 (encrypts the control channel, refuses active probes); in hostile-DPI regions wrap it in an obfuscation layer (stunnel / openvpn-scramble) or move to a Reality/Xray transport" ;;
+      hmac-only)
+        OVPN_FINGERPRINTABLE="yes"
+        warn "tls-auth only — refuses active probes, but the opcode is still cleartext"
+        add_verdict "OpenVPN uses tls-auth (HMAC): it refuses active probes, but the control-channel opcode is still sent in CLEARTEXT, so a passive opcode fingerprint still flags it. Upgrade tls-auth → tls-crypt-v2 to encrypt the control channel" ;;
+      probe-resistant)
+        OVPN_FINGERPRINTABLE="partial"
+        ok "tls-crypt encrypts the control channel — active-probe resistant"
+        info "residual tell: the opening handshake's packet length/timing burst is still OpenVPN-shaped to a passive classifier; an obfuscation wrapper (stunnel/scramble) removes it" ;;
+      wrapped)
+        OVPN_FINGERPRINTABLE="no"
+        ok "obfuscation layer present — control-channel opcode and handshake shape are hidden" ;;
+    esac
+    [ "$OPENVPN_PORT_UDP" = "1194" ] && info "port 1194 is the OpenVPN default → trivially port-blocked; 443/tcp blends with HTTPS"
+    [ "${OVPN_PROTO:-}" = "udp" ] && info "UDP is the first thing dropped in networks that block wholesale UDP — a 443/tcp fallback survives more restrictive vantages"
+    reveal "OpenVPN endpoint = ${OPENVPN_HOST}:${OPENVPN_PORT_UDP}/${OVPN_PROTO:-udp}"
+    # Honest scope (mirrors the Xray probes): one clean vantage sees port-blocks,
+    # active-drops, and config posture — NOT passive DPI classification or volumetric
+    # throttling, which need an in-region vantage or a live tunnel.
+    info "scope: one clean vantage reads reachability + active-probe response + config posture; passive DPI/throttling needs an in-region vantage"
   fi
 }
 
@@ -6492,6 +6602,14 @@ _emit_json() {
     --argjson openvpn_udp   "${OPENVPN_UDP_OK:-0}" \
     --argjson openvpn_tcp   "${OPENVPN_TCP_OK:-0}" \
     --arg openvpn_hs        "$OPENVPN_HANDSHAKE" \
+    --argjson openvpn_hs_replied "${OPENVPN_HS_REPLIED:-0}" \
+    --argjson openvpn_cfg   "$([ -n "${OVPN_CONFIG:-}" ] && echo 1 || echo 0)" \
+    --arg openvpn_proto     "${OVPN_PROTO:-}" \
+    --argjson openvpn_tlscrypt "${OVPN_TLS_CRYPT:--1}" \
+    --argjson openvpn_tlsauth  "${OVPN_TLS_AUTH:--1}" \
+    --argjson openvpn_obfs     "${OVPN_OBFS:--1}" \
+    --arg openvpn_posture   "${OVPN_POSTURE:-}" \
+    --arg openvpn_fp        "${OVPN_FINGERPRINTABLE:-}" \
     --argjson ctrl_pass     "${CONTROL_PASS:-0}" \
     --argjson ctrl_total    "${CONTROL_TOTAL:-0}" \
     --arg ctrl_blocked      "$CONTROL_BLOCKED" \
@@ -6716,7 +6834,15 @@ _emit_json() {
         openvpn: {
           udp_port_accessible: bool_int($openvpn_udp),
           tcp_port_reachable: bool_int($openvpn_tcp),
-          handshake_response_hex: opt($openvpn_hs)
+          handshake_response_hex: opt($openvpn_hs),
+          handshake_replied: bool_int($openvpn_hs_replied),
+          config_provided: bool_int($openvpn_cfg),
+          proto: opt($openvpn_proto),
+          tls_crypt: tri_bool($openvpn_tlscrypt),
+          tls_auth: tri_bool($openvpn_tlsauth),
+          obfuscated: tri_bool($openvpn_obfs),
+          posture: opt($openvpn_posture),
+          fingerprintable: opt($openvpn_fp)
         },
         control: {
           passed: $ctrl_pass,

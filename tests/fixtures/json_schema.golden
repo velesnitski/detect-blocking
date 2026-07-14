@@ -53,8 +53,16 @@ probes.ipv6.aaaa
 probes.ipv6.https_code
 probes.ipv6.target_reachable
 probes.openvpn
+probes.openvpn.config_provided
+probes.openvpn.fingerprintable
+probes.openvpn.handshake_replied
 probes.openvpn.handshake_response_hex
+probes.openvpn.obfuscated
+probes.openvpn.posture
+probes.openvpn.proto
 probes.openvpn.tcp_port_reachable
+probes.openvpn.tls_auth
+probes.openvpn.tls_crypt
 probes.openvpn.udp_port_accessible
 probes.panel_probe
 probes.panel_probe.panel_found

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-07-14
+
+### Added
+- **OpenVPN fingerprintability posture (probe 7 v2) + `--ovpn-config`.** Probe 7 now goes beyond port reachability: it reframes the active handshake through the censorship lens and, given a client profile, scores how fingerprintable the OpenVPN control channel is.
+  - **The handshake reply is now a *detectability* signal, not just liveness.** An OpenVPN server only answers an *anonymous* `HARD_RESET` when no `tls-crypt`/`tls-auth` is in force — which means it is confirmable by the exact active probe a censor uses ([USENIX '22, *"OpenVPN is Open to VPN Fingerprinting"*](https://www.usenix.org/conference/usenixsecurity22/presentation/xue-diwen)) and enumerable by anyone. A reply now raises a verdict; silence with the port open is treated as *ambiguous* (DPI drop / no service / a hardened server), and — when a profile declares `tls-crypt`/`tls-auth` — as the *expected, probe-resistant* posture rather than a block.
+  - **`--ovpn-config FILE`** parses an `.ovpn` for the endpoint (remote host/port/proto) and its posture (`tls-crypt`/`tls-crypt-v2`, `tls-auth`, obfuscation forks), then classifies fingerprintability as `wrapped` / `probe-resistant` / `hmac-only` / `exposed`, each with a concrete fix. The profile's inline `CA`/`cert`/`key`/`tls-crypt` secrets are stripped before parsing and are never printed; the endpoint host follows the normal rule (console header / `.target`).
+  - Runs with **no config at all** too — `--only openvpn <host>` infers the crypto posture from whether the server answers the anonymous probe. Port overridable via `OPENVPN_PORT_UDP` / `OPENVPN_PORT_TCP`.
+  - Additive JSON under `probes.openvpn`: `handshake_replied`, `config_provided`, `proto`, `tls_crypt`, `tls_auth`, `obfuscated`, `posture`, `fingerprintable` (booleans/enums, share-safe; existing fields unchanged). `schema_version` stays `1`.
+  - New pure helper `_ovpn_fingerprintability` (unit-tested) + `tests/test_openvpn_posture.sh`; README section added.
+
 ## [1.5.2] - 2026-07-13
 
 ### Fixed

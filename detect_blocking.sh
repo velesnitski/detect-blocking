@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="1.6.0"
+readonly DETECT_BLOCKING_VERSION="1.7.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -231,6 +231,7 @@ while [ $# -gt 0 ]; do
     --diff-baseline)   DIFF_BASELINE="${2:-}"; shift 2 ;;
     --diff-baseline=*) DIFF_BASELINE="${1#--diff-baseline=}"; shift ;;
     --reveal)      REVEAL=1; shift ;;
+    --via-tunnel)  VIA_TUNNEL=1; shift ;;
     --quiet|-q)    LOG_QUIET=1; shift ;;
     --json)        JSON_MODE=1; LOG_QUIET=1; shift ;;
     --version|-V)
@@ -240,7 +241,7 @@ while [ $# -gt 0 ]; do
     --help|-h)
       sed -n '2,39p' "$0"
       printf '\nversion: %s\n' "$DETECT_BLOCKING_VERSION"
-      printf '\nProbe names (for --only / --skip): env, dns, tcp, tls, ua, rst, udp, openvpn, control, ipv6, compare, xray, xrayjson\n'
+      printf '\nProbe names (for --only / --skip): env, tunnel, dns, tcp, tls, ua, rst, udp, openvpn, control, ipv6, compare, xray, xrayjson\n'
       printf '\nFlags:\n'
       printf '  --json (needs jq)   machine-readable JSON output (compact in batch/watch loops)\n'
       printf '  --quiet, -q         suppress stdout (logging still works)\n'
@@ -297,6 +298,8 @@ while [ $# -gt 0 ]; do
       printf '  --speedtest         force probe 14 (multi-stream capacity) even inside --watch/--from-file\n'
       printf '  --no-speedtest      disable probe 14 (it runs by default when probe 12 succeeds)\n'
       printf '  --no-egress-check   disable probe 16 (egress geo/reputation; avoids a 3rd-party IP-info call)\n'
+      printf '  --via-tunnel        force the VPN-tunnel-effectiveness probe (auto-runs when your default\n'
+      printf '                      route is a tunnel): compares egress through vs around the tunnel\n'
       printf '  --no-stability      disable probe 17 (held-session RST detection; it runs by default)\n'
       printf '  --stability         force probe 17 even inside --watch/--from-file loops\n'
       printf '  --no-fleet          disable probe 21 (it auto-enables on multi-outbound configs; N xray spawns)\n'
@@ -877,6 +880,12 @@ OVPN_TLS_AUTH="${OVPN_TLS_AUTH:-}"       # 1 | 0 | ""
 OVPN_OBFS="${OVPN_OBFS:-}"               # 1 | 0 | "" (scramble/xor/obfs fork)
 OVPN_POSTURE="${OVPN_POSTURE:-}"         # wrapped|probe-resistant|hmac-only|exposed
 OVPN_FINGERPRINTABLE="${OVPN_FINGERPRINTABLE:-}"  # yes|partial|no|""
+# VPN tunnel effectiveness (probe runs when the default route is a tunnel, or --via-tunnel)
+VIA_TUNNEL="${VIA_TUNNEL:-0}"            # 1 = force the tunnel probe even without a tunnel default route
+TUNNEL_STATUS=""                         # no-tunnel|captured|leak|captured-unverified|no-exit|skipped
+TUNNEL_DEFAULT_IS_TUN=0                  # 1 = default route egresses via a utun/tun/ppp/wg iface
+TUNNEL_EXIT_CC=""                        # ISO country of the egress seen THROUGH the tunnel
+TUNNEL_EXIT_DIFFERS=""                   # 1 tunnel changes egress · 0 same (leak) · "" unverified
 CONTROL_PASS=0
 CONTROL_TOTAL=0
 CONTROL_BLOCKED=""
@@ -2306,6 +2315,109 @@ probe_udp_protocols() {
   else
     info "no perl and no curl HTTP/3 — skipping QUIC / UDP-443 probe"
   fi
+}
+
+# Best-effort ACTIVE physical NIC to probe AROUND a full tunnel (echoes "" if none).
+# Requires a live carrier + a routable (non-link-local) IPv4 so we don't pick a
+# stale/self-assigned interface.
+_physical_iface() {
+  local i ip4
+  if [ "$(uname 2>/dev/null)" = "Darwin" ]; then
+    for i in $(ifconfig -l 2>/dev/null); do
+      case "$i" in
+        en*|bridge*)
+          ifconfig "$i" 2>/dev/null | grep -q 'status: active' || continue
+          ip4=$(ifconfig "$i" 2>/dev/null | awk '/inet /{print $2; exit}')
+          case "$ip4" in ''|169.254.*) continue ;; esac
+          printf '%s' "$i"; return 0 ;;
+      esac
+    done
+  else
+    ip -o -4 addr show up scope global 2>/dev/null | awk '{print $2}' \
+      | grep -Ev '^(utun|tun|tap|ppp|wg|ipsec|lo|docker|veth|br-)' | head -1
+  fi
+}
+
+# Public egress IP + ISO country on a given interface ("" = default path / through the
+# tunnel). Echoes "<ip>\t<cc>" or nothing. Uses HTTPS so an on-path censor can't spoof it.
+_egress_ip_cc() {
+  local j ip cc
+  command -v jq >/dev/null 2>&1 || return 0
+  if [ -n "${1:-}" ]; then j=$(_curl --interface "$1" https://ipinfo.io/json 2>/dev/null)
+  else                     j=$(_curl https://ipinfo.io/json 2>/dev/null); fi
+  ip=$(printf '%s' "$j" | jq -r '.ip // empty' 2>/dev/null)
+  cc=$(printf '%s' "$j" | jq -r '.country // empty' 2>/dev/null)
+  if [ -z "$ip" ]; then
+    if [ -n "${1:-}" ]; then j=$(_curl --interface "$1" https://ifconfig.co/json 2>/dev/null)
+    else                     j=$(_curl https://ifconfig.co/json 2>/dev/null); fi
+    ip=$(printf '%s' "$j" | jq -r '.ip // empty' 2>/dev/null)
+    cc=$(printf '%s' "$j" | jq -r '.country_iso // empty' 2>/dev/null)
+  fi
+  [ -n "$ip" ] && printf '%s\t%s' "$ip" "$cc"
+}
+
+# Pure: does the tunnel actually change our egress? through_ip vs around_ip →
+#   captured             (different IPs → tunnel carries our traffic)
+#   leak                 (same IP → traffic is NOT going through the tunnel)
+#   captured-unverified  (got the through-IP but couldn't probe the physical NIC)
+#   no-exit              (couldn't determine the egress at all)
+_tunnel_effect() {
+  local t="$1" a="$2"
+  [ -z "$t" ] && { echo "no-exit"; return 0; }
+  [ -z "$a" ] && { echo "captured-unverified"; return 0; }
+  [ "$t" = "$a" ] && { echo "leak"; return 0; }
+  echo "captured"
+}
+
+# VPN tunnel effectiveness — the "run detect-blocking while your VPN is up" probe.
+# When the default route egresses via a tunnel (or --via-tunnel is forced), it compares
+# the public egress THROUGH the tunnel vs AROUND it (bound to the physical NIC). Different
+# egress = the tunnel is really carrying your traffic (and where it exits); same egress =
+# a leak / split-tunnel / dead tunnel. No OpenVPN dependency, no root — just the routing
+# and the tunnel you already have up. Silent (no header) when there's no tunnel to report.
+probe_tunnel() {
+  local def_if is_tun=0 phys through around t_ip t_cc a_ip a_cc
+  def_if=$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')
+  [ -z "$def_if" ] && def_if=$(ip -o -4 route show default 2>/dev/null | awk '{print $5; exit}')
+  case "$def_if" in utun*|tun*|tap*|ppp*|wg*|ipsec*) is_tun=1 ;; esac
+  TUNNEL_DEFAULT_IS_TUN="$is_tun"
+
+  if [ "$is_tun" != "1" ] && [ "$VIA_TUNNEL" != "1" ]; then
+    TUNNEL_STATUS="no-tunnel"; return 0   # common case: stay silent, JSON still records it
+  fi
+
+  hdr "VPN tunnel effectiveness"
+  if ! command -v jq >/dev/null 2>&1; then
+    warn "jq not available — skipping tunnel effectiveness"; TUNNEL_STATUS="skipped"; return 0
+  fi
+
+  phys="$def_if"
+  case "$phys" in utun*|tun*|tap*|ppp*|wg*|ipsec*|'') phys=$(_physical_iface) ;; esac
+
+  through=$(_egress_ip_cc "")
+  t_ip=${through%%$'\t'*}; t_cc=${through#*$'\t'}; [ "$t_cc" = "$t_ip" ] && t_cc=""
+  around=""; [ -n "$phys" ] && around=$(_egress_ip_cc "$phys")
+  a_ip=${around%%$'\t'*}; a_cc=${around#*$'\t'}; [ "$a_cc" = "$a_ip" ] && a_cc=""
+
+  TUNNEL_EXIT_CC="$t_cc"
+  TUNNEL_STATUS=$(_tunnel_effect "$t_ip" "$a_ip")
+  case "$TUNNEL_STATUS" in
+    captured)
+      TUNNEL_EXIT_DIFFERS=1
+      ok "traffic exits THROUGH the tunnel — exit country ${t_cc:-?}$( [ -n "$a_cc" ] && printf ' (physical NIC would exit %s)' "$a_cc" )"
+      info "probes here run through the tunnel, so they see the EXIT's network, not your local one — to test your local blocking, probe around it (physical NIC)" ;;
+    leak)
+      TUNNEL_EXIT_DIFFERS=0
+      fail "your public IP is IDENTICAL with and without the tunnel — traffic is NOT going through it"
+      add_verdict "VPN tunnel is present but egress is unchanged vs the physical NIC — traffic is bypassing the tunnel (leak / split-tunnel / dead tunnel). Verify redirect-gateway and that the tunnel actually established" ;;
+    captured-unverified)
+      TUNNEL_EXIT_DIFFERS=""
+      info "current exit country: ${t_cc:-?}$( [ "$is_tun" = "1" ] && printf ' (default route is a tunnel)' )"
+      info "couldn't probe the physical NIC to compare (bind failed — likely policy routing or a nested VPN), so whether a tunnel is responsible is UNVERIFIED" ;;
+    no-exit)
+      warn "couldn't determine the public egress (no network, or the IP-echo lookup was blocked)" ;;
+  esac
+  reveal "exit IP = ${t_ip:-?} (through) | physical NIC IP = ${a_ip:-?} (${phys:-?})"
 }
 
 # Pure: OpenVPN control-channel fingerprintability from its posture knobs, ordered
@@ -6610,6 +6722,10 @@ _emit_json() {
     --argjson openvpn_obfs     "${OVPN_OBFS:--1}" \
     --arg openvpn_posture   "${OVPN_POSTURE:-}" \
     --arg openvpn_fp        "${OVPN_FINGERPRINTABLE:-}" \
+    --arg tunnel_status     "${TUNNEL_STATUS:-}" \
+    --argjson tunnel_is_tun "${TUNNEL_DEFAULT_IS_TUN:-0}" \
+    --arg tunnel_cc         "${TUNNEL_EXIT_CC:-}" \
+    --argjson tunnel_differs "${TUNNEL_EXIT_DIFFERS:--1}" \
     --argjson ctrl_pass     "${CONTROL_PASS:-0}" \
     --argjson ctrl_total    "${CONTROL_TOTAL:-0}" \
     --arg ctrl_blocked      "$CONTROL_BLOCKED" \
@@ -6843,6 +6959,12 @@ _emit_json() {
           obfuscated: tri_bool($openvpn_obfs),
           posture: opt($openvpn_posture),
           fingerprintable: opt($openvpn_fp)
+        },
+        tunnel: {
+          status: opt($tunnel_status),
+          default_iface_is_tunnel: bool_int($tunnel_is_tun),
+          exit_country: opt($tunnel_cc),
+          exit_differs: tri_bool($tunnel_differs)
         },
         control: {
           passed: $ctrl_pass,
@@ -7257,6 +7379,7 @@ fi
 unset _missing_optional
 
 _should_run env     && probe_environment
+_should_run tunnel  && probe_tunnel
 [ -n "$XRAY_SCAN_COVERS" ] && probe_cover_scan
 _should_run dns     && { probe_dns || true; }
 _should_run tcp     && probe_tcp_reachability

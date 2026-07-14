@@ -566,6 +566,29 @@ this reads reachability, active-probe response, and config posture — **not**
 passive DPI classification or volumetric throttling, which need an in-region
 vantage or a live tunnel.
 
+**Already connected? Just run it through the live tunnel.** If your VPN
+(OpenVPN or anything else) is already up, you don't need the config or a
+connect step — run detect-blocking normally and it measures what your traffic
+actually experiences. When your default route egresses through a tunnel (or you
+pass `--via-tunnel`), the **VPN tunnel effectiveness** probe compares your public
+egress *through* the tunnel vs *around* it (bound to the physical NIC):
+
+```bash
+~/Downloads/detect-blocking/detect_blocking.sh --via-tunnel
+```
+
+- Different egress → the tunnel really is carrying your traffic; it reports the
+  **exit country** (raw IP only under `--reveal`).
+- Same egress → a **leak / split-tunnel / dead tunnel** — traffic is bypassing it.
+- Couldn't bind the physical NIC (policy routing, nested VPNs) → it reports the
+  current exit and marks the tunnel question *unverified* rather than guessing.
+
+JSON: `probes.tunnel.{status, default_iface_is_tunnel, exit_country,
+exit_differs}`. **Caveat:** with the tunnel up, all the *other* probes run
+*through* it, so they see the exit's network, not your local one — the tunnel is
+hiding exactly the local censorship. To test your local blocking, probe from the
+suspect network directly.
+
 ### Happ deep links (`happ://`)
 
 [Happ](https://happ.su) is a popular client whose `happ://` deep links wrap

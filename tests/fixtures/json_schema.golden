@@ -86,6 +86,11 @@ probes.tls.fake_sni_ok
 probes.tls.fragmented_ok
 probes.tls.no_sni_ok
 probes.tls.proper_sni_ok
+probes.tunnel
+probes.tunnel.default_iface_is_tunnel
+probes.tunnel.exit_country
+probes.tunnel.exit_differs
+probes.tunnel.status
 probes.udp
 probes.udp.ike4500_responsive
 probes.udp.ike500_responsive

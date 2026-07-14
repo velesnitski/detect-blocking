@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-07-14
+
+### Added
+- **VPN tunnel effectiveness probe + `--via-tunnel` — "just run it while your VPN is up".** No config, no connect step, no external dependency: if your default route already egresses through a tunnel (or you pass `--via-tunnel`), the probe measures what your traffic actually experiences by comparing your public egress **through** the tunnel vs **around** it (a second lookup bound to the physical NIC via `curl --interface`).
+  - **Different egress → the tunnel is really carrying your traffic**; it reports the exit country (raw IP only under `--reveal`).
+  - **Same egress → a leak / split-tunnel / dead tunnel** — traffic is bypassing it (raises a verdict).
+  - **Couldn't bind the physical NIC** (policy routing / nested VPNs, where the NIC only reaches the internet *through* the tunnel) → reports the current exit and marks the tunnel question *unverified* instead of guessing.
+  - Auto-runs (silently) when the default route is a tunnel; otherwise a no-op unless `--via-tunnel` is given — a normal run isn't noisier and makes no extra network call when there's no tunnel.
+  - New pure helper `_tunnel_effect` (unit-tested) + `_physical_iface` / `_egress_ip_cc`; additive JSON `probes.tunnel.{status, default_iface_is_tunnel, exit_country, exit_differs}` (`schema_version` stays `1`); new `tests/test_tunnel_effect.sh`; README section.
+  - **Honest scope:** with the tunnel up, the *other* probes run through it, so they see the exit's network — the tunnel hides your local censorship. This probe answers "is my tunnel working and where does it exit," not "is my local network blocking the tunnel" (that needs probing the suspect network directly).
+
 ## [1.6.0] - 2026-07-14
 
 ### Added

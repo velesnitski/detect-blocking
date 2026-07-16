@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-07-16
+
+### Fixed
+- **Localization probe (`--localize`) false-positived "block localized to transit" on a REACHABLE target.** Forcing `--localize` on a host that answers TCP (e.g. `LOCALIZE_MAX_HOPS=7 … www.cloudflare.com`, which is farther than 7 hops) made the trace stop at the hop budget; the classifier read "didn't reach the target" as a block and blamed the last transit hop. Two guards added, both folded into the pure classifier (now takes `reachable` + `max_hops`): if the target is **reachable** (TCP ok) or the trace **hit the hop budget** (`last_hop >= max_hops`), the result is the new **`incomplete`** class — explicitly *not* a block, and no verdict is raised. Traceroute's final hops are frequently ICMP-filtered even to live hosts, so "trace didn't complete" ≠ "blocked." A genuine early death on an unreachable target still classifies as `access-edge` / `transit` / `near-destination` as before.
+
 ## [1.8.0] - 2026-07-16
 
 ### Added

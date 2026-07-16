@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="1.8.0"
+readonly DETECT_BLOCKING_VERSION="1.8.1"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -2365,16 +2365,22 @@ EOF
   printf '%s\t%s\t%s' "${last_hop:-0}" "${last_ip:-}" "$reached"
 }
 
-# Pure: where does the block sit, from the trace result + hop/target countries?
+# Pure: where does the block sit, from the trace result + reachability + hop budget?
 #   endpoint          reached the target → path is clear, block is at the endpoint/DPI
-#   access-edge       died within the first 3 hops → your access network / ISP edge
-#   near-destination  died in the target's own country → block at/near the destination
-#   transit           died mid-path elsewhere → a national/transit-level filter
+#   incomplete        target is REACHABLE (TCP ok) or the trace hit the hop budget →
+#                     the trace just didn't finish; this is NOT a block
+#   access-edge       genuinely died within the first 3 hops → your ISP / access edge
+#   near-destination  genuinely died in the target's own country → at/near destination
+#   transit           genuinely died mid-path elsewhere → a national/transit filter
 #   unknown           no usable hops (ICMP filtered/rate-limited)
+# `reachable`=1 (target answers TCP) and last_hop>=max_hops both mean "didn't complete",
+# NOT "blocked" — traceroute's final hops are frequently ICMP-filtered even to live hosts.
 _localize_class() {
-  local reached="$1" last_hop="$2" last_cc="$3" target_cc="$4"
+  local reached="$1" reachable="$2" last_hop="$3" max_hops="$4" last_cc="$5" target_cc="$6"
   if [ "$reached" = "1" ]; then echo "endpoint"; return 0; fi
   case "$last_hop" in ''|0|*[!0-9]*) echo "unknown"; return 0 ;; esac
+  if [ "$reachable" = "1" ]; then echo "incomplete"; return 0; fi
+  case "$max_hops" in ''|*[!0-9]*) : ;; *) [ "$last_hop" -ge "$max_hops" ] && { echo "incomplete"; return 0; } ;; esac
   if [ "$last_hop" -le 3 ]; then echo "access-edge"; return 0; fi
   if [ -n "$last_cc" ] && [ "$last_cc" = "$target_cc" ]; then echo "near-destination"; return 0; fi
   echo "transit"
@@ -2398,12 +2404,19 @@ probe_localize() {
   last_hop=${scan%%$'\t'*}; scan=${scan#*$'\t'}; last_ip=${scan%%$'\t'*}; reached=${scan##*$'\t'}
   hopinfo=$(_hop_info "$last_ip"); asn=${hopinfo%%$'\t'*}; cc=${hopinfo##*$'\t'}
   target_cc=""; [ "$reached" != "1" ] && { target_cc=$(_hop_info "$RESOLVED_IP"); target_cc=${target_cc##*$'\t'}; }
+  local reachable=0; [ "${TCP_OK:-0}" = "1" ] && reachable=1
   LOCALIZE_STATUS="ran"; LOCALIZE_LAST_HOP="$last_hop"; LOCALIZE_LAST_ASN="$asn"
   LOCALIZE_LAST_CC="$cc"; LOCALIZE_REACHED="$reached"
-  LOCALIZE_CLASS=$(_localize_class "$reached" "$last_hop" "$cc" "$target_cc")
+  LOCALIZE_CLASS=$(_localize_class "$reached" "$reachable" "$last_hop" "${LOCALIZE_MAX_HOPS:-20}" "$cc" "$target_cc")
   case "$LOCALIZE_CLASS" in
     endpoint)
       ok "the path REACHES the target — the block is at the endpoint / DPI, not a network-path drop (consistent with SNI or protocol filtering, or a stateful reset)" ;;
+    incomplete)
+      if [ "$reachable" = "1" ]; then
+        ok "the target is REACHABLE (TCP ok) — no block to localize; the trace just didn't reach it (its final hops are ICMP-filtered, common even for live hosts)"
+      else
+        info "the trace ran out of hop budget at hop ${last_hop} (raise LOCALIZE_MAX_HOPS) — didn't reach the target, so localization is inconclusive, NOT a confirmed block"
+      fi ;;
     access-edge)
       fail "the path dies after only ${last_hop} hop(s) — the block is very close to you (your access network / ISP edge)"
       add_verdict "Block localized to the access edge: the path to the target dies after ${last_hop} hop(s)$( [ -n "$asn" ] && printf ' at %s' "$asn")$( [ -n "$cc" ] && printf ' (%s)' "$cc") — the filtering is in your local/ISP network, not upstream" ;;

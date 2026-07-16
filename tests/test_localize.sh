@@ -11,14 +11,18 @@ SCRIPT="$SCRIPT_DIR/detect_blocking.sh"
 fail() { printf 'FAIL: %s\n' "$1" >&2; printf '%s\n' "${out:-}" >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "SKIP: jq not installed"; exit 0; }
 
-# ---- unit: the pure classifier (reached, last_hop, last_cc, target_cc) → class ----
+# ---- unit: the pure classifier (reached, reachable, last_hop, max_hops, last_cc, target_cc) ----
 eval "$(awk '/^_localize_class\(\)/,/^}/' "$SCRIPT")"
-[ "$(_localize_class 1 20 US US)" = "endpoint" ]         || fail "reached target → endpoint"
-[ "$(_localize_class 0 2  ''  '')" = "access-edge" ]      || fail "dies within 3 hops → access-edge"
-[ "$(_localize_class 0 14 DE DE)" = "near-destination" ] || fail "dies in target's country → near-destination"
-[ "$(_localize_class 0 8  NL DE)" = "transit" ]          || fail "dies mid-path elsewhere → transit"
-[ "$(_localize_class 0 0  ''  '')" = "unknown" ]         || fail "no hops → unknown"
-[ "$(_localize_class 0 '' ''  '')" = "unknown" ]         || fail "empty hop → unknown"
+[ "$(_localize_class 1 0 20 20 US US)" = "endpoint" ]         || fail "reached target → endpoint"
+[ "$(_localize_class 0 0 2  20 ''  '')" = "access-edge" ]      || fail "genuinely dies within 3 hops → access-edge"
+[ "$(_localize_class 0 0 14 20 DE DE)" = "near-destination" ] || fail "genuinely dies in target's country → near-destination"
+[ "$(_localize_class 0 0 8  20 NL DE)" = "transit" ]          || fail "genuinely dies mid-path elsewhere → transit"
+[ "$(_localize_class 0 0 0  20 ''  '')" = "unknown" ]         || fail "no hops → unknown"
+[ "$(_localize_class 0 0 '' 20 ''  '')" = "unknown" ]         || fail "empty hop → unknown"
+# the false-positive guards (the www.cloudflare.com --localize case):
+[ "$(_localize_class 0 1 7  20 DE US)" = "incomplete" ]      || fail "target REACHABLE but trace didn't finish → incomplete, NOT transit"
+[ "$(_localize_class 0 0 7  7  DE US)" = "incomplete" ]      || fail "trace hit the hop budget (last_hop>=max) → incomplete, NOT transit"
+[ "$(_localize_class 0 1 7  7  DE US)" = "incomplete" ]      || fail "reachable + hop budget → incomplete"
 
 # ---- additive JSON block: present with null defaults when the probe isn't selected ----
 out=$(TIMEOUT=3 bash "$SCRIPT" --only dns,tcp 127.0.0.1 --json 2>/dev/null)

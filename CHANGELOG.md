@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-07-16
+
+### Added
+- **Censorship localization probe + `--localize` — *where* does the block sit?** Detecting *that* you're blocked is half the answer; this locates the apparatus. When the target is TCP-unreachable (or you pass `--localize`), a bounded, unprivileged UDP traceroute finds the last responding hop and resolves its ASN/country to classify where the path dies:
+  - `access-edge` — within the first few hops → your **local / ISP** network
+  - `transit` — mid-route in another network → an **upstream (national / transit)** filter (raises a verdict)
+  - `near-destination` — inside the target's own country → **at/near the destination**
+  - `endpoint` — the path **reaches** the target → not a path drop; the block is at the endpoint/DPI (SNI/protocol filtering, or a stateful reset)
+  - `unknown` — traceroute too dark to read (ICMP rate-limited/filtered inside censored networks — best-effort by nature)
+  - Borrows the traceroute + ASN-enrichment *approach* (the on-mission slice of path tooling like `mtr`/`ttl`) without a compiled dependency — pure Bash + the existing ASN lookup. No root (UDP traceroute), bounded (~`LOCALIZE_MAX_HOPS`, default 20, seconds worst case).
+  - **Share-safe:** only the hop's ASN, country, and number are shown; raw hop IPs appear solely under `--reveal`.
+  - New pure helper `_localize_class` (unit-tested) + `_traceroute_scan` / `_hop_info`; additive JSON `probes.localize.{status, class, last_hop, last_hop_asn, last_hop_country, reached_destination}` (`schema_version` stays `1`); new `tests/test_localize.sh`; README section.
+
 ## [1.7.0] - 2026-07-14
 
 ### Added

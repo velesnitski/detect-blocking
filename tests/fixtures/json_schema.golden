@@ -52,6 +52,13 @@ probes.ipv6
 probes.ipv6.aaaa
 probes.ipv6.https_code
 probes.ipv6.target_reachable
+probes.localize
+probes.localize.class
+probes.localize.last_hop
+probes.localize.last_hop_asn
+probes.localize.last_hop_country
+probes.localize.reached_destination
+probes.localize.status
 probes.openvpn
 probes.openvpn.config_provided
 probes.openvpn.fingerprintable

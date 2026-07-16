@@ -589,6 +589,32 @@ exit_differs}`. **Caveat:** with the tunnel up, all the *other* probes run
 hiding exactly the local censorship. To test your local blocking, probe from the
 suspect network directly.
 
+### Localizing a block — *where* is it (`--localize`)
+
+Knowing you're blocked is half the story; **where** the block sits tells you who's
+doing it. When the target is unreachable (or you pass `--localize`), a bounded
+traceroute finds the last responding hop, and its ASN/country localizes the
+apparatus:
+
+```bash
+./detect_blocking.sh --localize your.endpoint.example      # or any target
+```
+
+| class | meaning |
+| --- | --- |
+| `access-edge` | path dies within the first few hops → your **local / ISP** network |
+| `transit` | dies mid-route in another network → an **upstream (national / transit)** filter |
+| `near-destination` | dies inside the target's own country → block **at/near the destination** |
+| `endpoint` | the path **reaches** the target → it's not a path drop; the block is at the endpoint/DPI (SNI/protocol filtering, or a stateful reset) |
+
+It auto-runs when the target is TCP-unreachable, uses unprivileged UDP traceroute
+(no root), and is **share-safe** — only the hop's ASN, country, and number are
+shown; raw hop IPs appear solely under `--reveal`. JSON:
+`probes.localize.{status, class, last_hop, last_hop_asn, last_hop_country,
+reached_destination}`. Caveat: traceroute is often rate-limited or filtered inside
+censored networks, so localization is best-effort (`class: unknown` when the path
+is too dark to read).
+
 ### Happ deep links (`happ://`)
 
 [Happ](https://happ.su) is a popular client whose `happ://` deep links wrap

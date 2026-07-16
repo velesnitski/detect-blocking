@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="1.7.0"
+readonly DETECT_BLOCKING_VERSION="1.8.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -232,6 +232,7 @@ while [ $# -gt 0 ]; do
     --diff-baseline=*) DIFF_BASELINE="${1#--diff-baseline=}"; shift ;;
     --reveal)      REVEAL=1; shift ;;
     --via-tunnel)  VIA_TUNNEL=1; shift ;;
+    --localize)    LOCALIZE=1; shift ;;
     --quiet|-q)    LOG_QUIET=1; shift ;;
     --json)        JSON_MODE=1; LOG_QUIET=1; shift ;;
     --version|-V)
@@ -241,7 +242,7 @@ while [ $# -gt 0 ]; do
     --help|-h)
       sed -n '2,39p' "$0"
       printf '\nversion: %s\n' "$DETECT_BLOCKING_VERSION"
-      printf '\nProbe names (for --only / --skip): env, tunnel, dns, tcp, tls, ua, rst, udp, openvpn, control, ipv6, compare, xray, xrayjson\n'
+      printf '\nProbe names (for --only / --skip): env, tunnel, dns, tcp, tls, ua, rst, udp, openvpn, control, localize, ipv6, compare, xray, xrayjson\n'
       printf '\nFlags:\n'
       printf '  --json (needs jq)   machine-readable JSON output (compact in batch/watch loops)\n'
       printf '  --quiet, -q         suppress stdout (logging still works)\n'
@@ -300,6 +301,9 @@ while [ $# -gt 0 ]; do
       printf '  --no-egress-check   disable probe 16 (egress geo/reputation; avoids a 3rd-party IP-info call)\n'
       printf '  --via-tunnel        force the VPN-tunnel-effectiveness probe (auto-runs when your default\n'
       printf '                      route is a tunnel): compares egress through vs around the tunnel\n'
+      printf '  --localize          force the censorship-localization probe (auto-runs when the target is\n'
+      printf '                      TCP-unreachable): bounded traceroute + ASN/geo of the last hop to\n'
+      printf '                      locate the block (ISP edge / transit / near-destination / endpoint)\n'
       printf '  --no-stability      disable probe 17 (held-session RST detection; it runs by default)\n'
       printf '  --stability         force probe 17 even inside --watch/--from-file loops\n'
       printf '  --no-fleet          disable probe 21 (it auto-enables on multi-outbound configs; N xray spawns)\n'
@@ -886,6 +890,15 @@ TUNNEL_STATUS=""                         # no-tunnel|captured|leak|captured-unve
 TUNNEL_DEFAULT_IS_TUN=0                  # 1 = default route egresses via a utun/tun/ppp/wg iface
 TUNNEL_EXIT_CC=""                        # ISO country of the egress seen THROUGH the tunnel
 TUNNEL_EXIT_DIFFERS=""                   # 1 tunnel changes egress · 0 same (leak) · "" unverified
+# Censorship localization (where does the block sit?) — auto-runs when the target is
+# TCP-unreachable, or forced with --localize. Bounded traceroute + ASN/geo of the last hop.
+LOCALIZE="${LOCALIZE:-0}"                 # 1 = force the localization probe
+LOCALIZE_STATUS=""                       # ran|ipv6-skip|no-traceroute|"" (not run)
+LOCALIZE_CLASS=""                        # endpoint|access-edge|transit|near-destination|unknown
+LOCALIZE_LAST_HOP=""                     # hop number of the last responding hop
+LOCALIZE_LAST_ASN=""                     # ASN of that hop
+LOCALIZE_LAST_CC=""                      # country of that hop
+LOCALIZE_REACHED=""                      # 1 = traceroute reached the target IP · 0 = died earlier
 CONTROL_PASS=0
 CONTROL_TOTAL=0
 CONTROL_BLOCKED=""
@@ -2315,6 +2328,94 @@ probe_udp_protocols() {
   else
     info "no perl and no curl HTTP/3 — skipping QUIC / UDP-443 probe"
   fi
+}
+
+# ASN + ISO country for an IP in one lookup: echoes "ASxxxx\t<CC>" (either may be empty).
+# HTTPS-first (an on-path censor could spoof plaintext ip-api), ip-api HTTP as fallback.
+_hop_info() {
+  local ip="$1" j as cc
+  [ -n "$ip" ] || return 0
+  j=$(_curl "https://ipinfo.io/${ip}/json" 2>/dev/null)
+  as=$(printf '%s' "$j" | sed -nE 's/.*"org":[[:space:]]*"(AS[0-9]+).*/\1/p' | head -1)
+  cc=$(printf '%s' "$j" | sed -nE 's/.*"country":[[:space:]]*"([A-Z][A-Z])".*/\1/p' | head -1)
+  if [ -z "$as" ] && [ -z "$cc" ]; then
+    j=$(_curl "http://ip-api.com/json/${ip}?fields=as,countryCode" 2>/dev/null)
+    as=$(printf '%s' "$j" | sed -nE 's/.*"as":"(AS[0-9]+).*/\1/p' | head -1)
+    cc=$(printf '%s' "$j" | sed -nE 's/.*"countryCode":"([A-Z][A-Z])".*/\1/p' | head -1)
+  fi
+  printf '%s\t%s' "${as:-}" "${cc:-}"
+}
+
+# Bounded traceroute to an IPv4 target; echoes "<last_responding_hop>\t<last_ip>\t<reached>"
+# where reached=1 iff the trace hit the target itself. Uses UDP (unprivileged) + numeric
+# (-n) so it needs no DNS and no root. Worst case ~max_hops * wait seconds (all hops dark).
+_traceroute_scan() {
+  local target="$1" maxh="$2" out line hop ip last_hop="" last_ip="" reached=0
+  out=$(traceroute -n -w "${LOCALIZE_WAIT:-1}" -q 1 -m "$maxh" "$target" 2>/dev/null)
+  while IFS= read -r line; do
+    hop=$(printf '%s' "$line" | awk '{print $1}')
+    case "$hop" in ''|*[!0-9]*) continue ;; esac       # skip the banner / non-hop lines
+    ip=$(printf '%s' "$line" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
+    [ -z "$ip" ] && continue                           # a "* * *" (no reply) hop
+    last_hop="$hop"; last_ip="$ip"
+    [ "$ip" = "$target" ] && reached=1
+  done <<EOF
+$out
+EOF
+  printf '%s\t%s\t%s' "${last_hop:-0}" "${last_ip:-}" "$reached"
+}
+
+# Pure: where does the block sit, from the trace result + hop/target countries?
+#   endpoint          reached the target → path is clear, block is at the endpoint/DPI
+#   access-edge       died within the first 3 hops → your access network / ISP edge
+#   near-destination  died in the target's own country → block at/near the destination
+#   transit           died mid-path elsewhere → a national/transit-level filter
+#   unknown           no usable hops (ICMP filtered/rate-limited)
+_localize_class() {
+  local reached="$1" last_hop="$2" last_cc="$3" target_cc="$4"
+  if [ "$reached" = "1" ]; then echo "endpoint"; return 0; fi
+  case "$last_hop" in ''|0|*[!0-9]*) echo "unknown"; return 0 ;; esac
+  if [ "$last_hop" -le 3 ]; then echo "access-edge"; return 0; fi
+  if [ -n "$last_cc" ] && [ "$last_cc" = "$target_cc" ]; then echo "near-destination"; return 0; fi
+  echo "transit"
+}
+
+# Censorship localization — when the target is blocked, WHERE is the block? A bounded
+# traceroute finds the last responding hop; its ASN/country (+ whether the trace reached
+# the target) localizes the apparatus: your ISP edge, a transit/national filter, or the
+# destination side. Runs only when the target is TCP-unreachable or --localize is given.
+# Share-safe: ASN / country / hop-number only; raw hop IPs solely under --reveal.
+probe_localize() {
+  if [ "${TCP_OK:-1}" != "0" ] && [ "${LOCALIZE:-0}" != "1" ]; then return 0; fi   # silent no-op
+  [ -n "${RESOLVED_IP:-}" ] || return 0
+  case "$RESOLVED_IP" in *:*) LOCALIZE_STATUS="ipv6-skip"; return 0 ;; esac          # IPv4 only for now
+  if ! check_cmd traceroute; then LOCALIZE_STATUS="no-traceroute"; return 0; fi
+
+  hdr "Censorship localization (path)"
+  info "tracing the path to the target to locate where the block sits (bounded, ~${LOCALIZE_MAX_HOPS:-20}s worst case)"
+  local scan last_hop last_ip reached hopinfo asn cc target_cc
+  scan=$(_traceroute_scan "$RESOLVED_IP" "${LOCALIZE_MAX_HOPS:-20}")
+  last_hop=${scan%%$'\t'*}; scan=${scan#*$'\t'}; last_ip=${scan%%$'\t'*}; reached=${scan##*$'\t'}
+  hopinfo=$(_hop_info "$last_ip"); asn=${hopinfo%%$'\t'*}; cc=${hopinfo##*$'\t'}
+  target_cc=""; [ "$reached" != "1" ] && { target_cc=$(_hop_info "$RESOLVED_IP"); target_cc=${target_cc##*$'\t'}; }
+  LOCALIZE_STATUS="ran"; LOCALIZE_LAST_HOP="$last_hop"; LOCALIZE_LAST_ASN="$asn"
+  LOCALIZE_LAST_CC="$cc"; LOCALIZE_REACHED="$reached"
+  LOCALIZE_CLASS=$(_localize_class "$reached" "$last_hop" "$cc" "$target_cc")
+  case "$LOCALIZE_CLASS" in
+    endpoint)
+      ok "the path REACHES the target — the block is at the endpoint / DPI, not a network-path drop (consistent with SNI or protocol filtering, or a stateful reset)" ;;
+    access-edge)
+      fail "the path dies after only ${last_hop} hop(s) — the block is very close to you (your access network / ISP edge)"
+      add_verdict "Block localized to the access edge: the path to the target dies after ${last_hop} hop(s)$( [ -n "$asn" ] && printf ' at %s' "$asn")$( [ -n "$cc" ] && printf ' (%s)' "$cc") — the filtering is in your local/ISP network, not upstream" ;;
+    near-destination)
+      warn "the path dies at hop ${last_hop} inside the destination's own network${asn:+ ($asn${cc:+, $cc})} — the block is at/near the destination side" ;;
+    transit)
+      warn "the path dies at hop ${last_hop} in transit${asn:+ ($asn${cc:+, $cc})} — a mid-path drop, consistent with a national / transit-level filter"
+      add_verdict "Block localized to transit: the path dies mid-route at hop ${last_hop}${asn:+ ($asn${cc:+, $cc})}, before reaching the target — consistent with an upstream (national / transit) filter rather than a local or endpoint block" ;;
+    unknown)
+      info "traceroute returned no usable hops (ICMP likely rate-limited or filtered) — localization inconclusive" ;;
+  esac
+  reveal "last responding hop = ${last_ip:-?} (hop ${last_hop:-?}), reached_target=${reached}"
 }
 
 # Best-effort ACTIVE physical NIC to probe AROUND a full tunnel (echoes "" if none).
@@ -6726,6 +6827,12 @@ _emit_json() {
     --argjson tunnel_is_tun "${TUNNEL_DEFAULT_IS_TUN:-0}" \
     --arg tunnel_cc         "${TUNNEL_EXIT_CC:-}" \
     --argjson tunnel_differs "${TUNNEL_EXIT_DIFFERS:--1}" \
+    --arg loc_status        "${LOCALIZE_STATUS:-}" \
+    --arg loc_class         "${LOCALIZE_CLASS:-}" \
+    --arg loc_last_hop      "${LOCALIZE_LAST_HOP:-}" \
+    --arg loc_last_asn      "${LOCALIZE_LAST_ASN:-}" \
+    --arg loc_last_cc       "${LOCALIZE_LAST_CC:-}" \
+    --argjson loc_reached   "${LOCALIZE_REACHED:--1}" \
     --argjson ctrl_pass     "${CONTROL_PASS:-0}" \
     --argjson ctrl_total    "${CONTROL_TOTAL:-0}" \
     --arg ctrl_blocked      "$CONTROL_BLOCKED" \
@@ -6965,6 +7072,14 @@ _emit_json() {
           default_iface_is_tunnel: bool_int($tunnel_is_tun),
           exit_country: opt($tunnel_cc),
           exit_differs: tri_bool($tunnel_differs)
+        },
+        localize: {
+          status: opt($loc_status),
+          class: opt($loc_class),
+          last_hop: (if $loc_last_hop == "" then null else ($loc_last_hop | tonumber? // null) end),
+          last_hop_asn: opt($loc_last_asn),
+          last_hop_country: opt($loc_last_cc),
+          reached_destination: tri_bool($loc_reached)
         },
         control: {
           passed: $ctrl_pass,
@@ -7389,6 +7504,7 @@ _should_run rst     && probe_rst_injection
 _should_run udp     && probe_udp_protocols
 _should_run openvpn && probe_openvpn
 _should_run control && probe_known_blocked
+_should_run localize && probe_localize
 _should_run ipv6    && probe_ipv6
 _should_run compare && probe_compare_matrix
 

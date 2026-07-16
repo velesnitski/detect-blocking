@@ -23,6 +23,8 @@ eval "$(awk '/^_localize_class\(\)/,/^}/' "$SCRIPT")"
 [ "$(_localize_class 0 1 7  20 DE US)" = "incomplete" ]      || fail "target REACHABLE but trace didn't finish → incomplete, NOT transit"
 [ "$(_localize_class 0 0 7  7  DE US)" = "incomplete" ]      || fail "trace hit the hop budget (last_hop>=max) → incomplete, NOT transit"
 [ "$(_localize_class 0 1 7  7  DE US)" = "incomplete" ]      || fail "reachable + hop budget → incomplete"
+[ "$(_localize_class 0 1 0  20 ''  '')" = "incomplete" ]     || fail "reachable + zero hops (ICMP fully filtered) → incomplete, NOT unknown"
+[ "$(_localize_class 0 0 0  20 ''  '')" = "unknown" ]        || fail "unreachable + zero hops → unknown (genuinely inconclusive)"
 
 # ---- additive JSON block: present with null defaults when the probe isn't selected ----
 out=$(TIMEOUT=3 bash "$SCRIPT" --only dns,tcp 127.0.0.1 --json 2>/dev/null)

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.3] - 2026-07-16
+
+### Fixed
+- **`--localize` mishandled edge inputs and over-claimed on reachable targets.** Two fixes: (1) `LOCALIZE_MAX_HOPS` is now validated/clamped to 1–64 (with a note) — `0` / negative / non-numeric previously reached `traceroute -m 0`, which probes nothing and then misreported "no usable hops (ICMP likely filtered)". (2) A **reachable** target (TCP ok) now short-circuits to "no block to localize" regardless of what the trace shows — both the `endpoint` message (trace reached the target) and the zero-hop case are reachability-aware, so forcing `--localize` on a healthy host no longer prints block-framing ("the block is at the endpoint/DPI") when nothing is blocked. Genuine blocks on unreachable targets still localize as `access-edge` / `transit` / `near-destination`.
+
 ## [1.8.2] - 2026-07-16
 
 ### Fixed

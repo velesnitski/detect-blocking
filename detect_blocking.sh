@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="1.8.2"
+readonly DETECT_BLOCKING_VERSION="1.8.3"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -2388,8 +2388,8 @@ EOF
 _localize_class() {
   local reached="$1" reachable="$2" last_hop="$3" max_hops="$4" last_cc="$5" target_cc="$6"
   if [ "$reached" = "1" ]; then echo "endpoint"; return 0; fi
+  if [ "$reachable" = "1" ]; then echo "incomplete"; return 0; fi   # target answers TCP → not a block, whatever the trace shows
   case "$last_hop" in ''|0|*[!0-9]*) echo "unknown"; return 0 ;; esac
-  if [ "$reachable" = "1" ]; then echo "incomplete"; return 0; fi
   case "$max_hops" in ''|*[!0-9]*) : ;; *) [ "$last_hop" -ge "$max_hops" ] && { echo "incomplete"; return 0; } ;; esac
   if [ "$last_hop" -le 3 ]; then echo "access-edge"; return 0; fi
   if [ -n "$last_cc" ] && [ "$last_cc" = "$target_cc" ]; then echo "near-destination"; return 0; fi
@@ -2408,19 +2408,30 @@ probe_localize() {
   if ! check_cmd traceroute; then LOCALIZE_STATUS="no-traceroute"; return 0; fi
 
   hdr "Censorship localization (path)"
-  info "tracing the path to the target to locate where the block sits (bounded, ~${LOCALIZE_MAX_HOPS:-20}s worst case)"
+  # Sanitize the hop budget: it's a user env knob, so guard 0 / negative / non-numeric /
+  # absurd values (traceroute -m 0 probes nothing → a misleading "no hops" read).
+  local _mh_raw="${LOCALIZE_MAX_HOPS:-}" mh="${LOCALIZE_MAX_HOPS:-20}"
+  case "$mh" in ''|*[!0-9]*) mh=20 ;; esac
+  [ "$mh" -lt 1 ]  2>/dev/null && mh=20
+  [ "$mh" -gt 64 ] 2>/dev/null && mh=64
+  [ -n "$_mh_raw" ] && [ "$_mh_raw" != "$mh" ] && info "LOCALIZE_MAX_HOPS='${_mh_raw}' is out of range (1-64) — using ${mh}"
+  info "tracing the path to the target to locate where the block sits (bounded, ~${mh}s worst case)"
   local scan last_hop last_ip reached hopinfo asn cc target_cc
-  scan=$(_traceroute_scan "$RESOLVED_IP" "${LOCALIZE_MAX_HOPS:-20}")
+  scan=$(_traceroute_scan "$RESOLVED_IP" "$mh")
   last_hop=${scan%%$'\t'*}; scan=${scan#*$'\t'}; last_ip=${scan%%$'\t'*}; reached=${scan##*$'\t'}
   hopinfo=$(_hop_info "$last_ip"); asn=${hopinfo%%$'\t'*}; cc=${hopinfo##*$'\t'}
   target_cc=""; [ "$reached" != "1" ] && { target_cc=$(_hop_info "$RESOLVED_IP"); target_cc=${target_cc##*$'\t'}; }
   local reachable=0; [ "${TCP_OK:-0}" = "1" ] && reachable=1
   LOCALIZE_STATUS="ran"; LOCALIZE_LAST_HOP="$last_hop"; LOCALIZE_LAST_ASN="$asn"
   LOCALIZE_LAST_CC="$cc"; LOCALIZE_REACHED="$reached"
-  LOCALIZE_CLASS=$(_localize_class "$reached" "$reachable" "$last_hop" "${LOCALIZE_MAX_HOPS:-20}" "$cc" "$target_cc")
+  LOCALIZE_CLASS=$(_localize_class "$reached" "$reachable" "$last_hop" "$mh" "$cc" "$target_cc")
   case "$LOCALIZE_CLASS" in
     endpoint)
-      ok "the path REACHES the target — the block is at the endpoint / DPI, not a network-path drop (consistent with SNI or protocol filtering, or a stateful reset)" ;;
+      if [ "$reachable" = "1" ]; then
+        ok "the target is fully reachable — the trace completes and TCP is up, so there's no block to localize"
+      else
+        ok "the trace REACHES the target's IP but the service isn't answering — the block is at the endpoint / DPI, not a network-path drop (consistent with SNI or protocol filtering, or a stateful reset)"
+      fi ;;
     incomplete)
       if [ "$reachable" = "1" ]; then
         ok "the target is REACHABLE (TCP ok) — no block to localize; the trace just didn't reach it (its final hops are ICMP-filtered, common even for live hosts)"

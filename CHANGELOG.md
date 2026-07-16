@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.2] - 2026-07-16
+
+### Fixed
+- **A symlinked-in-PATH install ignored the sibling `detect_blocking.conf`.** `SCRIPT_DIR` was taken from `BASH_SOURCE` without following symlinks, so an install like `/usr/local/bin/detect-blocking -> /opt/…/detect_blocking.sh` resolved `SCRIPT_DIR` to the symlink's directory and looked for the config there instead of next to the real file. It now resolves through symlinks first (multi-level, relative-target safe). Scoped to that one spot: the `$0`-based self-invokes and `sed "$0"` were already symlink-safe (the OS follows symlinks on exec/read), the bash shebang means `BASH_SOURCE` is always set (no zsh fallback needed), and the test files run by real path so they're untouched.
+
 ## [1.8.1] - 2026-07-16
 
 ### Fixed

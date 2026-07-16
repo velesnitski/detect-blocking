@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="1.8.1"
+readonly DETECT_BLOCKING_VERSION="1.8.2"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -115,7 +115,17 @@ check_cmd xxd  || _missing_optional="$_missing_optional xxd"
 
 # ---------- config file (optional, sourced before defaults) ----------
 
-SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+# Resolve THROUGH symlinks so a symlinked-in-PATH install (e.g. /usr/local/bin/detect-blocking
+# -> /opt/…/detect_blocking.sh) still finds the detect_blocking.conf that sits next to the
+# REAL file, not next to the symlink. (Bash shebang → BASH_SOURCE is always set; no zsh path.)
+_self="${BASH_SOURCE[0]}"
+while [ -L "$_self" ]; do
+  _sd="$( cd -P -- "$( dirname -- "$_self" )" &> /dev/null && pwd )"
+  _self="$( readlink -- "$_self" )"
+  case "$_self" in /*) ;; *) _self="$_sd/$_self" ;; esac
+done
+SCRIPT_DIR="$( cd -P -- "$( dirname -- "$_self" )" &> /dev/null && pwd )"
+unset _self _sd
 CONFIG_FILE="${CONFIG_FILE:-$SCRIPT_DIR/detect_blocking.conf}"
 if [ -f "$CONFIG_FILE" ]; then
   # shellcheck disable=SC1090

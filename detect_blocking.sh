@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="1.8.3"
+readonly DETECT_BLOCKING_VERSION="1.9.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -864,6 +864,8 @@ ENV_CONNECTED_VPN=""
 ENV_ON_VPN=0
 DNS_SYS_IPS=""
 DNS_DOH_IPS=""
+DNS_DIVERGE_CLASS=""     # on system-vs-DoH IP divergence: dns-block|system-ok|both-fail|unchecked
+DNS_BLOCK=0              # 1 = system-DNS IP is a dead TLS stub while the DoH IP serves the site
 TCP_BASELINE_OK=0
 TCP_BASELINE_IP=""
 TLS_PROPER_SNI_OK=0
@@ -1908,6 +1910,31 @@ probe_environment() {
   ENV_ON_VPN="$on_vpn"
 }
 
+# TLS reachability: 0 if a TLS handshake to ip:443 with the given SNI returns a
+# certificate, 1 otherwise. Bounded by the nc precheck (no ~75s connect hang on a
+# dead IP). Used to tell a live host from a dead TLS stub when DNS answers diverge.
+_tls_reachable() {
+  local ip="$1" sni="$2"
+  [ -n "$ip" ] || return 1
+  _nc_tcp_probe "$ip" 443 || return 1
+  echo Q | openssl s_client -connect "$ip:443" -servername "$sni" 2>/dev/null \
+    | grep -q 'BEGIN CERTIFICATE' && return 0
+  return 1
+}
+
+# Pure: classify a system-vs-DoH IP divergence by which side completes TLS.
+#   dns-block   system IP fails TLS, DoH IP serves it → DNS-layer block / poisoning
+#               (censored domain hosted abroad; the local resolver hands out a dead
+#               domestic IP while the real host answers via encrypted DNS)
+#   system-ok   the system IP serves TLS → benign CDN/geo divergence
+#   both-fail   neither serves TLS → real IP block / dead host, not DNS-selective
+_dns_block_verdict() {
+  local sys_tls="$1" doh_tls="$2"
+  if [ "$sys_tls" = "0" ] && [ "$doh_tls" = "1" ]; then echo "dns-block"; return 0; fi
+  if [ "$sys_tls" = "1" ]; then echo "system-ok"; return 0; fi
+  echo "both-fail"
+}
+
 probe_dns() {
   hdr "1. DNS resolution"
 
@@ -2014,10 +2041,32 @@ probe_dns() {
     RESOLVED_IP=$(printf '%s\n' "$sys_ips" | _first_word)
     RESOLVED_SOURCE="system DNS"
   else
-    warn "system DNS and DoH returned different public A sets – common with CDN/geo DNS"
-    info "not enough evidence for DNS poisoning"
-    RESOLVED_IP=$(printf '%s\n' "$sys_ips" | _first_word)
-    RESOLVED_SOURCE="system DNS"
+    # System DNS and DoH disagree on the public IP. Usually benign CDN/geo — BUT a
+    # censored domain hosted abroad classically shows a DEAD domestic IP from the
+    # system resolver while the DoH IP serves the site: that's DNS-layer blocking.
+    # Probe TLS on both to tell them apart instead of guessing "CDN/geo".
+    local _sys1 _doh1 _st=1 _dt=1
+    _sys1=$(printf '%s\n' "$sys_ips" | _first_word)
+    _doh1=$(printf '%s\n' "$doh_ips" | _first_word)
+    if check_cmd openssl; then
+      _tls_reachable "$_sys1" "$VPN_HOST" && _st=1 || _st=0
+      _tls_reachable "$_doh1" "$VPN_HOST" && _dt=1 || _dt=0
+      DNS_DIVERGE_CLASS=$(_dns_block_verdict "$_st" "$_dt")
+    else
+      DNS_DIVERGE_CLASS="unchecked"
+    fi
+    case "$DNS_DIVERGE_CLASS" in
+      dns-block)
+        fail "DNS-level block: the system-DNS IP refuses TLS while the DoH IP serves the site"
+        add_verdict "DNS-level block / poisoning — the system resolver returns an IP that refuses TLS, while the DoH-resolved IP serves the site normally (valid cert). The domain is blocked at the plaintext-DNS layer; the real host is reachable over encrypted DNS. Switch the client to DoH/DoT to bypass it"
+        RESOLVED_IP="$_doh1"; RESOLVED_SOURCE="DoH (system-DNS IP is a dead TLS stub)"; DNS_BLOCK=1 ;;
+      both-fail)
+        warn "system DNS and DoH gave different public A sets and NEITHER completes TLS — a real IP block or a dead host, not a DNS-selective block"
+        RESOLVED_IP="$_sys1"; RESOLVED_SOURCE="system DNS" ;;
+      *)
+        warn "system DNS and DoH returned different public A sets – common with CDN/geo DNS$( [ "$DNS_DIVERGE_CLASS" = "system-ok" ] && printf ' (both sides serve TLS)' )"
+        RESOLVED_IP="$_sys1"; RESOLVED_SOURCE="system DNS" ;;
+    esac
   fi
 
   info "target IP for transport probes: ${RESOLVED_IP:-<none>} (${RESOLVED_SOURCE:-none})"
@@ -6817,6 +6866,8 @@ _emit_json() {
     --argjson env_on_vpn    "${ENV_ON_VPN:-0}" \
     --arg dns_sys_ips       "$DNS_SYS_IPS" \
     --arg dns_doh_ips       "$DNS_DOH_IPS" \
+    --arg dns_diverge_class "${DNS_DIVERGE_CLASS:-}" \
+    --argjson dns_block_j   "${DNS_BLOCK:-0}" \
     --arg doh_state         "$DOH_INTEGRITY_STATE" \
     --arg doh_ips           "$DOH_INTEGRITY_IPS" \
     --arg dot_state         "$DOT_INTEGRITY_STATE" \
@@ -7048,6 +7099,8 @@ _emit_json() {
         dns: {
           system_a: ($dns_sys_ips | words),
           doh_a: ($dns_doh_ips | words),
+          divergence_class: opt($dns_diverge_class),
+          dns_block: bool_int($dns_block_j),
           doh_integrity: {state: opt($doh_state), returned: ($doh_ips | words)},
           dot_integrity: {state: opt($dot_state), returned: ($dot_ips | words)},
           doh_multi: {
@@ -7683,6 +7736,7 @@ else
       *"Detectability "*|*"Passive Reality/Xray fingerprint"*) rec="stealth/fingerprint finding, not a live block — make the server blend in: serve the cover SNI on 443, point Reality 'dest'/'serverNames' at a real CA-valid cover, and choose a cover hosted on the server's own network (or a large shared CDN). The structural fix for the SNI↔IP mismatch and entry/egress co-location tells is CDN-fronting: put the entry behind a CDN (e.g. Cloudflare) so the cover SNI resolves to the CDN's own IPs and the connection terminates on the CDN — eliminating both tells at the source. (Or a 'self-steal' REALITY setup: the server fronts its OWN real site via realitySettings.target + its own serverNames, so the cover resolves to the server itself — no mismatch.) Run with --scan-covers to rank candidate cover domains (TLSv1.3 + H2 + CA-valid + non-redirect)." ;;
       *"Encrypted-ClientHello (ECH)"*) rec="enable ECH (Encrypted ClientHello) in the client — the front already publishes an ECH config, so this hides the cover SNI outright; a chained client-side desync (dialerProxy) also fragments the ClientHello, but ECH is unconditional. This config is ALREADY CDN-fronted, so 'switch to Reality' would be a different architecture, not an upgrade" ;;
       *"SNI-based DPI block"*)    rec="try Reality / domain fronting / ECH-enabled client" ;;  # NOT a bare *"SNI"* glob: that swallowed Reality-cover / Hysteria / routing verdicts (which already carry their own fix) and gave them contradictory "switch to Reality" advice
+      *"DNS-level block"*)        rec="switch the client to DoH/DoT — the domain is blocked only at the plaintext-DNS layer; the real host is reachable once you resolve it over encrypted DNS (as this run proved via the DoH IP)" ;;
       *"System DNS failure"*)     rec="use DoH inside the VPN client and check router/provider DNS" ;;
       *"DNS sinkhole"*)           rec="use DoH inside the VPN client, not system resolver" ;;
       *"DoH path is compromised"*) rec="self-host DoH or use a trusted resolver via VPN tunnel – upstream DoH is intercepted on this network" ;;

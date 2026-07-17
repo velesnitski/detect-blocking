@@ -25,6 +25,8 @@ probes.cover_scan.best
 probes.cover_scan.candidates
 probes.cover_scan.status
 probes.dns
+probes.dns.divergence_class
+probes.dns.dns_block
 probes.dns.doh_a
 probes.dns.doh_integrity
 probes.dns.doh_integrity.returned

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-07-17
+
+### Changed
+- **DNS-level block disambiguation — probe both IPs when system-DNS and DoH diverge.** Previously, when the system resolver and DoH returned different public A records, the tool picked the system-DNS IP, soft-pedaled it as "common with CDN/geo DNS," and the downstream TLS/RST probes tested *only* that IP — so a **poisoned system-DNS answer** (a dead stub IP that answers TCP then aborts TLS) was misread as **"TLS DPI / RST injection."** Now, on divergence, probe 1 TLS-tests **both** IPs and classifies via the pure `_dns_block_verdict`:
+  - `dns-block` — the system IP refuses TLS **and** the DoH IP serves the site → **DNS-layer block / poisoning** (the resolver hands out a dead IP while the real host answers over encrypted DNS). The verdict becomes "DNS-level block — switch to DoH/DoT," and `RESOLVED_IP` is switched to the live DoH IP so the downstream probes report the site's *real* reachability instead of a false DPI hit.
+  - `system-ok` — the system IP serves TLS → benign CDN/geo divergence (behaviour unchanged).
+  - `both-fail` — neither serves TLS → a real IP block / dead host, not a DNS-selective block.
+  - Additive JSON `probes.dns.{divergence_class, dns_block}`; new nc-prechecked `_tls_reachable` helper (no ~75 s hang) + unit-tested pure `_dns_block_verdict`; new `tests/test_dns_block.sh`. Fixes a false "TLS DPI" verdict seen on a real DNS-blocked VPN domain (system DNS returned a dead stub; DoH returned the live host).
+
 ## [1.8.3] - 2026-07-16
 
 ### Fixed

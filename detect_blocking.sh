@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="1.9.0"
+readonly DETECT_BLOCKING_VERSION="1.9.1"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -1913,11 +1913,25 @@ probe_environment() {
 # TLS reachability: 0 if a TLS handshake to ip:443 with the given SNI returns a
 # certificate, 1 otherwise. Bounded by the nc precheck (no ~75s connect hang on a
 # dead IP). Used to tell a live host from a dead TLS stub when DNS answers diverge.
+# Run a command with a hard wall-clock bound (SIGALRM via perl exec — perl is a
+# soft-dep already used by the QUIC / OpenVPN probes). Falls back to running unbounded
+# when perl is absent (identical to prior behaviour). Used to cap `openssl s_client`,
+# whose TLS *handshake* has no native timeout and can hang on a TCP-open-but-stalling
+# host even after the nc connect precheck passes. (macOS has no `timeout`/`gtimeout`.)
+_bounded() {
+  local t="$1"; shift
+  if command -v perl >/dev/null 2>&1; then
+    perl -e 'alarm shift; exec @ARGV' "$t" "$@"
+  else
+    "$@"
+  fi
+}
+
 _tls_reachable() {
   local ip="$1" sni="$2"
   [ -n "$ip" ] || return 1
   _nc_tcp_probe "$ip" 443 || return 1
-  echo Q | openssl s_client -connect "$ip:443" -servername "$sni" 2>/dev/null \
+  echo Q | _bounded "$(( ${TIMEOUT:-10} + 2 ))" openssl s_client -connect "$ip:443" -servername "$sni" 2>/dev/null \
     | grep -q 'BEGIN CERTIFICATE' && return 0
   return 1
 }
@@ -2394,6 +2408,9 @@ probe_udp_protocols() {
 _hop_info() {
   local ip="$1" j as cc
   [ -n "$ip" ] || return 0
+  # a private/reserved hop (LAN gateway, CGN, etc.) has no public ASN/geo — don't
+  # ship it to a third-party reputation service, and don't waste the round-trip.
+  _is_special_ipv4 "$ip" && return 0
   j=$(_curl "https://ipinfo.io/${ip}/json" 2>/dev/null)
   as=$(printf '%s' "$j" | sed -nE 's/.*"org":[[:space:]]*"(AS[0-9]+).*/\1/p' | head -1)
   cc=$(printf '%s' "$j" | sed -nE 's/.*"country":[[:space:]]*"([A-Z][A-Z])".*/\1/p' | head -1)

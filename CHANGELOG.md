@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.1] - 2026-07-17
+
+### Fixed
+- **`_tls_reachable` (the DNS-divergence TLS probe) could hang on a TCP-open-but-stalling host.** The `nc` precheck bounds the *connect*, but `openssl s_client` has no native *handshake* timeout, so a host that accepts TCP then stalls the ClientHello could hang the DNS probe (macOS has no `timeout`/`gtimeout`). Added a small `_bounded` helper (hard wall-clock cap via `perl`'s `alarm` + `exec`, with an unbounded fallback when perl is absent — identical to prior behaviour) and applied it to `_tls_reachable`. The same residual in probes 3/15/24's openssl handshakes is pre-existing and left for the planned `_tls_probe` consolidation.
+- **`_hop_info` (localization) no longer queries a third-party IP-reputation service for private/reserved hop IPs.** A traceroute's early hops are frequently RFC1918/CGN (your LAN gateway) — they have no public ASN/geo, so the lookup is now skipped: avoids shipping a private IP to ipinfo and saves the round-trip.
+
 ## [1.9.0] - 2026-07-17
 
 ### Changed

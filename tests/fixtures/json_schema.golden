@@ -3,6 +3,7 @@ environment.default_interface
 environment.on_vpn
 environment.system_vpn_services
 environment.vpn_like_interfaces
+label
 probes
 probes.censor_sweep
 probes.censor_sweep.results
@@ -107,6 +108,10 @@ probes.udp.quic_baseline
 probes.udp.quic_baseline_code
 probes.udp.quic_target
 probes.udp.quic_verdict
+probes.whitelist
+probes.whitelist.controls_reachable
+probes.whitelist.permitted_reachable
+probes.whitelist.status
 probes.xray_active_probe
 probes.xray_active_probe.genuine_http_code
 probes.xray_active_probe.matches_cover

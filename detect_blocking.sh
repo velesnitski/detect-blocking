@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="1.9.1"
+readonly DETECT_BLOCKING_VERSION="1.10.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -181,6 +181,7 @@ while [ $# -gt 0 ]; do
     --scan-covers=*) XRAY_SCAN_COVERS="${1#--scan-covers=}"; shift ;;
     --panel-probe) case "${2:-}" in ""|-*) PANEL_PROBE=1; shift ;; *) PANEL_PROBE="$2"; shift 2 ;; esac ;;
     --panel-probe=*) PANEL_PROBE="${1#--panel-probe=}"; shift ;;
+    --no-panel-probe) PANEL_PROBE=0; shift ;;
     --censor-sweep) case "${2:-}" in ""|-*) XRAY_CENSOR_SWEEP=default; shift ;; *) XRAY_CENSOR_SWEEP="$2"; shift 2 ;; esac ;;
     --censor-sweep=*) XRAY_CENSOR_SWEEP="${1#--censor-sweep=}"; shift ;;
     --conn-test) case "${2:-}" in ""|-*|*[!0-9]*) CONN_TEST_N=16; shift ;; *) CONN_TEST_N="$2"; shift 2 ;; esac ;;
@@ -188,6 +189,7 @@ while [ $# -gt 0 ]; do
     --yt-test) YT_TEST_FORCE=1; case "${2:-}" in ""|-*|*[!0-9]*) YT_TEST_N=16; shift ;; *) YT_TEST_N="$2"; shift 2 ;; esac ;;
     --yt-test=*) YT_TEST_FORCE=1; YT_TEST_N="${1#--yt-test=}"; case "$YT_TEST_N" in ''|*[!0-9]*) YT_TEST_N=16 ;; esac; shift ;;
     --no-yt-test) YT_TEST_N=""; shift ;;
+    --no-conn-test) CONN_TEST_N=""; shift ;;
     --full|--thorough)
       # Umbrella: turn on the two opt-in scanners (everything else already runs by
       # default for a config). Explicit by design — --censor-sweep fetches
@@ -195,6 +197,7 @@ while [ $# -gt 0 ]; do
       # not a silent default. Doesn't clobber an explicit --scan-covers=LIST etc.
       [ -z "${XRAY_SCAN_COVERS:-}" ]  && XRAY_SCAN_COVERS=default
       [ -z "${XRAY_CENSOR_SWEEP:-}" ] && XRAY_CENSOR_SWEEP=default
+      PORT_SURVEY=1   # alt-VPN/proxy port sweep on the target — cheap, own host, finds bypass ports
       printf '%s\n' "note: --full also runs --censor-sweep (fetches known-censored sites from THIS machine to test reachability) — fine on a test box, reconsider on a sensitive / in-region one" >&2
       shift ;;
     --skip)        SKIP_PROBES="${2:-}"; shift 2 ;;
@@ -222,6 +225,7 @@ while [ $# -gt 0 ]; do
     --sub-jobs=*)  SUB_JOBS="${1#--sub-jobs=}"; shift ;;
     --no-tunnel)   NO_TUNNEL=1; shift ;;
     --stub-dialer) STUB_DIALER=1; shift ;;
+    --no-stub-dialer) STUB_DIALER=0; shift ;;
     --outbound)    OUTBOUND_TAG="${2:-}"; shift 2 ;;
     --outbound=*)  OUTBOUND_TAG="${1#--outbound=}"; shift ;;
     --xray-config-json)    _req_val "$1" "${2:-}"; XRAY_JSON_CONFIG="${2:-}"; shift 2 ;;
@@ -243,6 +247,8 @@ while [ $# -gt 0 ]; do
     --reveal)      REVEAL=1; shift ;;
     --via-tunnel)  VIA_TUNNEL=1; shift ;;
     --localize)    LOCALIZE=1; shift ;;
+    --label)       _req_val "$1" "${2:-}"; RUN_LABEL="${2:-}"; shift 2 ;;
+    --label=*)     RUN_LABEL="${1#--label=}"; shift ;;
     --quiet|-q)    LOG_QUIET=1; shift ;;
     --json)        JSON_MODE=1; LOG_QUIET=1; shift ;;
     --version|-V)
@@ -252,7 +258,7 @@ while [ $# -gt 0 ]; do
     --help|-h)
       sed -n '2,39p' "$0"
       printf '\nversion: %s\n' "$DETECT_BLOCKING_VERSION"
-      printf '\nProbe names (for --only / --skip): env, tunnel, dns, tcp, tls, ua, rst, udp, openvpn, control, localize, ipv6, compare, xray, xrayjson\n'
+      printf '\nProbe names (for --only / --skip): env, tunnel, dns, tcp, tls, ua, rst, udp, openvpn, control, whitelist, localize, ipv6, compare, xray, xrayjson\n'
       printf '\nFlags:\n'
       printf '  --json (needs jq)   machine-readable JSON output (compact in batch/watch loops)\n'
       printf '  --quiet, -q         suppress stdout (logging still works)\n'
@@ -261,10 +267,13 @@ while [ $# -gt 0 ]; do
       printf '  --xray-only         only the Xray-protocol probes (11-26 + routing/egress); skips transport probes 0-10 (alias for --only xray,xrayjson; needs --xray-config / --xray-config-json)\n'
       printf '  --scan-covers[=LIST] rank candidate Reality dest/serverName covers (TLSv1.3 + H2 + CA-valid + non-redirect); LIST is comma-separated, or omit for a built-in set\n'
       printf '  --censor-sweep[=LIST] reachability of commonly-censored hosts, direct vs through the tunnel (does the tunnel unblock them?); LIST is comma-separated, or omit for a built-in set\n'
+      printf '  --no-panel-probe    the panel audit AUTO-runs when a panel port answers on a non-CDN IP;\n'
+      printf '                      --no-panel-probe opts out (--panel-probe [IP] still forces/redirects it)\n'
       printf '  --panel-probe [IP]  audit an ORIGIN IP for an exposed x-ui/3x-ui admin panel (checks the known\n'
       printf '                      panel ports+paths, classifies each login/CDN/web/closed). Point it at the\n'
       printf '                      backend behind the CDN — the fronted domain only reaches the CDN edge\n'
-      printf '  --conn-test [N]     open N (default 16) simultaneous TLS handshakes to the server and report how\n'
+      printf '  --conn-test [N]     open N simultaneous TLS handshakes to the server and report how\n'
+      printf '  --no-conn-test      ON BY DEFAULT at N=8 (concurrent, target-only); --no-conn-test opts out\n'
       printf '                      many complete — does it cap / rate-limit / degrade under concurrency (server\n'
       printf '                      robustness; pair with --sub-test N to deep-test one fleet node). Direct probe.\n'
       printf '  --yt-test [N]       YouTube fan-out: open N concurrent connections THROUGH the tunnel to real\n'
@@ -300,6 +309,8 @@ while [ $# -gt 0 ]; do
       printf '                      tunnel per node → slower; batch defaults to 3 to avoid xray thrash)\n'
       printf '  --no-tunnel         skip tunnel/data-plane probes (no xray spawn, no throughput); run only the\n'
       printf '                      direct fingerprint probes (cover/active-probe/TLS-parity/detectability)\n'
+      printf '  --no-stub-dialer    the local-dialerProxy stub AUTO-starts when one is configured but dead\n'
+      printf '                      (otherwise every tunnel probe fails and reads as a dead endpoint)\n'
       printf '  --stub-dialer       if the config dials through a LOCAL dialerProxy (ByeDPI/zapret) that is not\n'
       printf '                      running, serve it with a throwaway PLAIN socks so the tunnel probes run.\n'
       printf '                      Tests carriage + egress/QoE, NOT desync efficacy (that needs a DPI vantage)\n'
@@ -311,9 +322,13 @@ while [ $# -gt 0 ]; do
       printf '  --no-egress-check   disable probe 16 (egress geo/reputation; avoids a 3rd-party IP-info call)\n'
       printf '  --via-tunnel        force the VPN-tunnel-effectiveness probe (auto-runs when your default\n'
       printf '                      route is a tunnel): compares egress through vs around the tunnel\n'
-      printf '  --localize          force the censorship-localization probe (auto-runs when the target is\n'
-      printf '                      TCP-unreachable): bounded traceroute + ASN/geo of the last hop to\n'
-      printf '                      locate the block (ISP edge / transit / near-destination / endpoint)\n'
+      printf '  --label NAME        name this vantage (e.g. --label lte-megafon); stamped into --json and\n'
+      printf '                      shown in the baseline diff header, so an LTE run vs a Wi-Fi run of the\n'
+      printf '                      same endpoint is self-describing (pairs with --save/--diff-baseline)\n'
+      printf '  --localize          force the censorship-localization probe (auto-runs only when probe 2\n'
+      printf '                      MEASURED the target unreachable): bounded traceroute + ASN/geo of the\n'
+      printf '                      last hop → ISP edge / transit / near-destination / endpoint\n'
+      printf '                      env: LOCALIZE_MAX_HOPS (1-64, default 20) · LOCALIZE_WAIT (1-10s, default 1)\n'
       printf '  --no-stability      disable probe 17 (held-session RST detection; it runs by default)\n'
       printf '  --stability         force probe 17 even inside --watch/--from-file loops\n'
       printf '  --no-fleet          disable probe 21 (it auto-enables on multi-outbound configs; N xray spawns)\n'
@@ -827,6 +842,11 @@ BASELINE_IPS="${BASELINE_IPS:-${BASELINE_IP:-1.1.1.1} 8.8.8.8 9.9.9.9}"
 
 FAKE_SNI="${FAKE_SNI:-www.microsoft.com}"
 CONTROL_SITES="${CONTROL_SITES:-www.protonvpn.com www.torproject.org www.discord.com}"
+# Whitelist-restriction probe: "permitted-class" hosts (large public services that a
+# restricted mobile path typically still permits) vs neutral controls (ordinary global
+# hosts that a captive path drops). Both lists are public services — never infra.
+WHITELIST_HOSTS="${WHITELIST_HOSTS:-vk.com mts.ru}"
+WHITELIST_CONTROL_HOSTS="${WHITELIST_CONTROL_HOSTS:-www.example.com github.com}"
 DOH_URL="${DOH_URL:-https://1.1.1.1/dns-query}"
 DOH_PROVIDERS="${DOH_PROVIDERS:-https://1.1.1.1/dns-query https://dns.google/dns-query https://dns.quad9.net/dns-query}"
 TIMEOUT="${TIMEOUT:-5}"
@@ -842,6 +862,15 @@ STRICT_OPENVPN_VERDICT="${STRICT_OPENVPN_VERDICT:-0}"
 RESOLVED_IP=""
 RESOLVED_SOURCE=""
 TCP_OK=0
+TCP_TESTED=0        # 1 once probe 2 actually ran — so "never measured" ≠ "measured unreachable"
+# --label NAME: a free-text vantage name stamped into --json and shown in the baseline
+# diff header. Pairs with .environment.default_interface so a saved run is
+# self-describing ("which network was this?") — the point of comparing e.g. an LTE run
+# against a Wi-Fi run of the same endpoint.
+RUN_LABEL="${RUN_LABEL:-}"
+WHITELIST_STATUS=""          # open | restricted | permitted-unreachable | no-network
+WHITELIST_PERMITTED_OK=""    # how many permitted-class hosts answered TCP 443
+WHITELIST_CONTROL_OK=""      # how many neutral controls answered TCP 443
 TARGET_ICMP_OK=""   # 1/0/"" — did the target answer ICMP when TCP 80+443 both failed
 OPENVPN_UDP_OK=0
 OPENVPN_TCP_OK=0
@@ -1017,7 +1046,11 @@ XRAY_COVER_SCAN_RESULTS=""  # newline-joined "domain|tls13|h2|cavalid|nonredirec
 # Opt-in. Opens N simultaneous TLS handshakes to the server and reports how many
 # complete + the handshake-time spread — i.e. does the server CAP / rate-limit /
 # degrade under concurrent connections (a robustness/UX signal, not a censorship one).
-CONN_TEST_N="${CONN_TEST_N:-}"   # "" off; else N concurrent handshakes (clamped 1..128)
+# On by default at a modest 8 concurrent handshakes: it probes only the TARGET (your own
+# endpoint), runs them concurrently (≈ one probe's worth of wall-clock) and catches
+# connection-limit shaping. `-` not `:-` so --no-conn-test (which sets "") survives this
+# init, exactly like YT_TEST_N. "" = off; --conn-test N raises it (clamped 1..128).
+CONN_TEST_N="${CONN_TEST_N-8}"
 CONN_LIMIT_STATUS=""             # disabled / ok / unreachable / curl-missing / error
 CONN_LIMIT_REQUESTED=""; CONN_LIMIT_SUCC=""; CONN_LIMIT_FAIL=""
 CONN_LIMIT_MINMS=""; CONN_LIMIT_MAXMS=""; CONN_LIMIT_VERDICT=""
@@ -2088,6 +2121,7 @@ probe_dns() {
 
 probe_tcp_reachability() {
   hdr "2. TCP reachability"
+  TCP_TESTED=1   # distinguishes "measured unreachable" (TCP_OK=0) from "never measured"
 
   local baseline_ok=0 ok_ip=""
   for ip in $BASELINE_IPS; do
@@ -2403,6 +2437,64 @@ probe_udp_protocols() {
   fi
 }
 
+# Pure: is this network only letting through a permitted (whitelisted) set of
+# destinations? Compares reach of "permitted-class" hosts vs neutral controls.
+#   restricted    permitted-class reachable, ALL controls fail → captive/whitelist-only
+#                 path (the zero-balance / restricted-LTE state where only the
+#                 operator's permitted list resolves and connects)
+#   open          controls reachable → the network is not whitelist-restricted
+#   permitted-unreachable  controls fine but permitted-class hosts are not — NOT a
+#                 restriction: normal when probing from outside their region (those
+#                 services often refuse foreign clients)
+#   no-network    nothing reachable at all → no connectivity, nothing to conclude
+_classify_whitelist() {
+  local perm_ok="$1" ctl_ok="$2"
+  if [ "${ctl_ok:-0}" -gt 0 ] 2>/dev/null; then
+    [ "${perm_ok:-0}" -gt 0 ] 2>/dev/null && { echo "open"; return 0; }
+    echo "permitted-unreachable"; return 0
+  fi
+  [ "${perm_ok:-0}" -gt 0 ] 2>/dev/null && { echo "restricted"; return 0; }
+  echo "no-network"
+}
+
+# Whitelist-restriction probe. Some mobile networks (notably in restricted/zero-balance
+# states) permit only a curated list of destinations; a VPN then fails for a reason that
+# has nothing to do with DPI — the whole path is captive. Distinguishing that from a
+# block matters, because the fix is different (use an entry host inside the permitted
+# ranges, not a stealthier transport). TCP-only and bounded: no HTTP fetch, no new deps.
+probe_whitelist() {
+  local perm_ok=0 perm_n=0 ctl_ok=0 ctl_n=0 h
+  # This is a coarse reach/no-reach question over ~4 hosts, so cap the per-host wait:
+  # at the default TIMEOUT=10 a fully dark network would otherwise cost ~40s in a run
+  # where this probe is on by default. `local TIMEOUT` is seen by _nc_tcp_probe (bash
+  # dynamic scoping) and restored on return; never RAISE a user's lower timeout.
+  local TIMEOUT="${TIMEOUT:-10}"
+  [ "$TIMEOUT" -gt 3 ] 2>/dev/null && TIMEOUT=3
+  # shellcheck disable=SC2086
+  for h in $WHITELIST_HOSTS; do
+    perm_n=$((perm_n+1)); _nc_tcp_probe "$h" 443 && perm_ok=$((perm_ok+1))
+  done
+  # shellcheck disable=SC2086
+  for h in $WHITELIST_CONTROL_HOSTS; do
+    ctl_n=$((ctl_n+1)); _nc_tcp_probe "$h" 443 && ctl_ok=$((ctl_ok+1))
+  done
+  WHITELIST_STATUS=$(_classify_whitelist "$perm_ok" "$ctl_ok")
+  WHITELIST_PERMITTED_OK="$perm_ok"; WHITELIST_CONTROL_OK="$ctl_ok"
+
+  case "$WHITELIST_STATUS" in
+    restricted)
+      hdr "Whitelist-restricted network"
+      fail "this network reaches ${perm_ok}/${perm_n} permitted-list hosts but 0/${ctl_n} neutral controls — the PATH is whitelist-restricted, not DPI-blocked"
+      add_verdict "Network is whitelist-restricted (captive): permitted-list destinations connect while every neutral control fails, so the whole path — not your protocol — is the constraint. A stealthier transport will not help. Place the entry host inside the permitted ranges (an operator-permitted network/CDN), or test from an unrestricted path. Typical on a zero-balance / restricted mobile state" ;;
+    permitted-unreachable)
+      info "whitelist check: controls reachable, permitted-list hosts are not (${perm_ok}/${perm_n}) — not a restriction, expected when probing from outside their region" ;;
+    no-network)
+      info "whitelist check: nothing reachable (0/${perm_n} permitted, 0/${ctl_n} controls) — no connectivity, see probe 2" ;;
+    *)
+      info "whitelist check: network reaches both permitted-list (${perm_ok}/${perm_n}) and neutral controls (${ctl_ok}/${ctl_n}) — not whitelist-restricted" ;;
+  esac
+}
+
 # ASN + ISO country for an IP in one lookup: echoes "ASxxxx\t<CC>" (either may be empty).
 # HTTPS-first (an on-path censor could spoof plaintext ip-api), ip-api HTTP as fallback.
 _hop_info() {
@@ -2427,7 +2519,14 @@ _hop_info() {
 # (-n) so it needs no DNS and no root. Worst case ~max_hops * wait seconds (all hops dark).
 _traceroute_scan() {
   local target="$1" maxh="$2" out line hop ip last_hop="" last_ip="" reached=0
-  out=$(traceroute -n -w "${LOCALIZE_WAIT:-1}" -q 1 -m "$maxh" "$target" 2>/dev/null)
+  # Clamp the per-hop wait: traceroute rejects -w 0 ("wait time must be > 0") and the
+  # failure is swallowed by 2>/dev/null, which would surface as a misleading
+  # "no usable hops (ICMP filtered)". Same guard as LOCALIZE_MAX_HOPS.
+  local w="${LOCALIZE_WAIT:-1}"
+  case "$w" in ''|*[!0-9]*) w=1 ;; esac
+  [ "$w" -lt 1 ]  2>/dev/null && w=1
+  [ "$w" -gt 10 ] 2>/dev/null && w=10
+  out=$(traceroute -n -w "$w" -q 1 -m "$maxh" "$target" 2>/dev/null)
   while IFS= read -r line; do
     hop=$(printf '%s' "$line" | awk '{print $1}')
     case "$hop" in ''|*[!0-9]*) continue ;; esac       # skip the banner / non-hop lines
@@ -2454,7 +2553,11 @@ EOF
 _localize_class() {
   local reached="$1" reachable="$2" last_hop="$3" max_hops="$4" last_cc="$5" target_cc="$6"
   if [ "$reached" = "1" ]; then echo "endpoint"; return 0; fi
-  if [ "$reachable" = "1" ]; then echo "incomplete"; return 0; fi   # target answers TCP → not a block, whatever the trace shows
+  # Claim a block ONLY when unreachability was actually MEASURED (reachable="0").
+  # reachable="1" → target answers TCP, so it's not a block whatever the trace shows.
+  # reachable=""  → the TCP probe never ran (e.g. --skip tcp / --only without tcp):
+  #                 "not measured" is NOT evidence of a block — stay at `incomplete`.
+  if [ "$reachable" != "0" ]; then echo "incomplete"; return 0; fi
   case "$last_hop" in ''|0|*[!0-9]*) echo "unknown"; return 0 ;; esac
   case "$max_hops" in ''|*[!0-9]*) : ;; *) [ "$last_hop" -ge "$max_hops" ] && { echo "incomplete"; return 0; } ;; esac
   if [ "$last_hop" -le 3 ]; then echo "access-edge"; return 0; fi
@@ -2468,7 +2571,11 @@ _localize_class() {
 # destination side. Runs only when the target is TCP-unreachable or --localize is given.
 # Share-safe: ASN / country / hop-number only; raw hop IPs solely under --reveal.
 probe_localize() {
-  if [ "${TCP_OK:-1}" != "0" ] && [ "${LOCALIZE:-0}" != "1" ]; then return 0; fi   # silent no-op
+  # Auto-run ONLY on measured unreachability (probe 2 ran AND the target failed);
+  # `--localize` forces a run regardless. A skipped probe 2 must not look like a block.
+  if ! { [ "${TCP_TESTED:-0}" = "1" ] && [ "${TCP_OK:-0}" = "0" ]; } && [ "${LOCALIZE:-0}" != "1" ]; then
+    return 0   # silent no-op
+  fi
   [ -n "${RESOLVED_IP:-}" ] || return 0
   case "$RESOLVED_IP" in *:*) LOCALIZE_STATUS="ipv6-skip"; return 0 ;; esac          # IPv4 only for now
   if ! check_cmd traceroute; then LOCALIZE_STATUS="no-traceroute"; return 0; fi
@@ -2487,7 +2594,9 @@ probe_localize() {
   last_hop=${scan%%$'\t'*}; scan=${scan#*$'\t'}; last_ip=${scan%%$'\t'*}; reached=${scan##*$'\t'}
   hopinfo=$(_hop_info "$last_ip"); asn=${hopinfo%%$'\t'*}; cc=${hopinfo##*$'\t'}
   target_cc=""; [ "$reached" != "1" ] && { target_cc=$(_hop_info "$RESOLVED_IP"); target_cc=${target_cc##*$'\t'}; }
-  local reachable=0; [ "${TCP_OK:-0}" = "1" ] && reachable=1
+  # tri-state: 1 = reachable · 0 = measured unreachable · "" = probe 2 never ran (unknown)
+  local reachable=""
+  if [ "${TCP_TESTED:-0}" = "1" ]; then reachable=0; [ "${TCP_OK:-0}" = "1" ] && reachable=1; fi
   LOCALIZE_STATUS="ran"; LOCALIZE_LAST_HOP="$last_hop"; LOCALIZE_LAST_ASN="$asn"
   LOCALIZE_LAST_CC="$cc"; LOCALIZE_REACHED="$reached"
   LOCALIZE_CLASS=$(_localize_class "$reached" "$reachable" "$last_hop" "$mh" "$cc" "$target_cc")
@@ -2501,6 +2610,8 @@ probe_localize() {
     incomplete)
       if [ "$reachable" = "1" ]; then
         ok "the target is REACHABLE (TCP ok) — no block to localize; the trace just didn't reach it (its final hops are ICMP-filtered, common even for live hosts)"
+      elif [ -z "$reachable" ]; then
+        info "probe 2 (TCP reachability) did not run, so there is no evidence the target is blocked — the trace alone can't tell a block from an ICMP-filtered path. Include the tcp probe (drop --skip tcp / add it to --only) for a localization verdict"
       else
         info "the trace ran out of hop budget at hop ${last_hop} (raise LOCALIZE_MAX_HOPS) — didn't reach the target, so localization is inconclusive, NOT a confirmed block"
       fi ;;
@@ -3837,7 +3948,7 @@ probe_host_exposure() {
 # classifies each (x-ui/3x-ui login vs a CDN edge vs a plain web server vs closed),
 # so it's a repeatable fleet audit. GETs only (share-safe: booleans/codes only).
 probe_panel() {
-  [ -n "${PANEL_PROBE:-}" ] || { PANEL_STATUS="skipped"; return 0; }
+  { [ -n "${PANEL_PROBE:-}" ] && [ "${PANEL_PROBE:-}" != "0" ]; } || { PANEL_STATUS="skipped"; return 0; }
   check_cmd curl || { warn "--panel-probe needs curl"; PANEL_STATUS="skipped"; return 0; }
   local tgt
   case "$PANEL_PROBE" in 1|default|"") tgt="${RESOLVED_IP:-$VPN_HOST}" ;; *) tgt="$PANEL_PROBE" ;; esac
@@ -5025,25 +5136,36 @@ PERL
 # tunnel probes can run. Idempotent (uses an existing listener), loopback-only.
 # HONEST: plain socks = NO desync → validates carriage + egress/QoE, not efficacy.
 _start_stub_dialer() {
-  [ "${STUB_DIALER:-}" = "1" ] || return 0
+  # AUTO mode: without --stub-dialer, still stub a LOCAL desync dialerProxy that has no
+  # listener — otherwise every tunnel probe fails and the run reads as "dead endpoint"
+  # when the real cause is just that ByeDPI/zapret isn't running here. Every bail-out
+  # below is silent in auto mode (a normal config must not gain noise); the loud
+  # "THROWAWAY PLAIN socks / NOT desync efficacy" warning still prints when we do stub.
+  local _auto=0
+  [ "${STUB_DIALER:-}" = "0" ] && return 0   # --no-stub-dialer: never stub, not even in auto
+  if [ "${STUB_DIALER:-}" != "1" ]; then
+    [ -n "${NO_TUNNEL:-}" ] && return 0
+    _auto=1
+  fi
   if [ -n "${NO_TUNNEL:-}" ]; then
     info "--stub-dialer ignored with --no-tunnel (there are no tunnel probes to serve)"; return 0
   fi
   local tgt; tgt=$(_dialer_proxy_target)
   if [ -z "$tgt" ]; then
-    info "--stub-dialer: this config has no dialerProxy chain — nothing to stub"; return 0
+    [ "$_auto" = 1 ] || info "--stub-dialer: this config has no dialerProxy chain — nothing to stub"; return 0
   fi
   if [ "$(_dialer_is_local_desync)" != "1" ]; then
-    info "--stub-dialer: the dialerProxy is not a local proxy — not stubbing (a remote hop must be reachable on its own)"; return 0
+    [ "$_auto" = 1 ] || info "--stub-dialer: the dialerProxy is not a local proxy — not stubbing (a remote hop must be reachable on its own)"; return 0
   fi
   local port; port=$(printf '%s' "$tgt" | sed -E 's/.*:([0-9]+)$/\1/')
-  case "$port" in ''|*[!0-9]*) info "--stub-dialer: could not read the dialerProxy port — skipping"; return 0 ;; esac
+  case "$port" in ''|*[!0-9]*) [ "$_auto" = 1 ] || info "--stub-dialer: could not read the dialerProxy port — skipping"; return 0 ;; esac
   if nc -z 127.0.0.1 "$port" 2>/dev/null; then
-    info "--stub-dialer: 127.0.0.1:$port already has a listener (real desync proxy or a prior stub) — using it, not stubbing"; return 0
+    [ "$_auto" = 1 ] || info "--stub-dialer: 127.0.0.1:$port already has a listener (real desync proxy or a prior stub) — using it, not stubbing"; return 0
   fi
   if ! check_cmd perl; then
-    warn "--stub-dialer needs perl (absent) — start a socks on 127.0.0.1:$port yourself (e.g. microsocks -p $port)"; return 0
+    [ "$_auto" = 1 ] || warn "--stub-dialer needs perl (absent) — start a socks on 127.0.0.1:$port yourself (e.g. microsocks -p $port)"; return 0
   fi
+  [ "$_auto" = 1 ] && info "auto-stubbing the dialerProxy chain: a local desync proxy is configured on 127.0.0.1:$port but nothing is listening — without this every tunnel probe would fail and look like a dead endpoint (suppress with --no-stub-dialer)"
   _socks5_stub_serve "$port" & _STUB_PID=$!
   local i=0 up=0
   while [ "$i" -lt 20 ]; do
@@ -5088,7 +5210,7 @@ _fet_exposed() {
                 native|xorpub) echo 0 ;;               # reshapes the wire → don't assert a block
                 *)             echo 1 ;;               # classic security=none, no VLESS Enc
               esac ;;
-            *) echo 0 ;;                               # ws/grpc/xhttp carry HTTP framing
+            *) echo 0 ;;                               # ws/httpupgrade/grpc/xhttp carry HTTP framing
           esac ;;
         *) echo 0 ;;                                   # tls/reality → TLS exemption
       esac ;;
@@ -5188,6 +5310,20 @@ $1"
   if [ -n "$flow" ] && { [ "$net" != "tcp" ] && [ "$net" != "raw" ]; } \
      && { [ -z "$XRAY_VLESS_ENC" ] || [ "$XRAY_VLESS_ENC" = "none" ] || [ "$XRAY_VLESS_ENC" = "invalid" ]; }; then
     _lint_add "flow=$flow requires raw TCP transport (network=tcp/raw), but network=$net and no VLESS Encryption — the handshake will fail (VLESS Encryption would lift this restriction)"
+  fi
+
+  # httpupgrade transport (HTTP/1.1 Upgrade → a WebSocket-shaped tunnel without the
+  # full ws handshake). It's the CDN-frontable transport of choice behind a public
+  # balancer (the ByeDPI/Cloudflare pattern), so name it explicitly instead of letting
+  # it fall through the generic branches: check the settings a CDN actually needs, and
+  # say plainly that vision can't apply here (it needs raw TCP).
+  if [ "$net" = "httpupgrade" ]; then
+    local _hu_path _hu_host
+    _hu_path=$(_xray_cfg_field type '.outbounds[0].streamSettings.httpupgradeSettings.path')
+    _hu_host=$(_xray_cfg_field type '.outbounds[0].streamSettings.httpupgradeSettings.host')
+    [ -z "$_hu_path" ] && _lint_add "network=httpupgrade but httpupgradeSettings.path is empty — the server routes the Upgrade by path; an empty/wrong path answers 404 and the tunnel never establishes"
+    [ -z "$_hu_host" ] && info "httpupgrade: no httpupgradeSettings.host — the Host header falls back to the TLS serverName; set it explicitly when the CDN routes by Host"
+    info "transport httpupgrade — CDN-frontable (HTTP/1.1 Upgrade behind a public balancer); carries HTTP framing, so the FET entropy classifier does not apply. XTLS vision cannot be used on this transport (it requires raw TCP) — cover-SNI quality and ECH are the levers here"
   fi
 
   # VLESS without a flow is deprecated upstream (Xray-core is migrating to
@@ -6878,6 +7014,10 @@ _emit_json() {
     --arg resolved_ip       "$RESOLVED_IP" \
     --arg resolved_source   "$RESOLVED_SOURCE" \
     --arg env_default_if    "$ENV_DEFAULT_IF" \
+    --arg run_label         "${RUN_LABEL:-}" \
+    --arg wl_status         "${WHITELIST_STATUS:-}" \
+    --arg wl_perm_ok        "${WHITELIST_PERMITTED_OK:-}" \
+    --arg wl_ctl_ok         "${WHITELIST_CONTROL_OK:-}" \
     --arg env_vpn_ifs       "$ENV_VPN_IFACES" \
     --arg env_connected     "$ENV_CONNECTED_VPN" \
     --argjson env_on_vpn    "${ENV_ON_VPN:-0}" \
@@ -7099,6 +7239,7 @@ _emit_json() {
       schema_version: 1,
       version: $version,
       timestamp: (now | todate),
+      label: opt($run_label),
       target: {
         host: $host,
         port_tcp: $port_tcp,
@@ -7176,6 +7317,11 @@ _emit_json() {
           default_iface_is_tunnel: bool_int($tunnel_is_tun),
           exit_country: opt($tunnel_cc),
           exit_differs: tri_bool($tunnel_differs)
+        },
+        whitelist: {
+          status: opt($wl_status),
+          permitted_reachable: (if $wl_perm_ok == "" then null else ($wl_perm_ok|tonumber? // null) end),
+          controls_reachable: (if $wl_ctl_ok == "" then null else ($wl_ctl_ok|tonumber? // null) end)
         },
         localize: {
           status: opt($loc_status),
@@ -7454,6 +7600,19 @@ _emit_baseline_diff() {
 
   hdr "Baseline diff (vs ${ts})"
 
+  # Name both vantages when known (--label / .environment.default_interface). Without
+  # this the diff is anonymous — and the whole point of diffing two runs of the SAME
+  # endpoint is usually "which network path was different" (e.g. LTE vs Wi-Fi).
+  local _blab _clab _bif _cif
+  _blab=$(printf '%s' "$base" | jq -r '.label // ""' 2>/dev/null)
+  _clab=$(printf '%s' "$cur"  | jq -r '.label // ""' 2>/dev/null)
+  _bif=$(printf '%s' "$base"  | jq -r '.environment.default_interface // ""' 2>/dev/null)
+  _cif=$(printf '%s' "$cur"   | jq -r '.environment.default_interface // ""' 2>/dev/null)
+  if [ -n "$_blab$_clab$_bif$_cif" ]; then
+    info "vantage: baseline ${_blab:-<unlabelled>}${_bif:+ (${_bif})} → current ${_clab:-<unlabelled>}${_cif:+ (${_cif})}"
+    [ -z "$_blab$_clab" ] && info "tip: pass --label <name> (e.g. --label lte-megafon) so each saved run identifies its network path"
+  fi
+
   # Version-drift note: a baseline from an older build is missing the probe
   # blocks added since, so those probes will show up as "none -> X" changes on
   # the first diff after an upgrade. Flag it so that isn't read as a regression.
@@ -7608,6 +7767,7 @@ _should_run rst     && probe_rst_injection
 _should_run udp     && probe_udp_protocols
 _should_run openvpn && probe_openvpn
 _should_run control && probe_known_blocked
+_should_run whitelist && probe_whitelist
 _should_run localize && probe_localize
 _should_run ipv6    && probe_ipv6
 _should_run compare && probe_compare_matrix
@@ -7654,7 +7814,15 @@ _start_stub_dialer
 # Connection-limit probe: opt-in (--conn-test), direct (runs under --no-tunnel too).
 [ -n "${CONN_TEST_N:-}" ] && probe_conn_limit
 # Panel probe: opt-in (--panel-probe [IP]), direct — audits an origin for x-ui/3x-ui.
-[ -n "${PANEL_PROBE:-}" ] && probe_panel
+# AUTO: host-exposure sets XRAY_HOSTEXP_CDN=0 only when a PANEL port is open AND the
+# resolved IP is not a CDN edge — i.e. a real exposed-panel suspicion on this very host.
+# Audit it without being asked: it's the operator's own server and the finding (takeover
+# risk + a strong detectability tell) is worth the one extra probe. --no-panel-probe opts out.
+if [ -z "${PANEL_PROBE:-}" ] && [ "${XRAY_HOSTEXP_CDN:-}" = "0" ]; then
+  PANEL_PROBE=1
+  info "auto --panel-probe: a proxy-panel port answered on a non-CDN IP — auditing it directly (--no-panel-probe to skip)"
+fi
+[ -n "${PANEL_PROBE:-}" ] && [ "${PANEL_PROBE:-}" != "0" ] && probe_panel
 [ -z "${NO_TUNNEL:-}" ] && _should_run xrayjson && probe_xray_egress
 # YouTube fan-out probe: opt-in, needs the tunnel (probe 12) up.
 [ -n "${YT_TEST_N:-}" ] && [ -z "${NO_TUNNEL:-}" ] && _should_run xrayjson && probe_yt_reach

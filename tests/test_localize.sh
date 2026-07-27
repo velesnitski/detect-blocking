@@ -25,6 +25,11 @@ eval "$(awk '/^_localize_class\(\)/,/^}/' "$SCRIPT")"
 [ "$(_localize_class 0 1 7  7  DE US)" = "incomplete" ]      || fail "reachable + hop budget → incomplete"
 [ "$(_localize_class 0 1 0  20 ''  '')" = "incomplete" ]     || fail "reachable + zero hops (ICMP fully filtered) → incomplete, NOT unknown"
 [ "$(_localize_class 0 0 0  20 ''  '')" = "unknown" ]        || fail "unreachable + zero hops → unknown (genuinely inconclusive)"
+# reachable="" = probe 2 never ran (e.g. --skip tcp): "not measured" is NOT evidence of a
+# block, so no access-edge/transit claim may be made from the trace shape alone.
+[ "$(_localize_class 0 '' 2 20 ''  '')" = "incomplete" ]     || fail "TCP untested + early death → incomplete, NOT access-edge"
+[ "$(_localize_class 0 '' 8 20 NL DE)" = "incomplete" ]      || fail "TCP untested + mid-path death → incomplete, NOT transit"
+[ "$(_localize_class 0 '' 14 20 DE DE)" = "incomplete" ]     || fail "TCP untested + death in target country → incomplete, NOT near-destination"
 
 # ---- additive JSON block: present with null defaults when the probe isn't selected ----
 out=$(TIMEOUT=3 bash "$SCRIPT" --only dns,tcp 127.0.0.1 --json 2>/dev/null)
@@ -32,6 +37,14 @@ out=$(TIMEOUT=3 bash "$SCRIPT" --only dns,tcp 127.0.0.1 --json 2>/dev/null)
 [ "$(printf '%s' "$out" | jq -r '.probes.localize.reached_destination')" = "null" ] || fail "not selected → reached_destination null"
 printf '%s' "$out" | jq -e '.probes.localize | has("class") and has("last_hop") and has("last_hop_asn")' >/dev/null \
   || fail "localize block should expose class/last_hop/last_hop_asn"
+
+# ---- regression: a SKIPPED probe 2 must not auto-run localization nor raise a verdict ----
+# (--only dns,localize leaves TCP_OK at its 0 init; that must read as "unknown", not "blocked")
+out=$(TIMEOUT=4 LOCALIZE_MAX_HOPS=3 bash "$SCRIPT" --only dns,localize 127.0.0.1 --json 2>/dev/null)
+[ "$(printf '%s' "$out" | jq -r '.probes.localize.status')" = "null" ] \
+  || fail "probe 2 skipped → localization must NOT auto-run (status stays null)"
+[ "$(printf '%s' "$out" | jq -r '[.verdicts[]? | select(test("localized"))] | length')" = "0" ] \
+  || fail "probe 2 skipped → no 'Block localized' verdict may be raised"
 
 # ---- offline integration: forced trace to loopback reaches hop 1 → endpoint ----
 if command -v traceroute >/dev/null 2>&1; then

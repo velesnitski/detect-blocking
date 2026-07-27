@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="1.10.0"
+readonly DETECT_BLOCKING_VERSION="1.10.1"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -1190,7 +1190,7 @@ XRAY_MTU_PATH=""            # discovered path MTU (bytes)
 # NEGOTIATION (version / ALPN / cipher). A real relaying Reality server is
 # byte-identical to the genuine cover; a fake / wrong-dest one diverges.
 # Output: per-attribute parity booleans + the generic negotiated values only.
-XRAY_TLSPAR_STATUS=""       # ok, mismatch, skipped, no-sni, openssl-missing, unreachable
+XRAY_TLSPAR_STATUS=""       # ok, mismatch, unverified, skipped, no-sni, openssl-missing, unreachable
 XRAY_TLSPAR_VER_MATCH=""    # 1 / 0  TLS version parity
 XRAY_TLSPAR_ALPN_MATCH=""   # 1 / 0  ALPN parity
 XRAY_TLSPAR_CIPHER_MATCH="" # 1 / 0  cipher parity
@@ -6173,6 +6173,19 @@ probe_xray_mtu() {
   fi
 }
 
+# Pure: compare one negotiated TLS field between server and cover.
+#   1  both sides read and EQUAL          → measured match
+#   0  both sides read and DIFFERENT      → measured mismatch (the only scorable case)
+#   "" either side unreadable             → NOT measured; must not be scored or claimed
+# ALPN legitimately reads as empty ("no ALPN negotiated"), so an empty-vs-empty pair
+# counts as a measured match only when BOTH are empty AND the handshake produced output;
+# callers pass ALPN through the same gate and treat "" as unknown, which is the safe read.
+_tls_field_match() {
+  local a="$1" b="$2"
+  { [ -n "$a" ] && [ -n "$b" ]; } || { printf '%s' ""; return 0; }
+  [ "$a" = "$b" ] && printf '1' || printf '0'
+}
+
 # Probe 24 — TLS-negotiation parity. Compares the TLS the server negotiates
 # (version / ALPN / cipher) against the genuine cover site. A relaying Reality
 # server matches; a fake / wrong-dest one diverges. Booleans + generic values
@@ -6224,17 +6237,26 @@ probe_xray_tls_parity() {
   c_ver=$(printf '%s' "$c_out"  | sed -nE 's/^[[:space:]]*Protocol[[:space:]]*:[[:space:]]*(.*)/\1/p' | head -1)
   s_alpn=$(printf '%s' "$s_out" | sed -nE 's/^ALPN protocol:[[:space:]]*(.*)/\1/p' | head -1)
   c_alpn=$(printf '%s' "$c_out" | sed -nE 's/^ALPN protocol:[[:space:]]*(.*)/\1/p' | head -1)
+  # Cipher line format differs by openssl build and BOTH must be handled, else the
+  # field silently reads as "unmeasured" and (pre-1.10.1) scored as a MISMATCH:
+  #   OpenSSL 1.x / LibreSSL : "    Cipher    : TLS_AES_256_GCM_SHA384"
+  #   OpenSSL 3.x            : "New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384"
   s_ciph=$(printf '%s' "$s_out" | sed -nE 's/^[[:space:]]*Cipher[[:space:]]*:[[:space:]]*(.*)/\1/p' | head -1)
+  [ -z "$s_ciph" ] && s_ciph=$(printf '%s' "$s_out" | sed -nE 's/^New,[^,]*,[[:space:]]*Cipher is[[:space:]]*(.*)/\1/p' | head -1)
   c_ciph=$(printf '%s' "$c_out" | sed -nE 's/^[[:space:]]*Cipher[[:space:]]*:[[:space:]]*(.*)/\1/p' | head -1)
+  [ -z "$c_ciph" ] && c_ciph=$(printf '%s' "$c_out" | sed -nE 's/^New,[^,]*,[[:space:]]*Cipher is[[:space:]]*(.*)/\1/p' | head -1)
 
   # ServerHello extension list (ordered ids), the JA3S-discriminating part.
   s_ext=$(printf '%s' "$s_out" | sed -nE 's/.*server extension.*\(id=([0-9]+)\).*/\1/p' | tr '\n' '-' | sed 's/-$//')
   c_ext=$(printf '%s' "$c_out" | sed -nE 's/.*server extension.*\(id=([0-9]+)\).*/\1/p' | tr '\n' '-' | sed 's/-$//')
 
-  [ -n "$s_ver" ] && [ "$s_ver" = "$c_ver" ] && XRAY_TLSPAR_VER_MATCH=1 || XRAY_TLSPAR_VER_MATCH=0
-  [ "$s_alpn" = "$c_alpn" ] && XRAY_TLSPAR_ALPN_MATCH=1 || XRAY_TLSPAR_ALPN_MATCH=0
-  [ -n "$s_ciph" ] && [ "$s_ciph" = "$c_ciph" ] && XRAY_TLSPAR_CIPHER_MATCH=1 || XRAY_TLSPAR_CIPHER_MATCH=0
-  [ -n "$s_ext" ] && [ "$s_ext" = "$c_ext" ] && XRAY_TLSPAR_EXT_MATCH=1 || XRAY_TLSPAR_EXT_MATCH=0
+  # Tri-state per field: 1 measured-match · 0 measured-MISMATCH · "" not measurable.
+  # Never score a field we could not read (an unreadable cipher line used to look
+  # exactly like a mismatch and added a permanent, unearned +15 in probe 26).
+  XRAY_TLSPAR_VER_MATCH=$(_tls_field_match "$s_ver" "$c_ver")
+  XRAY_TLSPAR_ALPN_MATCH=$(_tls_field_match "$s_alpn" "$c_alpn")
+  XRAY_TLSPAR_CIPHER_MATCH=$(_tls_field_match "$s_ciph" "$c_ciph")
+  XRAY_TLSPAR_EXT_MATCH=$(_tls_field_match "$s_ext" "$c_ext")
 
   # JA3S-grade fingerprint: hash(version|cipher|extension-ids) for each side. Same
   # inputs as JA3S (openssl's names rather than the canonical numeric encoding, but
@@ -6244,23 +6266,33 @@ probe_xray_tls_parity() {
     XRAY_TLSPAR_COVER_FP=$(printf '%s|%s|%s' "$c_ver" "$c_ciph" "$c_ext" | openssl dgst -sha256 2>/dev/null | sed -nE 's/.*([0-9a-f]{64}).*/\1/p' | cut -c1-12)
   fi
 
-  info "negotiation: version-match=${XRAY_TLSPAR_VER_MATCH}, ALPN-match=${XRAY_TLSPAR_ALPN_MATCH}, cipher-match=${XRAY_TLSPAR_CIPHER_MATCH}, ext-match=${XRAY_TLSPAR_EXT_MATCH} (server ${s_ver:-?}/${s_alpn:-none}, cover ${c_ver:-?}/${c_alpn:-none})"
+  info "negotiation: version-match=${XRAY_TLSPAR_VER_MATCH:-n/a}, ALPN-match=${XRAY_TLSPAR_ALPN_MATCH:-n/a}, cipher-match=${XRAY_TLSPAR_CIPHER_MATCH:-n/a}, ext-match=${XRAY_TLSPAR_EXT_MATCH:-n/a} (server ${s_ver:-?}/${s_alpn:-none}, cover ${c_ver:-?}/${c_alpn:-none}; n/a = this openssl did not report the field, not a mismatch)"
   info "ServerHello fingerprint (JA3S-grade): server ${XRAY_TLSPAR_SERVER_FP:-?} vs cover ${XRAY_TLSPAR_COVER_FP:-?}$( [ -n "$XRAY_TLSPAR_SERVER_FP" ] && [ "$XRAY_TLSPAR_SERVER_FP" = "$XRAY_TLSPAR_COVER_FP" ] && echo ' (match)' || echo ' (DIFFER)' )"
 
-  if [ "$XRAY_TLSPAR_VER_MATCH" = "1" ] && [ "$XRAY_TLSPAR_ALPN_MATCH" = "1" ] && [ "$XRAY_TLSPAR_CIPHER_MATCH" = "1" ]; then
-    XRAY_TLSPAR_STATUS="ok"   # decision stays on version+ALPN+cipher (reliable; feeds probe 26)
+  # Decision on version+ALPN+cipher, but ONLY on fields we actually measured: any
+  # measured "0" is a real mismatch; all-unmeasured is `unverified` (scored like
+  # `unreachable`: +5 for an unobservable dimension, never the full mismatch penalty).
+  local _mismatched=0 _measured=0 _f
+  for _f in "$XRAY_TLSPAR_VER_MATCH" "$XRAY_TLSPAR_ALPN_MATCH" "$XRAY_TLSPAR_CIPHER_MATCH"; do
+    case "$_f" in 0) _mismatched=1; _measured=$((_measured+1)) ;; 1) _measured=$((_measured+1)) ;; esac
+  done
+  if [ "$_measured" = "0" ]; then
+    XRAY_TLSPAR_STATUS="unverified"
+    warn "could not read version/ALPN/cipher from either handshake (this openssl build reports none of them) — TLS parity UNVERIFIED, not scored as a mismatch"
+  elif [ "$_mismatched" = "0" ]; then
+    XRAY_TLSPAR_STATUS="ok"   # every MEASURED field matches (unmeasured ones are ignored)
     if [ "$XRAY_TLSPAR_EXT_MATCH" = "0" ]; then
       # Version/ALPN/cipher align but the ServerHello extension SET diverges — a
       # finer (JA3S-grade) tell. Not scored (can be benign relay/openssl variance),
       # but a JA3S/JA4S fingerprinter could still distinguish server from cover.
       warn "version/ALPN/cipher match the cover, but the ServerHello EXTENSION set differs (JA3S-grade fingerprint ${XRAY_TLSPAR_SERVER_FP:-?} ≠ ${XRAY_TLSPAR_COVER_FP:-?}) — a JA3S/JA4S fingerprinter could still tell the server from the cover it impersonates (often benign relay/openssl variance; matters against a censor that does ServerHello fingerprinting)"
     else
-      ok "TLS negotiation matches the genuine cover (version + ALPN + cipher + ServerHello extensions) → relays cleanly"
+      ok "TLS negotiation matches the genuine cover on every field this openssl reported (${_measured}/3 of version/ALPN/cipher, plus ServerHello extensions) → relays cleanly"
     fi
   else
     warn "TLS negotiation differs from the genuine cover"
     XRAY_TLSPAR_STATUS="mismatch"
-    add_verdict "Server's TLS negotiation does not match the genuine cover site (version/ALPN/cipher$( [ "$XRAY_TLSPAR_EXT_MATCH" = "0" ] && echo '/ServerHello extensions' ); JA3S-grade fingerprint ${XRAY_TLSPAR_SERVER_FP:-?} vs cover ${XRAY_TLSPAR_COVER_FP:-?}) — it doesn't fully impersonate the host its serverName claims, a fingerprint an active prober or a JA3S/JA4S fingerprinter can use. Point Reality 'dest' at the exact cover the client's serverName expects (and confirm probes 15/20)"
+    add_verdict "Server's TLS negotiation does not match the genuine cover site (version/ALPN/cipher$( [ "$XRAY_TLSPAR_EXT_MATCH" = "0" ] && echo '/ServerHello extensions' )$( if [ -n "$XRAY_TLSPAR_SERVER_FP" ] && [ "$XRAY_TLSPAR_SERVER_FP" != "$XRAY_TLSPAR_COVER_FP" ]; then printf '; JA3S-grade fingerprint %s vs cover %s' "$XRAY_TLSPAR_SERVER_FP" "$XRAY_TLSPAR_COVER_FP"; else printf '; the JA3S-grade ServerHello fingerprint itself MATCHES the cover, so the divergence is in the negotiated parameters only'; fi )) — it doesn't fully impersonate the host its serverName claims, a fingerprint an active prober or a JA3S/JA4S fingerprinter can use. Point Reality 'dest' at the exact cover the client's serverName expects (and confirm probes 15/20)"
   fi
 }
 
@@ -6599,6 +6631,7 @@ probe_xray_detectability() {
     ok)          tls_desc="version+ALPN+cipher match cover" ;;
     mismatch)    tls_pts=15; tls_desc="negotiation differs from cover" ;;
     unreachable) tls_pts=5;  tls_desc="UNVERIFIED${nxnote:- (cover unreachable)}" ;;
+    unverified)  tls_pts=5;  tls_desc="UNVERIFIED (openssl reported no fields)" ;;
     *)           tls_desc="not evaluated (${XRAY_TLSPAR_STATUS:-skipped})" ;;
   esac
   score=$(( score + tls_pts ))

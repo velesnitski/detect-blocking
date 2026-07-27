@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.1] - 2026-07-27
+
+### Fixed
+- **Probe 24 added a permanent, unearned +15 to every Reality config on OpenSSL 3.x.** The negotiated cipher was parsed only from the classic summary line (`    Cipher    : …`, OpenSSL 1.x / LibreSSL); **OpenSSL 3.x prints `New, TLSv1.3, Cipher is …`** instead, so extraction returned empty — and because the comparison was `[ -n "$s_ciph" ] && [ "$s_ciph" = "$c_ciph" ]`, an *unreadable* field scored exactly like a **measured mismatch**. `cipher_match` could therefore never be 1 on OpenSSL 3.x, probe 24 could never report `ok`, and probe 26 added +15 forever — enough to push a config from the *moderate* band into *high*. Found by running against a real config where probe 24 claimed a cipher/ALPN mismatch while printing **identical** JA3S fingerprints, which is self-contradictory. Now: the cipher is parsed from **both** openssl dialects, and each field is **tri-state** (`1` measured match · `0` measured mismatch · `null` not measurable) so an unreadable field is never scored or claimed. The decision counts only measured fields; when none can be read the status is the new **`unverified`**, scored +5 like `unreachable` ("don't score what you couldn't observe") instead of the full mismatch penalty.
+- **Self-contradicting fingerprint text.** The mismatch verdict printed *"JA3S-grade fingerprint X vs cover X"* with two identical hashes. It now only quotes the fingerprints when they genuinely differ, and otherwise states that the ServerHello fingerprint **matches** and the divergence is in the negotiated parameters only.
+- Console output marks unreadable fields `n/a` (with "n/a = this openssl did not report the field, not a mismatch") rather than a bare `0`.
+
 ## [1.10.0] - 2026-07-23
 
 ### Changed

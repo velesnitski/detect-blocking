@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.2] - 2026-07-30
+
+### Fixed
+- **A censor-named cover SNI could evade the severe keyword tell.** The antagonistic-keyword patterns for censor names were hyphen-anchored (`*-rkn*` / `*rkn-*`) — deliberately narrow, because plenty of innocent domains contain those letters as a substring (`workname.com`, `darkness.io`, `networking.dev` all contain "rkn"). The side effect was that a **dot-delimited** label slipped through: a cover such as `…​.rkn` scored only as the softer "does not resolve" tell, missing the severe one — even though a passive SNI blocklist matches that string **directly**, which is the cheapest detection a censor has. Censor names are now matched on **label boundaries** (start, end, `.` or `-`), so dot-anchored labels are caught while innocent substrings still are not, and `zapret` / `tspu` were added alongside the existing terms. Found on a real config whose cover named the censor: the score moved 70 → 80 and the severe verdict now fires.
+- The check is extracted into the unit-tested pure helper `_sni_keyword_hit` (matching the codebase's pure-helper convention) with `tests/test_sni_keyword.sh` covering both the hits and the false-positive traps.
+
 ## [1.10.1] - 2026-07-27
 
 ### Fixed

@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="1.10.1"
+readonly DETECT_BLOCKING_VERSION="1.10.2"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -6173,6 +6173,29 @@ probe_xray_mtu() {
   fi
 }
 
+# Pure: does the cleartext cover SNI carry a circumvention / antagonistic keyword?
+# Echoes 1 on hit, 0 otherwise. A passive SNI blocklist matches these DIRECTLY — the
+# cheapest possible detection, no DNS lookup and no active probe — so this is the
+# severe tell, distinct from the softer "does not resolve" one.
+#
+# Censor-name terms (rkn / tspu) are matched on LABEL BOUNDARIES only (start, end, `.`
+# or `-`), never as a bare substring: plenty of innocent domains contain those letters
+# (`workname.com` contains "rkn"). Anchoring is why `blocked.rkn` used to slip through —
+# the old patterns required a hyphen, so a dot-delimited label never matched.
+_sni_keyword_hit() {
+  local sni_lc
+  sni_lc=$(printf '%s' "${1-}" | tr '[:upper:]' '[:lower:]')
+  case "$sni_lc" in
+    # protocol / circumvention vocabulary — distinctive enough to match anywhere
+    *vpn*|*proxy*|*xray*|*v2ray*|*reality*|*shadowsock*|*trojan*|*wireguard*|*outline*\
+    |*censor*|*roskomnadzor*|*zapret*|*unblock*|*bypass*) printf '1'; return 0 ;;
+    # censor names, label-anchored (start | end | dot | hyphen delimited)
+    rkn|rkn.*|*.rkn|*.rkn.*|*-rkn|*-rkn.*|*rkn-*) printf '1'; return 0 ;;
+    tspu|tspu.*|*.tspu|*.tspu.*|*-tspu|*-tspu.*|*tspu-*) printf '1'; return 0 ;;
+  esac
+  printf '0'
+}
+
 # Pure: compare one negotiated TLS field between server and cover.
 #   1  both sides read and EQUAL          → measured match
 #   0  both sides read and DIFFERENT      → measured mismatch (the only scorable case)
@@ -6695,16 +6718,14 @@ probe_xray_detectability() {
       sniq_pts=$(( sniq_pts + 10 ))
       sniq_desc="NXDOMAIN (self-cooked SNI — soft tell)"
     fi
-    # (b) circumvention/antagonistic keyword in the cleartext SNI.
-    sni_lc=$(printf '%s' "$sni" | tr '[:upper:]' '[:lower:]')
-    case "$sni_lc" in
-      *vpn*|*proxy*|*xray*|*v2ray*|*reality*|*shadowsock*|*trojan*|*wireguard*|*outline*|*censor*|*roskomnadzor*|*-rkn*|*rkn-*|*unblock*|*bypass*)
-        XRAY_PASSIVE_SNI_KEYWORD=1; sniq_pts=$(( sniq_pts + 10 ))
-        case "$sniq_desc" in
-          real-looking) sniq_desc="contains a circumvention keyword (cleartext SNI)" ;;
-          *)            sniq_desc="$sniq_desc + circumvention keyword" ;;
-        esac ;;
-    esac
+    # (b) circumvention/antagonistic keyword in the cleartext SNI (see _sni_keyword_hit).
+    if [ "$(_sni_keyword_hit "$sni")" = "1" ]; then
+      XRAY_PASSIVE_SNI_KEYWORD=1; sniq_pts=$(( sniq_pts + 10 ))
+      case "$sniq_desc" in
+        real-looking) sniq_desc="contains a circumvention keyword (cleartext SNI)" ;;
+        *)            sniq_desc="$sniq_desc + circumvention keyword" ;;
+      esac
+    fi
     # (c) cover popularity: a good Reality cover is a popular site on a major CDN
     #     (blocking it costs the censor collateral). A cover that resolves to a
     #     hosting/VPS network is self-owned / obscure — low collateral to block,

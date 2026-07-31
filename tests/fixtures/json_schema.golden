@@ -245,8 +245,12 @@ probes.xray_throughput.target_bytes
 probes.xray_tls_parity
 probes.xray_tls_parity.alpn_match
 probes.xray_tls_parity.cipher_match
+probes.xray_tls_parity.cover_alpn
 probes.xray_tls_parity.cover_fingerprint
+probes.xray_tls_parity.cover_http3
 probes.xray_tls_parity.ext_match
+probes.xray_tls_parity.http3_parity
+probes.xray_tls_parity.server_alpn
 probes.xray_tls_parity.server_fingerprint
 probes.xray_tls_parity.status
 probes.xray_tls_parity.version_match

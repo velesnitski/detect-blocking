@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-07-31
+
+### Added
+- **HTTP version posture (1.1 / 2 / 3) — reported, linted, and made actionable.** The measurements mostly existed already (probe 6 answers "is UDP/443 usable at all here" with a dependency-free QUIC version-negotiation probe; probe 24 negotiates `h2,http/1.1` against server and cover) but none of it was usable: JSON exposed a lone `alpn_match` boolean and the console said only "negotiation differs from the genuine cover", which tells an operator nothing to change. Now, all default-on:
+  - **The negotiated ALPN of both sides is surfaced** — a `HTTP versions: server ALPN=… · cover ALPN=… · cover HTTP/3=…` line plus `probes.xray_tls_parity.{server_alpn, cover_alpn}` in JSON — and a measured ALPN divergence names itself: *"this server negotiates 'h2' while the genuine cover negotiates 'http/1.1' … make the client's alpn match the cover, or drop the alpn parameter and let the relay decide."*
+  - **Static `alpn` lint.** The declared ALPN was parsed but never checked. `alpn=h2` with `network=ws`/`httpupgrade` now raises a finding — those transports ride an HTTP/1.1 `Upgrade`, and over HTTP/2 that needs Extended CONNECT (RFC 8441), which many servers and CDNs do not implement. A pinned `alpn` on a REALITY config gets an advisory that it must be one the cover actually negotiates, else the parity mismatch is self-inflicted. Zero network cost.
+  - **HTTP/3 cover parity (advisory).** A cover on a large CDN answers QUIC on UDP/443 while a TCP-only Reality server does not, so one UDP packet separates the impersonator from the impersonated. Reuses the existing `_quic_vn_probe`, costs one bounded packet, and reports `probes.xray_tls_parity.{cover_http3, http3_parity}` (`ok` / `cover-only` / `n/a`). **Deliberately not scored:** it correlates with the SNI↔IP mismatch probe 26 already charges +10 for, and plenty of honest hosts skip h3 — scoring both would charge twice for one underlying fact.
+  - Not included, with reasons: **plaintext HTTP/1.1 `Host`-header filtering on :80** is a genuine and distinct censorship vector, but testing it means fetching *censored* hosts from the operator's machine, so it belongs behind `--censor-sweep`/`--full` like the rest of that class, not in the default run. **HTTP/2 frame fingerprinting** (SETTINGS/WINDOW_UPDATE ordering — a real proxy-detection vector, cf. XTLS #4900) needs a client that exposes h2 frames; it stays in the tshark frontier alongside injected-RST-TTL.
+
 ## [1.10.2] - 2026-07-30
 
 ### Fixed

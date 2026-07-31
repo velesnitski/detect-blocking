@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="1.10.2"
+readonly DETECT_BLOCKING_VERSION="1.11.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -1195,6 +1195,10 @@ XRAY_TLSPAR_VER_MATCH=""    # 1 / 0  TLS version parity
 XRAY_TLSPAR_ALPN_MATCH=""   # 1 / 0  ALPN parity
 XRAY_TLSPAR_CIPHER_MATCH="" # 1 / 0  cipher parity
 XRAY_TLSPAR_EXT_MATCH=""    # 1 / 0  ServerHello extension-set parity (JA3S-grade; -tlsextdebug)
+XRAY_TLSPAR_SERVER_ALPN=""  # ALPN the SERVER negotiated (h2 / http/1.1 / "" none) — the HTTP version in use
+XRAY_TLSPAR_COVER_ALPN=""   # ALPN the genuine COVER negotiated (compare: a divergence is a prober's tell)
+XRAY_TLSPAR_COVER_H3=""     # does the cover domain answer QUIC/HTTP-3 on 443? vn|silent|...
+XRAY_TLSPAR_H3_PARITY=""    # ok | cover-only (cover serves h3, this IP does not) | n/a
 XRAY_TLSPAR_SERVER_FP=""    # short hash of server ServerHello shape (version|cipher|extensions)
 XRAY_TLSPAR_COVER_FP=""     # same, for the genuine cover (compare → does the server impersonate it at the JA3S level?)
 # ---- host exposure (whole-host disguise: does the server look like only a web host?) ----
@@ -5326,6 +5330,25 @@ $1"
     info "transport httpupgrade — CDN-frontable (HTTP/1.1 Upgrade behind a public balancer); carries HTTP framing, so the FET entropy classifier does not apply. XTLS vision cannot be used on this transport (it requires raw TCP) — cover-SNI quality and ECH are the levers here"
   fi
 
+  # ALPN vs transport / cover. The declared alpn is parsed from the URL (or tls/reality
+  # settings) but was never checked against what it has to be compatible with:
+  #   - ws / httpupgrade ride an HTTP/1.1 `Upgrade`; over HTTP/2 that needs Extended
+  #     CONNECT (RFC 8441), which many stacks and CDNs do not do → pinning h2 breaks it.
+  #   - on REALITY the handshake is relayed to the cover, so an alpn the cover would
+  #     never choose manufactures the probe-24 parity divergence yourself.
+  local _alpn
+  _alpn=$(_xray_cfg_field alpn '(.outbounds[0].streamSettings.tlsSettings.alpn // .outbounds[0].streamSettings.realitySettings.alpn | if type=="array" then join(",") else . end)')
+  if [ -n "$_alpn" ]; then
+    case "$_alpn" in
+      *h2*)
+        case "$net" in
+          ws|httpupgrade)
+            _lint_add "alpn declares h2 but network=$net rides an HTTP/1.1 Upgrade — over HTTP/2 that requires Extended CONNECT (RFC 8441), which many servers/CDNs do not implement; the tunnel may fail to establish. Drop h2 from alpn (or use http/1.1) for this transport" ;;
+        esac ;;
+    esac
+    [ "$sec" = "reality" ] && info "alpn is pinned to '${_alpn}' on a REALITY config — the handshake is relayed to the cover, so this must be an ALPN that cover actually negotiates, or probe 24 will read as a parity mismatch. Leaving alpn unset lets the relay decide (what a real client of that cover does)"
+  fi
+
   # VLESS without a flow is deprecated upstream (Xray-core is migrating to
   # VLESS-with-flow; XTLS/Xray-core discussion #5568). A forward-looking warning,
   # not a misconfig — so it's a plain warn (visible), not a _lint_add (which frames
@@ -6276,6 +6299,7 @@ probe_xray_tls_parity() {
   # Tri-state per field: 1 measured-match · 0 measured-MISMATCH · "" not measurable.
   # Never score a field we could not read (an unreadable cipher line used to look
   # exactly like a mismatch and added a permanent, unearned +15 in probe 26).
+  XRAY_TLSPAR_SERVER_ALPN="$s_alpn"; XRAY_TLSPAR_COVER_ALPN="$c_alpn"
   XRAY_TLSPAR_VER_MATCH=$(_tls_field_match "$s_ver" "$c_ver")
   XRAY_TLSPAR_ALPN_MATCH=$(_tls_field_match "$s_alpn" "$c_alpn")
   XRAY_TLSPAR_CIPHER_MATCH=$(_tls_field_match "$s_ciph" "$c_ciph")
@@ -6290,6 +6314,28 @@ probe_xray_tls_parity() {
   fi
 
   info "negotiation: version-match=${XRAY_TLSPAR_VER_MATCH:-n/a}, ALPN-match=${XRAY_TLSPAR_ALPN_MATCH:-n/a}, cipher-match=${XRAY_TLSPAR_CIPHER_MATCH:-n/a}, ext-match=${XRAY_TLSPAR_EXT_MATCH:-n/a} (server ${s_ver:-?}/${s_alpn:-none}, cover ${c_ver:-?}/${c_alpn:-none}; n/a = this openssl did not report the field, not a mismatch)"
+  # HTTP/3 parity (advisory, NOT scored). A cover on a big CDN answers QUIC on UDP/443;
+  # a TCP-only Reality server does not. One UDP packet then separates the impersonator
+  # from the impersonated. Deliberately unscored: it correlates with the SNI<->IP
+  # mismatch probe 26 already charges +10 for, and plenty of honest hosts skip h3 —
+  # scoring both would charge twice for the same underlying fact.
+  # No resolvability guard needed: this probe returns early unless the cover answered
+  # TCP/443, so reaching here already proves the cover domain resolves and is up.
+  if check_cmd perl; then
+    XRAY_TLSPAR_COVER_H3=$(_quic_vn_probe "$sni" 443 "$TIMEOUT")
+    if [ "$XRAY_TLSPAR_COVER_H3" = "vn" ] && [ -n "${UDP_QUIC_TARGET:-}" ] && [ "${UDP_QUIC_TARGET}" != "vn" ]; then
+      XRAY_TLSPAR_H3_PARITY="cover-only"
+      warn "HTTP/3 parity: the cover domain answers QUIC on UDP/443 but this server does not — a prober can tell them apart with a single UDP packet (advisory, not scored; the SNI<->IP mismatch already covers the same underlying fact). Serving QUIC is not expected of a Reality endpoint; it matters only because you impersonate a host that does"
+    elif [ "$XRAY_TLSPAR_COVER_H3" = "vn" ]; then
+      XRAY_TLSPAR_H3_PARITY="ok"
+    else
+      XRAY_TLSPAR_H3_PARITY="n/a"
+    fi
+  else
+    XRAY_TLSPAR_H3_PARITY="n/a"
+  fi
+
+  info "HTTP versions: server ALPN=${s_alpn:-none} · cover ALPN=${c_alpn:-none} · cover HTTP/3=$( [ "$XRAY_TLSPAR_COVER_H3" = "vn" ] && printf 'yes' || printf 'no/unknown' )"
   info "ServerHello fingerprint (JA3S-grade): server ${XRAY_TLSPAR_SERVER_FP:-?} vs cover ${XRAY_TLSPAR_COVER_FP:-?}$( [ -n "$XRAY_TLSPAR_SERVER_FP" ] && [ "$XRAY_TLSPAR_SERVER_FP" = "$XRAY_TLSPAR_COVER_FP" ] && echo ' (match)' || echo ' (DIFFER)' )"
 
   # Decision on version+ALPN+cipher, but ONLY on fields we actually measured: any
@@ -6315,6 +6361,12 @@ probe_xray_tls_parity() {
   else
     warn "TLS negotiation differs from the genuine cover"
     XRAY_TLSPAR_STATUS="mismatch"
+    # Name the HTTP version divergence explicitly — "negotiation differs" alone gives
+    # the operator nothing to change. This is the single most common cause: the client
+    # pins an ALPN the cover would never pick, so the relayed handshake cannot match.
+    if [ "$XRAY_TLSPAR_ALPN_MATCH" = "0" ]; then
+      warn "HTTP version mismatch: this server negotiates '${s_alpn:-none}' while the genuine cover negotiates '${c_alpn:-none}' — an active prober comparing the two separates them on one handshake. Fix: make the client's alpn match the cover (or drop the alpn parameter entirely and let the relay decide, which is what a real client of that cover would do)"
+    fi
     add_verdict "Server's TLS negotiation does not match the genuine cover site (version/ALPN/cipher$( [ "$XRAY_TLSPAR_EXT_MATCH" = "0" ] && echo '/ServerHello extensions' )$( if [ -n "$XRAY_TLSPAR_SERVER_FP" ] && [ "$XRAY_TLSPAR_SERVER_FP" != "$XRAY_TLSPAR_COVER_FP" ]; then printf '; JA3S-grade fingerprint %s vs cover %s' "$XRAY_TLSPAR_SERVER_FP" "$XRAY_TLSPAR_COVER_FP"; else printf '; the JA3S-grade ServerHello fingerprint itself MATCHES the cover, so the divergence is in the negotiated parameters only'; fi )) — it doesn't fully impersonate the host its serverName claims, a fingerprint an active prober or a JA3S/JA4S fingerprinter can use. Point Reality 'dest' at the exact cover the client's serverName expects (and confirm probes 15/20)"
   fi
 }
@@ -7231,6 +7283,10 @@ _emit_json() {
     --arg xmtu_status       "$XRAY_MTU_STATUS" \
     --arg xmtu_path         "$XRAY_MTU_PATH" \
     --arg xtp_status        "$XRAY_TLSPAR_STATUS" \
+    --arg xtp_server_alpn   "${XRAY_TLSPAR_SERVER_ALPN:-}" \
+    --arg xtp_cover_alpn    "${XRAY_TLSPAR_COVER_ALPN:-}" \
+    --arg xtp_cover_h3      "${XRAY_TLSPAR_COVER_H3:-}" \
+    --arg xtp_h3_parity     "${XRAY_TLSPAR_H3_PARITY:-}" \
     --arg xtp_ver           "$XRAY_TLSPAR_VER_MATCH" \
     --arg xtp_alpn          "$XRAY_TLSPAR_ALPN_MATCH" \
     --arg xtp_cipher        "$XRAY_TLSPAR_CIPHER_MATCH" \
@@ -7564,6 +7620,10 @@ _emit_json() {
           alpn_match: tri_bool(($xtp_alpn | tonumber? // -1)),
           cipher_match: tri_bool(($xtp_cipher | tonumber? // -1)),
           ext_match: tri_bool(($xtp_ext | tonumber? // -1)),
+          server_alpn: opt($xtp_server_alpn),
+          cover_alpn: opt($xtp_cover_alpn),
+          cover_http3: opt($xtp_cover_h3),
+          http3_parity: opt($xtp_h3_parity),
           server_fingerprint: opt($xtp_sfp),
           cover_fingerprint: opt($xtp_cfp)
         },

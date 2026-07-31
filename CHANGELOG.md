@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-07-31
+
+### Added
+- **Full-output contract gate (`tests/test_json_values_golden.sh`).** The existing schema gate compares JSON **key paths** only, so it cannot see a value landing in the wrong key, a positional field decoded in the wrong order, or a share-safety leak into a field that used to hold a boolean. The new gate compares the **whole emitted JSON — every value** — against a recorded blob, with volatile fields (`timestamp`, `version`, the randomly allocated SOCKS port) masked; those were found empirically by diffing two identical runs, not guessed. Key order is normalised (`jq -S`) on purpose: order is semantically meaningless in JSON, and normalising keeps the blob stable while still catching wrong value / wrong key / dropped field / changed type. Verified against a deliberately injected change, so it is not a no-op. This is the prerequisite safety net for the planned `_emit_json` restructuring.
+- **Verdicts now carry a stable machine code.** `add_verdict [CODE] "human text"` records the code in a parallel `VERDICT_CODES` array; `_has_verdict_code` looks one up. The code is detected by shape (no whitespace), so uncoded legacy calls keep working during the conversion.
+
+### Changed
+- **The false-positive suppressor keys on verdict CODES instead of prose.** Verdict wording is explicitly *not* part of the 1.x contract, yet the suppressor matched it with globs — so rewording a verdict could silently stop it from being cancelled, resurfacing a "likely full IP block — rotate your endpoint" verdict for a tunnel that later probes proved healthy, with no test able to catch it. It now matches `transport-silent-drop` / `data-plane-dead` by code, and filters `VERDICTS` and `VERDICT_CODES` **by index in lockstep** so the two arrays cannot desynchronise. Verdict text output is byte-identical (confirmed by the new value gate). Covered by `tests/test_verdict_codes.sh`, which also asserts the suppressor never regresses to prose matching.
+
 ## [1.11.0] - 2026-07-31
 
 ### Added

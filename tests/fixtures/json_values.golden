@@ -1,0 +1,322 @@
+{
+  "environment": {
+    "default_interface": null,
+    "on_vpn": false,
+    "system_vpn_services": null,
+    "vpn_like_interfaces": []
+  },
+  "label": null,
+  "probes": {
+    "censor_sweep": {
+      "results": [],
+      "status": null,
+      "tunnel_used": null
+    },
+    "conn_limit": {
+      "failed": null,
+      "max_handshake_ms": null,
+      "min_handshake_ms": null,
+      "requested": null,
+      "status": "unreachable",
+      "succeeded": null,
+      "verdict": null
+    },
+    "control": {
+      "passed": 0,
+      "total": 0,
+      "unreachable": []
+    },
+    "cover_scan": {
+      "best": null,
+      "candidates": [],
+      "status": null
+    },
+    "dns": {
+      "divergence_class": null,
+      "dns_block": false,
+      "doh_a": [],
+      "doh_integrity": {
+        "returned": [],
+        "state": null
+      },
+      "doh_multi": {
+        "compromised": 0,
+        "ok": 0,
+        "providers": [],
+        "unreachable": 0
+      },
+      "dot_integrity": {
+        "returned": [],
+        "state": null
+      },
+      "system_a": []
+    },
+    "host_exposure": {
+      "cdn_edge": null,
+      "open_ports": [],
+      "status": "ok"
+    },
+    "hysteria": {
+      "insecure": null,
+      "obfs": null,
+      "sni_explicit": null,
+      "sni_keyword": null,
+      "status": null
+    },
+    "ipv6": {
+      "aaaa": [],
+      "https_code": null,
+      "target_reachable": false
+    },
+    "localize": {
+      "class": null,
+      "last_hop": null,
+      "last_hop_asn": null,
+      "last_hop_country": null,
+      "reached_destination": null,
+      "status": null
+    },
+    "openvpn": {
+      "config_provided": false,
+      "fingerprintable": null,
+      "handshake_replied": false,
+      "handshake_response_hex": null,
+      "obfuscated": null,
+      "posture": null,
+      "proto": null,
+      "tcp_port_reachable": false,
+      "tls_auth": null,
+      "tls_crypt": null,
+      "udp_port_accessible": false
+    },
+    "panel_probe": {
+      "panel_found": null,
+      "status": null
+    },
+    "request_filter": {
+      "chrome_ua_code": null,
+      "default_ua_code": null,
+      "impersonate_binary": null,
+      "impersonate_code": null
+    },
+    "rst": {
+      "elapsed_seconds": null,
+      "handshake_ok": false,
+      "openssl_exit_code": 0
+    },
+    "tcp": {
+      "baseline_ip": null,
+      "baseline_reachable": false,
+      "target_icmp_ok": null,
+      "target_reachable": false
+    },
+    "tls": {
+      "fake_sni_ok": false,
+      "fragmented_ok": null,
+      "no_sni_ok": false,
+      "proper_sni_ok": false
+    },
+    "tunnel": {
+      "default_iface_is_tunnel": false,
+      "exit_country": null,
+      "exit_differs": null,
+      "status": null
+    },
+    "udp": {
+      "ike4500_responsive": false,
+      "ike500_responsive": false,
+      "quic_baseline": null,
+      "quic_baseline_code": null,
+      "quic_target": null,
+      "quic_verdict": null
+    },
+    "whitelist": {
+      "controls_reachable": null,
+      "permitted_reachable": null,
+      "status": null
+    },
+    "xray_active_probe": {
+      "genuine_http_code": "200",
+      "matches_cover": false,
+      "relay_http_code": "000",
+      "status": "exposed"
+    },
+    "xray_bufferbloat": {
+      "idle_rtt_ms": null,
+      "inflation_ms": null,
+      "jitter_ms": null,
+      "loaded_rtt_ms": null,
+      "status": "skipped"
+    },
+    "xray_clock": {
+      "skew_seconds": 0,
+      "status": "ok"
+    },
+    "xray_cover": {
+      "chain_valid": null,
+      "cn_matches_servername": null,
+      "self_signed": null,
+      "status": "unreachable"
+    },
+    "xray_cover_throttle": {
+      "baseline_bytes_per_second": null,
+      "cover_bytes_per_second": null,
+      "status": "inconclusive"
+    },
+    "xray_detectability": {
+      "band": "moderate",
+      "cover_obscure": false,
+      "deployment_fingerprint": "94b2750f704e",
+      "mux_enabled": null,
+      "passive_fingerprint_strong": false,
+      "port_standard": false,
+      "score": 25,
+      "sni_ip_asn_match": null,
+      "sni_keyword": false,
+      "sni_resolves": true,
+      "status": "ok",
+      "tls_in_tls_protected": true,
+      "utls_fp": "chrome",
+      "utls_fp_uncommon": false,
+      "volume_throttle_suspected": null
+    },
+    "xray_egress": {
+      "asn_hosting": null,
+      "country": null,
+      "datacenter_fallback": null,
+      "dns_resolver_geo": null,
+      "egress_colocated": null,
+      "hosting": null,
+      "mobile": null,
+      "proxy": null,
+      "status": "skipped"
+    },
+    "xray_fleet": {
+      "outbounds_ok": null,
+      "outbounds_total": null,
+      "per_outbound": [],
+      "status": "single"
+    },
+    "xray_full_config": {
+      "config_path": null,
+      "egress_ip": null,
+      "egress_location": null,
+      "failure_kind": null,
+      "rtt_ms": null,
+      "slow_handshake_retry": false,
+      "socks_port_used": "<masked>",
+      "status": "xray-bind-failed",
+      "synthesized_from_url": true
+    },
+    "xray_lint": {
+      "config_valid": null,
+      "desync_chain": null,
+      "dialer_proxy": null,
+      "fet_exposed": false,
+      "findings": [],
+      "id_uuid": true,
+      "status": "ok",
+      "vless_encryption": "none",
+      "vless_encryption_padding": false,
+      "vless_flow_deprecated": false
+    },
+    "xray_mtu": {
+      "path_mtu": 1500,
+      "status": "ok"
+    },
+    "xray_protocol": {
+      "egress_ip": null,
+      "egress_location": null,
+      "failure_kind": "other",
+      "rtt_ms": null,
+      "slow_handshake_retry": false,
+      "status": "failed",
+      "tester_binary": "xray-knife",
+      "url_display": "vless://<creds>@127.0.0.1:1"
+    },
+    "xray_routing": {
+      "default_outbound": null,
+      "dns_leak_risk": null,
+      "dns_split_horizon": null,
+      "domain_strategy": null,
+      "live_results": [],
+      "live_test": null,
+      "proxy_outbounds": [],
+      "proxy_sensitive_categories": [],
+      "sniffing": null,
+      "status": "none",
+      "undefined_outbound_tags": []
+    },
+    "xray_sni_privacy": {
+      "ech_applies": false,
+      "ech_published_by_cover": null,
+      "posture": "reality",
+      "sni_cleartext": true,
+      "status": "ok"
+    },
+    "xray_speedtest": {
+      "best_bytes_per_second": null,
+      "best_endpoint": null,
+      "best_mbps": null,
+      "per_endpoint": [],
+      "status": "skipped",
+      "streams": 4
+    },
+    "xray_stability": {
+      "first_failure_seconds": null,
+      "kill_at_bytes": null,
+      "per_pulse": [],
+      "pulses_killed": null,
+      "pulses_ok": null,
+      "pulses_retried_recovered": null,
+      "pulses_slow": null,
+      "pulses_total": null,
+      "rtt_max_ms": null,
+      "rtt_min_ms": null,
+      "status": "skipped"
+    },
+    "xray_throughput": {
+      "bytes_per_second": null,
+      "bytes_received": null,
+      "seconds": null,
+      "status": "skipped",
+      "target_bytes": 10485760
+    },
+    "xray_tls_parity": {
+      "alpn_match": null,
+      "cipher_match": null,
+      "cover_alpn": null,
+      "cover_fingerprint": null,
+      "cover_http3": null,
+      "ext_match": null,
+      "http3_parity": null,
+      "server_alpn": null,
+      "server_fingerprint": null,
+      "status": "unreachable",
+      "version_match": null
+    },
+    "youtube_reach": {
+      "failed": null,
+      "max_ttfb_ms": null,
+      "min_ttfb_ms": null,
+      "requested": null,
+      "status": "skipped",
+      "succeeded": null,
+      "verdict": null
+    }
+  },
+  "schema_version": 1,
+  "target": {
+    "host": "127.0.0.1",
+    "port_tcp": 1,
+    "port_udp": 443,
+    "resolved_ip": null,
+    "resolved_source": null
+  },
+  "timestamp": "<masked>",
+  "verdicts": [
+    "Server fails active probing — an unauthenticated HTTPS request does not get relayed to the genuine cover site (no coherent response), so it does not behave like the site it impersonates. Combined with the cover-cert check (probe 15) this is a strong VPN fingerprint. Fix the Reality 'dest'/'serverNames' so unauth clients are proxied to the real cover",
+    "Detectability 25/100 (moderate) — active probing may be clean, but passive structure (port / SNI↔IP) still leaves a fingerprint. These are FP-prone for a censor at scale, but a targeted check catches them: serve on 443 and choose a cover hosted on a large shared CDN"
+  ],
+  "version": "<masked>"
+}

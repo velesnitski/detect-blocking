@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="1.11.0"
+readonly DETECT_BLOCKING_VERSION="1.12.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -1306,7 +1306,38 @@ info() { [ "$LOG_QUIET" = "1" ] || printf "  ${DIM}        %s${RST}\n" "$1"; _lo
 hdr()  { [ "$LOG_QUIET" = "1" ] || printf "\n${BLU}== %s ==${RST}\n" "$1"; _log_line HDR  "$1"; }
 
 declare -a VERDICTS=()
-add_verdict() { VERDICTS+=("$1"); _log_line VERDICT "$1"; }
+declare -a VERDICT_CODES=()   # parallel to VERDICTS: stable machine code per verdict ("" = uncoded)
+# add_verdict [CODE] "human text"
+#
+# CODE is a short stable token (no whitespace). Everything that CONSUMES a verdict —
+# the false-positive suppressor, the recommendation engine, the fix-class classifier —
+# keys off the CODE, never off the prose. That matters because verdict wording is
+# explicitly NOT part of the 1.x contract: before codes, rewording a verdict silently
+# unhooked its recommendation, or (worse) stopped the suppressor from cancelling a
+# false "rotate your endpoint" on a healthy tunnel, with no test able to catch it.
+#
+# The code is detected by shape (no whitespace) so an uncoded legacy call still works;
+# tests/test_verdict_codes.sh asserts that no uncoded call remains.
+add_verdict() {
+  local code=""
+  case "${1-}" in
+    ''|*[[:space:]]*) : ;;          # first arg is the human text — no code given
+    *) code="$1"; shift ;;
+  esac
+  VERDICTS+=("$1")
+  VERDICT_CODES+=("$code")
+  _log_line VERDICT "${code:+[$code] }$1"
+}
+
+# Is CODE present among the verdicts raised so far? The code-based replacement for
+# globbing verdict prose.
+_has_verdict_code() {
+  local c want="$1"
+  for c in ${VERDICT_CODES[@]+"${VERDICT_CODES[@]}"}; do
+    [ "$c" = "$want" ] && return 0
+  done
+  return 1
+}
 
 # QUIC-SNI advisory (gfw.report USENIX'25): since 2024 the GFW decrypts the QUIC
 # Initial packet (the key is derived from its header), reads the SNI, and blocks
@@ -2370,7 +2401,7 @@ probe_rst_injection() {
     add_verdict "Active RST injection by DPI mid-handshake"
   elif awk "BEGIN{exit !($elapsed >= $TIMEOUT - 1)}"; then
     fail "handshake hangs full timeout (${elapsed}s) → silent drop (no RST, blackhole)"
-    add_verdict "Silent packet drop (firewall blackhole, not DPI reset)"
+    add_verdict transport-silent-drop "Silent packet drop (firewall blackhole, not DPI reset)"
   else
     warn "handshake failed at ${elapsed}s – inconclusive timing"
   fi
@@ -3447,7 +3478,7 @@ probe_xray_throughput() {
   if [ "$bps" -lt 1024 ]; then
     fail "tunnel throughput collapsed: ${human} (${bytes} bytes in ${time_s}s, curl rc=$rc)"
     XRAY_THROUGHPUT_STATUS="broken"
-    add_verdict "Reality tunnel handshakes successfully but data plane is unusable — payload doesn't flow (mid-stream RST, MTU clamp, or post-detection kill-shaping). Inspect with --pcap and look for RST flags arriving shortly after the first MB"
+    add_verdict data-plane-dead "Reality tunnel handshakes successfully but data plane is unusable — payload doesn't flow (mid-stream RST, MTU clamp, or post-detection kill-shaping). Inspect with --pcap and look for RST flags arriving shortly after the first MB"
   elif [ "$bps" -lt 51200 ]; then
     fail "tunnel throughput severely throttled: ${human}"
     XRAY_THROUGHPUT_STATUS="throttled-severe"
@@ -7974,18 +8005,24 @@ fi
 # probe 2's vantage-aware cross-reference. Runs before the summary so the JSON
 # and the printed verdict stay consistent.
 if [ "${#VERDICTS[@]}" -gt 0 ]; then
-  _vkept=(); _vsupp=0
-  for v in "${VERDICTS[@]}"; do
-    case "$v" in
-      *"Silent packet drop (firewall blackhole"*)
+  # Cancel verdicts that a LATER probe disproved. This keys on the verdict CODE, not
+  # its prose: keying on wording meant a reworded verdict silently stopped being
+  # cancelled, resurfacing a false "likely full IP block — rotate your endpoint" on a
+  # demonstrably healthy tunnel. Both arrays are filtered BY INDEX so they stay aligned.
+  _vkept=(); _ckept=(); _vsupp=0; _vi=0
+  while [ "$_vi" -lt "${#VERDICTS[@]}" ]; do
+    v="${VERDICTS[$_vi]}"; _vc="${VERDICT_CODES[$_vi]:-}"
+    _vi=$(( _vi + 1 ))
+    case "$_vc" in
+      transport-silent-drop)
         if [ "${XRAY_JSON_STATUS:-}" = "ok" ]; then _vsupp=1; continue; fi ;;
-      *"data plane is unusable"*)
+      data-plane-dead)
         if [ "${XRAY_SPEEDTEST_STATUS:-}" = "ok" ] || [ "${XRAY_STABILITY_STATUS:-}" = "ok" ]; then _vsupp=1; continue; fi ;;
     esac
-    _vkept+=("$v")
+    _vkept+=("$v"); _ckept+=("$_vc")
   done
-  VERDICTS=()
-  [ "${#_vkept[@]}" -gt 0 ] && VERDICTS=("${_vkept[@]}")
+  VERDICTS=(); VERDICT_CODES=()
+  [ "${#_vkept[@]}" -gt 0 ] && { VERDICTS=("${_vkept[@]}"); VERDICT_CODES=("${_ckept[@]}"); }
   if [ "$_vsupp" = "1" ]; then
     add_verdict "Transient (not a block): an early handshake (probe 5) and/or single-stream throughput (probe 13) read as a hard failure, but the tunnel established (probe 12) and multi-stream capacity (probe 14) / held-session stability (probe 17) are healthy — so that's load / path jitter, not an IP block or a dead data plane. The endpoint is fine; don't rotate it on that evidence."
   fi

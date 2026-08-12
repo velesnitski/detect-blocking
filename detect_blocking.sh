@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="1.12.0"
+readonly DETECT_BLOCKING_VERSION="1.12.1"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -3903,15 +3903,37 @@ ${h}|${dirok}|na|${verdict}"
 # Is <ip> a CDN edge? Reuses the probe-26 org-keyword approach (HTTPS-first, ip-api
 # fallback). A CDN edge is shared and answers many ports BY DESIGN, so "panel ports
 # open" there is the CDN's own alt-ports, not the origin's panel. Returns 0 = CDN.
+# Is this endpoint a CDN edge? TRI-STATE by exit code:
+#   0 = yes, a CDN edge   1 = no, not a CDN   2 = COULD NOT DETERMINE
+#
+# The third state matters. Callers use "not a CDN" to justify a hard finding (an open
+# 8080/2053 on your own origin is a takeover risk; on a CDN edge those are the CDN's
+# own ports, served by design). Before 1.12.1 a failed lookup collapsed into "not a
+# CDN", so a CDN-fronted host got a false takeover verdict — and the lookup failed
+# routinely, because the caller passes VPN_HOST when probe 1 has not run, and the
+# IP-info APIs 404 on a hostname ("Please provide a valid IP address").
+#
+# So: resolve a hostname to an address first, and report 2 when the answer is unknown.
 _is_cdn_ip() {
   local ip="$1" info
-  [ -n "$ip" ] && check_cmd curl || return 1
+  [ -n "$ip" ] || return 2
+  check_cmd curl || return 2
+  if ! _is_ip_literal "$ip"; then
+    ip=$(_resolve_a_records "$ip" 2>/dev/null | _first_word)
+    [ -n "$ip" ] || return 2          # cannot resolve → unknown, NOT "no"
+  fi
   info=$(_curl "https://ipinfo.io/${ip}/json" 2>/dev/null)
   [ -z "$info" ] && info=$(_curl "http://ip-api.com/json/${ip}?fields=org,as,isp" 2>/dev/null)
+  # An error body (404 / rate-limit) carries no org field — treat as unknown, not "no".
+  case "$info" in
+    ''|*'"status": 404'*|*'"status":404'*|*'Wrong ip'*|*'rate limit'*|*'"status":"fail"'*) return 2 ;;
+  esac
   printf '%s' "$info" | tr '[:upper:]' '[:lower:]' \
     | grep -qE 'cloudflare|akamai|fastly|cloudfront|edgecast|edgio|g.?core|bunny|stackpath|cdn77|incapsula|sucuri|netlify|vercel|fbcdn|limelight|lumen' \
     && return 0
-  return 1
+  # A real answer that names some other org → genuinely not a CDN.
+  printf '%s' "$info" | grep -qiE '"org"|"as"|"isp"' && return 1
+  return 2
 }
 
 # Classify a panel-port response (pure, unit-testable). Args: httpcode server-header
@@ -3965,7 +3987,13 @@ probe_host_exposure() {
     # 8080/2053/2087/8443…), so "panel port open" here is the CDN's, not the
     # origin's — the classic false positive on a CDN-fronted config. Downgrade it
     # and point at --panel-probe against the real backend IP.
-    if _is_cdn_ip "$ip"; then
+    _cdnrc=0; _is_cdn_ip "$ip" || _cdnrc=$?
+    if [ "$_cdnrc" = "2" ]; then
+      # Unknown: do NOT claim an exposed panel. On a CDN-fronted host these ports are
+      # the CDN's own and the finding would be false; say what we could not establish.
+      XRAY_HOSTEXP_CDN=""
+      warn "could not determine whether ${ip} is a CDN edge (address lookup unavailable) — so it is UNKNOWN whether these are the CDN's own alt-ports or an exposed panel on your origin. Re-run including the dns probe, or audit directly with --panel-probe <origin-ip>"
+    elif [ "$_cdnrc" = "0" ]; then
       XRAY_HOSTEXP_CDN=1
       info "…but the resolved IP is a CDN edge — those are the CDN's own alt-ports (e.g. Cloudflare serves 8080/2053/2087/8443), NOT an exposed x-ui/3x-ui panel. Origin panel exposure can't be seen through the CDN; audit the backend directly with: --panel-probe <origin-ip>"
     else

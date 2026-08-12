@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.12.1] - 2026-08-12
+
+### Fixed
+- **CDN-fronted hosts got a false "exposed proxy-panel" verdict.** An open 8080/2053 means opposite things depending on the host: on your own origin it is a takeover risk, on a CDN edge it is the CDN's own port served by design (Cloudflare answers 8080/2053/2087/8443). `_is_cdn_ip` decided that, but returned a plain yes/no — so a **failed lookup collapsed into "not a CDN"** and raised the hard verdict. It failed routinely: host-exposure passes `VPN_HOST` when probe 1 has not run (`--only xray`, `--skip dns`), and the IP-info APIs reject a hostname with `404 "Please provide a valid IP address"`. Found while scanning a live 16-node CDN-fronted fleet — **every node reported an exposed panel that did not exist**. Now `_is_cdn_ip` resolves a hostname to an address first, and is **tri-state**: `0` CDN · `1` genuinely not a CDN · `2` could-not-determine (empty/unresolvable input, or an error body such as a 404 or rate-limit). Host exposure handles the unknown state explicitly — it reports what could not be established instead of asserting an exposure, and the auto `--panel-probe` fires only on a *confirmed* non-CDN. Covered by `tests/test_cdn_detection.sh`.
+
 ## [1.12.0] - 2026-07-31
 
 ### Added

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.12.2] - 2026-08-13
+
+### Fixed
+- **Two conclusions were reported that had never been measured.** Both surfaced on a real in-region run whose own output contradicted itself.
+  - **The YouTube verdict blamed the egress even when the tunnel carried nothing.** With probe 12 failed, the report simultaneously said *"the tunnel itself isn't passing traffic"* and *"the egress IP is blocked/listed by Google … verify the egress reputation"* — the second is a restatement of the first, not evidence about the egress, and it sends the operator to audit a healthy one. The egress verdict is now raised only when probe 12 **proved** the tunnel carries traffic; otherwise the run says plainly that this is not evidence about the egress. Carries the code `yt-egress-blocked`.
+  - **HTTP/3 parity reported `ok` without measuring the target.** A Reality/TCP config never has its target QUIC-probed (probe 6 only baselines), and the v1.11.0 logic fell through to `ok` whenever the *cover* served h3 — asserting a parity nobody observed. `ok` now requires **both** sides measured; an unprobed target is `n/a`.
+  - Covered by `tests/test_unmeasured_claims.sh`, which pins the gate ordering and the full h3 truth table.
+
 ## [1.12.1] - 2026-08-12
 
 ### Fixed

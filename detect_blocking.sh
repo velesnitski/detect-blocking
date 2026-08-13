@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="1.12.1"
+readonly DETECT_BLOCKING_VERSION="1.12.2"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -4235,8 +4235,17 @@ probe_yt_reach() {
       warn "${succ}/${n} completed but TTFB ballooned ${minms}→${maxms}ms under load — Google is likely throttling the egress IP (datacenter egress); expect buffering"
       add_verdict "YouTube reachable but TTFB degrades badly under concurrency (${minms}→${maxms}ms) — googlevideo throttles datacenter/VPN egress IPs. Route YouTube via a residential/clean egress for usable playback [server-side]" ;;
     all-failed)
-      warn "0/${n} — YouTube is unreachable through the tunnel; the egress IP is likely blocked/listed by Google, or routing drops these destinations"
-      add_verdict "YouTube: 0/${n} connections completed through the tunnel — the egress IP is blocked/listed by Google or routing drops YouTube. Verify the egress reputation and that YouTube isn't force-routed to a dead path [server-side]" ;;
+      # Blaming the EGRESS only makes sense if the tunnel demonstrably carries traffic.
+      # When probe 12 also failed, "YouTube unreachable" is a restatement of "the tunnel
+      # is dead" and says nothing about egress reputation — asserting it anyway sends the
+      # operator to audit a healthy egress. (Seen on a real in-region run: the tool said
+      # the tunnel carried nothing AND that Google had listed the egress, in one report.)
+      if [ "${XRAY_JSON_STATUS:-}" = "ok" ]; then
+        warn "0/${n} — YouTube is unreachable through a WORKING tunnel (probe 12 passed); the egress IP is likely blocked/listed by Google, or routing drops these destinations"
+        add_verdict yt-egress-blocked "YouTube: 0/${n} connections completed through the tunnel, while probe 12 confirmed the tunnel itself carries traffic — so the egress IP is blocked/listed by Google or YouTube is force-routed to a dead path. Verify the egress reputation [server-side]"
+      else
+        warn "0/${n} — YouTube unreachable through the tunnel, but probe 12 did not confirm the tunnel carries traffic either, so this is NOT evidence about the egress (see the cross-reference below)"
+      fi ;;
   esac
   # Cross-reference with probe 12: now that YT runs independently, a divergence is a
   # real signal — disentangles "dead tunnel" from "one destination blocked".
@@ -4244,7 +4253,7 @@ probe_yt_reach() {
     case "$YT_REACH_VERDICT" in
       clean|degraded|capped)
         info "→ YouTube works through the tunnel even though probe 12's Cloudflare check failed: the tunnel is ALIVE; Cloudflare specifically is blocked/reset at the egress (or was transient), not the whole tunnel"
-        add_verdict "Tunnel carries YouTube but not Cloudflare (probe 12) — a destination-specific egress block on Cloudflare, NOT a dead tunnel; re-check probe 12 against a different target before concluding the config is broken" ;;
+        add_verdict tunnel-cf-only-block "Tunnel carries YouTube but not Cloudflare (probe 12) — a destination-specific egress block on Cloudflare, NOT a dead tunnel; re-check probe 12 against a different target before concluding the config is broken" ;;
       all-failed)
         info "→ both Cloudflare (probe 12) and YouTube fail through the tunnel: the tunnel itself isn't passing traffic — most likely the Reality outbound/auth failed (verify UUID / keys / flow / target SNI), not a per-site block" ;;
     esac
@@ -6382,11 +6391,16 @@ probe_xray_tls_parity() {
   # TCP/443, so reaching here already proves the cover domain resolves and is up.
   if check_cmd perl; then
     XRAY_TLSPAR_COVER_H3=$(_quic_vn_probe "$sni" 443 "$TIMEOUT")
-    if [ "$XRAY_TLSPAR_COVER_H3" = "vn" ] && [ -n "${UDP_QUIC_TARGET:-}" ] && [ "${UDP_QUIC_TARGET}" != "vn" ]; then
+    # Order matters: "ok" may only be claimed when BOTH sides were measured. A Reality/TCP
+    # config never gets its target QUIC-probed (probe 6 only baselines), and recording that
+    # as "ok" asserted a parity nobody measured.
+    if [ "$XRAY_TLSPAR_COVER_H3" != "vn" ] || [ -z "${UDP_QUIC_TARGET:-}" ]; then
+      XRAY_TLSPAR_H3_PARITY="n/a"
+    elif [ "${UDP_QUIC_TARGET}" = "vn" ]; then
+      XRAY_TLSPAR_H3_PARITY="ok"
+    elif [ "$XRAY_TLSPAR_COVER_H3" = "vn" ] && [ -n "${UDP_QUIC_TARGET:-}" ] && [ "${UDP_QUIC_TARGET}" != "vn" ]; then
       XRAY_TLSPAR_H3_PARITY="cover-only"
       warn "HTTP/3 parity: the cover domain answers QUIC on UDP/443 but this server does not — a prober can tell them apart with a single UDP packet (advisory, not scored; the SNI<->IP mismatch already covers the same underlying fact). Serving QUIC is not expected of a Reality endpoint; it matters only because you impersonate a host that does"
-    elif [ "$XRAY_TLSPAR_COVER_H3" = "vn" ]; then
-      XRAY_TLSPAR_H3_PARITY="ok"
     else
       XRAY_TLSPAR_H3_PARITY="n/a"
     fi

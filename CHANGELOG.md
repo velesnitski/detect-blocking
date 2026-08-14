@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.12.4] - 2026-08-13
+
+### Changed
+- **Corrected the non-canonical-id message: it is not a detectability finding.** The lint previously called a short or shared client id "a fleet-credential tell", which implies a censor can observe it. It cannot — the id travels inside the authenticated/encrypted portion of the handshake and is never sent in cleartext, so it carries no wire-visible signal. The message now states that plainly and keeps only the risks that are real, both operational rather than stealth-related: a truncated or mistyped id still hashes to a valid derived UUID, so it passes `xray -test` and fails later at **auth** against a server holding the full string; and a very short id has less guessing resistance. Recommends confirming the id matches the server byte for byte, and a full UUID for new nodes.
+
 ## [1.12.3] - 2026-08-13
 
 ### Fixed

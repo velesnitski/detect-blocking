@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="1.12.3"
+readonly DETECT_BLOCKING_VERSION="1.12.4"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -5543,7 +5543,13 @@ $1"
       XRAY_ID_UUID=1
     else
       XRAY_ID_UUID=0
-      info "client id is not a canonical UUID (${#cfg_id}-char string) — VLESS/VMess hash it to a derived UUID so it still works, but it's unusual (a typo/truncated UUID also passes 'xray -test' yet fails auth, and a short/shared id is a fleet-credential tell); confirm it matches the server's user id exactly"
+      # NOT a detectability finding: the id travels inside the authenticated/encrypted
+      # portion of the handshake, so a network observer never sees it — calling it a
+      # "tell" (as this line used to) implied a wire-visibility it does not have. The
+      # real risks are operational: a silently-truncated id still hashes to something
+      # valid, so it passes `xray -test` and then fails AUTH against a server that
+      # expects the full value; and a very short id has less guessing resistance.
+      info "client id is not a canonical UUID (${#cfg_id}-char string) — VLESS/VMess hash any string into a derived UUID, so it authenticates fine PROVIDED the server stores the identical string. This is not visible to a censor (the id is never sent in cleartext); the risk is operational: a truncated/typo'd id still passes 'xray -test' and only fails later at auth. Confirm it matches the server's user id byte for byte; prefer a full UUID for new nodes (more entropy, no ambiguity)"
     fi
   fi
 

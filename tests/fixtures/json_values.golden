@@ -53,7 +53,7 @@
     },
     "host_exposure": {
       "cdn_edge": null,
-      "open_ports": [],
+      "open_ports": "<masked>",
       "status": "ok"
     },
     "hysteria": {
@@ -227,11 +227,11 @@
     "xray_protocol": {
       "egress_ip": null,
       "egress_location": null,
-      "failure_kind": "other",
+      "failure_kind": "<masked>",
       "rtt_ms": null,
       "slow_handshake_retry": false,
-      "status": "failed",
-      "tester_binary": "xray-knife",
+      "status": "<masked>",
+      "tester_binary": "<masked>",
       "url_display": "vless://<creds>@127.0.0.1:1"
     },
     "xray_routing": {

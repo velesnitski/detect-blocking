@@ -15,10 +15,15 @@
 # JSON, and normalising keeps the blob stable while still catching every case that
 # matters — wrong value, wrong key, dropped field, changed type.
 #
-# Volatile fields are masked. They were determined empirically (two identical runs
-# diffed), not guessed: .timestamp, .version (changes every release), and the randomly
-# allocated SOCKS port. If a future field is genuinely non-deterministic, mask it here
-# — never by loosening the comparison.
+# Masked fields fall into two groups, and nothing else may be added without a reason:
+#   VOLATILE  — .timestamp, .version (changes each release), the random SOCKS port.
+#   HOST/TOOLCHAIN — values that describe the machine rather than the emitter: the
+#     ports 127.0.0.1 happens to listen on (CI runners run sshd, laptops usually do
+#     not), and which optional tester binary is installed (xray-knife vs xray, which
+#     also determines probe 11 status/failure_kind). Recording these made the gate
+#     pass locally and fail on CI for three releases.
+# If a future field is genuinely non-deterministic, mask it here — never by loosening
+# the comparison itself.
 #
 #   bash tests/test_json_values_golden.sh            # verify
 #   bash tests/test_json_values_golden.sh --update   # accept an intended change
@@ -43,6 +48,18 @@ canon() {
       | .version   = "<masked>"
       | (if (.probes.xray_full_config? // empty) | type == "object"
            then .probes.xray_full_config.socks_port_used = "<masked>" else . end)
+      # --- fields that describe the HOST the test runs on, not the emitter ---
+      # The fixture points at 127.0.0.1, so host-exposure reports whatever this machine
+      # happens to listen on (a CI runner has sshd; a laptop usually does not).
+      | (if (.probes.host_exposure? // empty) | type == "object"
+           then .probes.host_exposure.open_ports = "<masked>" else . end)
+      # Probe 11 picks whichever optional tester is installed (xray-knife vs xray), and
+      # its status/failure_kind follow from that choice — toolchain, not wiring.
+      | (if (.probes.xray_protocol? // empty) | type == "object"
+           then .probes.xray_protocol.tester_binary = "<masked>"
+              | .probes.xray_protocol.status        = "<masked>"
+              | .probes.xray_protocol.failure_kind  = "<masked>"
+           else . end)
       '
 }
 

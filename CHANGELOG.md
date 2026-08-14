@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.12.3] - 2026-08-13
+
+### Fixed
+- **CI's `full suite (with xray-core)` job had been failing since 1.12.0 — the fault was in the new value gate, not the tool.** `tests/test_json_values_golden.sh` recorded the *whole* emitted JSON, which includes fields describing the **machine the test runs on** rather than the emitter's wiring, so a blob recorded on one host could never match another:
+  - `host_exposure.open_ports` — the fixture targets `127.0.0.1`, so this reports whatever the host listens on. A GitHub runner runs `sshd` (`["22(SSH)"]`); a laptop typically does not (`[]`).
+  - `xray_protocol.tester_binary` — probe 11 picks whichever optional tester is installed (`xray-knife` locally vs `xray` on CI), and `status` / `failure_kind` follow from that choice (`failed`/`other` vs `unavailable`/`null`).
+  Those four fields are now masked alongside the volatile ones, with the rule documented in the test header: mask only VOLATILE values or values describing the HOST/TOOLCHAIN — never loosen the comparison itself. Verified three ways: deterministic across repeat runs, still passing when `xray-knife` is made unavailable (the exact CI condition), and still failing on a deliberately injected wiring change, so the gate has not been weakened into a no-op.
+
 ## [1.12.2] - 2026-08-13
 
 ### Fixed

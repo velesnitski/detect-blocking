@@ -61,6 +61,26 @@ Pattern:
 - **Never rename/remove a `--json` key** without bumping `schema_version`.
   `tests/test_json_schema_golden.sh` enforces this; after an *additive* change,
   refresh the snapshot with `bash tests/test_json_schema_golden.sh --update`.
+- **The full-output gate** (`tests/test_json_values_golden.sh`) compares every emitted
+  *value*, not just key paths, so it catches a field landing in the wrong key — the
+  failure mode the path-only gate cannot see. Only two kinds of field may be masked:
+  genuinely VOLATILE (timestamp, version, random port) and HOST/TOOLCHAIN-dependent
+  (what `127.0.0.1` listens on, which optional binary is installed). Never loosen the
+  comparison instead of masking; recording a host-dependent value made CI red for three
+  releases while every local run passed.
+
+### Mutation testing — are the tests load-bearing?
+
+`bash scripts/mutation-test.sh` re-introduces each historical bug as a mutant and
+requires the test that guards it to FAIL. `killed` means that test genuinely protects
+the invariant; `SURVIVED` is a coverage gap. A mutant whose source text has moved
+reports `STALE` rather than being skipped, so the harness cannot rot into false
+confidence. It rewrites `detect_blocking.sh` in place and restores it via a trap on
+every exit path, and exits non-zero if anything survives — so it can be used as a gate.
+
+Run it after touching any classifier or failure path. **When you fix a bug of the
+recurring kind — a default or fallback value standing in for a measurement that never
+happened — add a mutant for it**, so the next refactor cannot quietly reinstate it.
 
 ## Releasing
 

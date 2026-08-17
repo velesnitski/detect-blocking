@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.0] - 2026-08-17
+
+### Added
+- **Mutation testing (`scripts/mutation-test.sh`) — verification that the suite is load-bearing.** Every defect real-world use has found in this tool has had one shape: a default or fallback value standing in for a measurement that never happened. Each fix installed an invariant and a test, but a passing test proves nothing about whether it would *notice* the bug returning. This harness re-introduces each historical bug as a mutant, runs the test meant to object, and requires that test to **fail**: `killed` means the invariant is genuinely guarded, `SURVIVED` is a coverage gap. Eleven mutants cover the tri-state classifiers (localize reachability, TLS field parity, CDN detection, DNS-block, whitelist quadrants, OpenVPN posture ordering), the code-keyed false-positive suppressor, label-anchored SNI keywords, HTTP/3 parity, the target-normalization host guard, and the full-output JSON gate. Current result: **11 killed, 0 survived, 0 stale.**
+  - A mutant whose source text has moved reports **STALE** instead of being silently skipped, so the harness cannot rot into false confidence as the code changes.
+  - It rewrites `detect_blocking.sh` in place and restores it through a trap on every exit path (interrupts included), and exits non-zero if anything survives or goes stale, so it is usable as a gate. Verified to discriminate: a deliberately cosmetic mutation is correctly reported as SURVIVED.
+  - Not part of `tests/run.sh` — it is a deliberate, on-demand check. Documented in CONTRIBUTING with the rule that fixing another bug of this family should come with a new mutant.
+
 ## [1.12.5] - 2026-08-17
 
 ### Fixed

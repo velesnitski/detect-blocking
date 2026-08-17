@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.12.5] - 2026-08-17
+
+### Fixed
+- **A URL or `host:port` target produced a false "domain is blocked" verdict.** The positional target is a HOST, but `--xray-config` takes a URL — so pasting `https://host/path` into the target slot is a natural slip, and it was misleadingly fatal: the entire string went to DNS, resolved to nothing, and the run concluded *"Domain unresolvable (DoH also blocked or domain offline)"* about a perfectly healthy domain, recommended debugging the resolver, and skipped every transport probe as collateral. `host:8443` failed the same way, since that is not a resolvable name either. Targets are now normalized by the new pure `_normalize_target` — scheme, `#fragment`, `?query`, `/path` and `user:pass@` are stripped, a numeric `:port` is adopted when `VPN_PORT_TCP` is unset — and the substitution is **announced**, so a run never silently probes something other than what was typed. A bare IPv6 literal is left intact (its colons are not a port), bracketed `[IPv6]:port` is split correctly, and a non-numeric `:suffix` is discarded while keeping the host. Plain hosts and IPs pass through with no note, and the normalizer **refuses to return a non-host**: if stripping would not leave something hostname-shaped it returns the caller's string untouched and stays silent — without that guard, a `--from-file` line containing a `#` (the batch matcher deliberately accepts an indented comment as a host) was reduced to whitespace and silently replaced the target. Covered by `tests/test_target_normalize.sh`.
+
 ## [1.12.4] - 2026-08-13
 
 ### Changed

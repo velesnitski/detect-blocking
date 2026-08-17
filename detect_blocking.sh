@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="1.12.4"
+readonly DETECT_BLOCKING_VERSION="1.12.5"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -75,6 +75,38 @@ check_cmd() { command -v "$1" >/dev/null 2>&1; }
 # a case-insensitive `-d` egress-guard mis-flags). New network calls should use it;
 # existing call sites migrate on touch. Extra flags/URL pass through: _curl -L "$u".
 _curl() { curl -sS --max-time "${TIMEOUT:-10}" "$@"; }
+# Normalize a target the user may have pasted as a URL or host:port. This tool takes a
+# HOST, but --xray-config takes a URL, so pasting "https://host/path" into the positional
+# slot is a natural slip — and it used to be MISLEADINGLY fatal: the whole string went to
+# DNS, resolved to nothing, and the run concluded "Domain unresolvable (DoH also blocked
+# or domain offline)" about a perfectly healthy domain, then advised debugging the
+# resolver. Same for "host:8443", which is not a resolvable name either.
+# Echoes "host<TAB>port" (port empty when absent). Leaves a bare IPv6 literal alone.
+_normalize_target() {
+  local t="${1-}" port=""
+  t=${t#*://}                       # strip scheme://
+  t=${t%%#*}                        # strip #fragment
+  t=${t%%\?*}                       # strip ?query  (can follow host:port with NO path)
+  t=${t%%/*}                        # strip /path
+  t=${t##*@}                        # strip user[:pass]@
+  case "$t" in
+    \[*\]*)                         # [IPv6]:port
+      port=${t##*\]}; port=${port#:}
+      t=${t%%\]*}; t=${t#\[} ;;
+    *:*:*) : ;;                     # bare IPv6 literal — a colon is not a port here
+    *:*) port=${t##*:}; t=${t%%:*} ;;
+  esac
+  case "$port" in ''|*[!0-9]*) port="" ;; esac
+  # Refuse to "normalize" into something that is not a host. Stripping is only correct
+  # when the result still looks like a hostname/IP — otherwise leave the caller's string
+  # completely alone. Without this, a batch input line such as a comment ("  # note...")
+  # was reduced to whitespace by the fragment strip, silently replacing the target.
+  case "$t" in
+    ''|*[!A-Za-z0-9._:-]*) printf '%s\t' "${1-}"; return 0 ;;
+  esac
+  printf '%s\t%s' "$t" "$port"
+}
+
 # Guard a required-value flag: if its value is missing or looks like another flag,
 # the value was omitted and the flag swallowed the next flag (e.g.
 # `--xray-config-json --stub-dialer <path>`). Die with the correct order. Runs as
@@ -342,6 +374,20 @@ while [ $# -gt 0 ]; do
     *)  VPN_HOST="${1}"; shift ;;
   esac
 done
+
+# Normalize a URL- or host:port-shaped positional target down to a bare host (see
+# _normalize_target). Announce it, so the run is never silently probing something other
+# than what the operator typed.
+if [ -n "${VPN_HOST:-}" ]; then
+  _nt=$(_normalize_target "$VPN_HOST")
+  _nt_host=${_nt%%	*}; _nt_port=${_nt##*	}
+  if [ -n "$_nt_host" ] && [ "$_nt_host" != "$VPN_HOST" ]; then
+    printf '%s\n' "note: target '${VPN_HOST}' is a URL/host:port — probing host '${_nt_host}'$( [ -n "$_nt_port" ] && printf " on port %s" "$_nt_port" ) (this tool takes a HOST; a URL would fail DNS and read as 'domain unresolvable')" >&2
+    VPN_HOST="$_nt_host"
+    [ -n "$_nt_port" ] && [ -z "${VPN_PORT_TCP:-}" ] && VPN_PORT_TCP="$_nt_port"
+  fi
+  unset _nt _nt_host _nt_port
+fi
 
 # --xray-only runs only the Xray-protocol probes, which need a config to test.
 if [ "${XRAY_ONLY:-}" = "1" ] && [ -z "$XRAY_CONFIG" ] && [ -z "$XRAY_JSON_CONFIG" ]; then

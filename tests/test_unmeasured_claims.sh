@@ -3,7 +3,7 @@
 # tests/test_unmeasured_claims.sh — two guards against the recurring failure mode in
 # this codebase: reporting a conclusion that was never actually measured.
 #
-# Both were found on a real in-region run whose output contradicted itself.
+# Both were found on a run whose output contradicted itself.
 #
 # (a) The YouTube "egress is blocked by Google" verdict may only be raised when probe 12
 #     PROVED the tunnel carries traffic. When probe 12 also failed, "YouTube unreachable"

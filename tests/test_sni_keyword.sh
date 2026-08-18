@@ -4,8 +4,8 @@
 # A passive SNI blocklist matches an antagonistic cover domain directly, so this is
 # the cheapest detection a censor has. Censor NAMES (rkn / tspu) must match on label
 # boundaries only: before 1.10.2 the patterns were hyphen-anchored (`*-rkn*`/`*rkn-*`)
-# to avoid firing on innocent substrings, which meant a dot-delimited label such as
-# `blocked.rkn` slipped through and scored only as the softer NXDOMAIN tell.
+# to avoid firing on innocent substrings — which meant a dot-delimited label slipped
+# through and scored only as the softer NXDOMAIN tell.
 set -u
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,7 +26,7 @@ for s in rkn rkn.example.com blocked.rkn foo.rkn.bar my-rkn.com rkn-block.net \
   [ "$(_sni_keyword_hit "$s")" = "1" ] || fail "censor-name keyword should flag: $s"
 done
 # case-insensitive
-[ "$(_sni_keyword_hit 'FUCK.RKN')" = "1" ] || fail "matching must be case-insensitive"
+[ "$(_sni_keyword_hit 'BLOCKED.RKN')" = "1" ] || fail "matching must be case-insensitive"
 
 # ---- must NOT flag: innocent domains that merely CONTAIN the letters ----
 # darkness / networking / workname all contain "rkn"; tsputnik contains "tspu".

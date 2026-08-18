@@ -4284,7 +4284,7 @@ probe_yt_reach() {
       # Blaming the EGRESS only makes sense if the tunnel demonstrably carries traffic.
       # When probe 12 also failed, "YouTube unreachable" is a restatement of "the tunnel
       # is dead" and says nothing about egress reputation — asserting it anyway sends the
-      # operator to audit a healthy egress. (Seen on a real in-region run: the tool said
+      # operator to audit a healthy egress. (Seen in practice: the tool said
       # the tunnel carried nothing AND that Google had listed the egress, in one report.)
       if [ "${XRAY_JSON_STATUS:-}" = "ok" ]; then
         warn "0/${n} — YouTube is unreachable through a WORKING tunnel (probe 12 passed); the egress IP is likely blocked/listed by Google, or routing drops these destinations"
@@ -6323,8 +6323,9 @@ probe_xray_mtu() {
 #
 # Censor-name terms (rkn / tspu) are matched on LABEL BOUNDARIES only (start, end, `.`
 # or `-`), never as a bare substring: plenty of innocent domains contain those letters
-# (`workname.com` contains "rkn"). Anchoring is why `blocked.rkn` used to slip through —
-# the old patterns required a hyphen, so a dot-delimited label never matched.
+# (`workname.com` contains "rkn"). Anchoring is why a label such as `blocked.rkn` used
+# to slip through: the old patterns required a hyphen, so a dot-delimited label never
+# matched.
 _sni_keyword_hit() {
   local sni_lc
   sni_lc=$(printf '%s' "${1-}" | tr '[:upper:]' '[:lower:]')

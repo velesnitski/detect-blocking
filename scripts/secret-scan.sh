@@ -89,5 +89,15 @@ if [ -s "$findings" ]; then
   exit 1
 fi
 rm -f "$findings"
-echo "secret-scan: clean (${#files[@]} file(s) scanned)"
+# A guard that quietly does nothing is worse than none: it reads green. If the
+# deny-list never loaded, say so on the same line as the verdict — "clean" from a
+# run that only enforced the generic layer is a weaker claim, and the reader
+# cannot tell the two apart otherwise.
+if [ -z "$BANNED" ]; then
+  echo "secret-scan: clean (${#files[@]} file(s) scanned) — LAYER 1 NOT ENFORCED" >&2
+  echo "  The deny-list is unconfigured, so only generic credential patterns ran." >&2
+  echo "  Set SECRET_SCAN_BANNED, or create scripts/.banned (see .banned.example)." >&2
+  exit 0
+fi
+echo "secret-scan: clean (${#files[@]} file(s) scanned; deny-list enforced)"
 exit 0

@@ -88,6 +88,6 @@ cat > "$TMP/twofleet.json" <<EOF
   {"tag":"direct","protocol":"freedom"} ] }
 EOF
 [ "$(_fleet_tags "$TMP/twofleet.json" | tr '\n' ' ')" = "a b " ] \
-  || fail "_fleet_tags should keep both endpoints of a real 2-node fleet (got: $(_fleet_tags "$TMP/twofleet.json" | tr '\n' ' '))"
+  || fail "_fleet_tags should keep both endpoints of a two-entry fleet fixture (got: $(_fleet_tags "$TMP/twofleet.json" | tr '\n' ' '))"
 
 echo "PASS: dialerProxy chain recognized (local/remote/broken/none), JSON flags, tunnel-failure caveat, fleet excludes the dialer helper"

@@ -8,7 +8,7 @@
 # misleadingly fatal: the whole string went to DNS, resolved to nothing, and the run
 # concluded "Domain unresolvable (DoH also blocked or domain offline)" about a healthy
 # domain — then advised debugging the resolver, while every transport probe skipped as
-# collateral. Seen on a real run against a live, reachable host.
+# collateral. Seen against a reachable host.
 set -u
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"

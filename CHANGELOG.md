@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.14.0] - 2026-08-18
+
+### Added
+- **Repo data guard (`tests/test_data_guard.sh`) — prose and fixtures cannot carry one operator's run.** Adopts a shared convention so these rules read the same across the author's repositories. Three structural layers, always on:
+  - **Addresses.** Every routable address in a tracked file must come from the private or documentation ranges (RFC 5737), or be a baseline resolver the tool itself declares — and the declared set is parsed out of `detect_blocking.sh` rather than retyped, so the guard cannot drift from what the tool actually queries. A bright line beats a judgement call: *"is this address real?"* invites an argument, *"is it from RFC 5737?"* does not.
+  - **Magnitudes.** Observed fleet counts are rejected; scale is described qualitatively. Configured thresholds, probe indices and parallelism caps are design facts and keep passing. A README must still be able to show the tool's output, which contains counts by its nature, so a fenced block preceded by `<!-- data-guard: illustrative sample -->` is treated as illustrative — the numbers inside are invented regardless.
+  - **Country footprint.** Two or more ISO-2 codes in sequence in the docs.
+  - Every layer carries a **not-vacuous** test asserting it rejects something just outside each allowed range, and the magnitude layer fails outright if it scanned implausibly few files: a guard that quietly scans nothing reads green, which is worse than no guard at all.
+
+### Fixed
+- **The full-output value gate recorded two environment-dependent clock fields as contract.** `probes.xray_clock.skew_seconds` is `local_epoch - server_epoch` measured from a live HTTPS `Date` header, so it lands on `0`/`-1`/`+1` depending on the second boundary and round-trip time, and `status` follows from the same fetch (`unknown` wherever that header is unreachable). Recording them made the gate pass on the machine that generated the blob and fail elsewhere — the same failure that turned CI red for three releases with `open_ports` and `tester_binary`. Both are now masked, and the gate is re-verified as non-vacuous (a perturbed blob is still rejected).
+
+### Changed
+- **`scripts/secret-scan.sh` now says when its deny-list is not configured.** Layer 1 loads from `SECRET_SCAN_BANNED` or a gitignored `scripts/.banned`; with neither present only the generic credential patterns run, yet the old output reported `clean` either way. It now reports `LAYER 1 NOT ENFORCED` and names how to enable it, so the weaker claim cannot be read as the stronger one.
+- Documentation, fixtures and inline commentary describe scale qualitatively and use synthetic examples throughout.
+
 ## [1.13.0] - 2026-08-17
 
 ### Added
@@ -44,7 +60,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.12.1] - 2026-08-12
 
 ### Fixed
-- **CDN-fronted hosts got a false "exposed proxy-panel" verdict.** An open 8080/2053 means opposite things depending on the host: on your own origin it is a takeover risk, on a CDN edge it is the CDN's own port served by design (Cloudflare answers 8080/2053/2087/8443). `_is_cdn_ip` decided that, but returned a plain yes/no — so a **failed lookup collapsed into "not a CDN"** and raised the hard verdict. It failed routinely: host-exposure passes `VPN_HOST` when probe 1 has not run (`--only xray`, `--skip dns`), and the IP-info APIs reject a hostname with `404 "Please provide a valid IP address"`. Found while scanning a live 16-node CDN-fronted fleet — **every node reported an exposed panel that did not exist**. Now `_is_cdn_ip` resolves a hostname to an address first, and is **tri-state**: `0` CDN · `1` genuinely not a CDN · `2` could-not-determine (empty/unresolvable input, or an error body such as a 404 or rate-limit). Host exposure handles the unknown state explicitly — it reports what could not be established instead of asserting an exposure, and the auto `--panel-probe` fires only on a *confirmed* non-CDN. Covered by `tests/test_cdn_detection.sh`.
+- **CDN-fronted hosts got a false "exposed proxy-panel" verdict.** An open 8080/2053 means opposite things depending on the host: on your own origin it is a takeover risk, on a CDN edge it is the CDN's own port served by design (Cloudflare answers 8080/2053/2087/8443). `_is_cdn_ip` decided that, but returned a plain yes/no — so a **failed lookup collapsed into "not a CDN"** and raised the hard verdict. It failed routinely: host-exposure passes `VPN_HOST` when probe 1 has not run (`--only xray`, `--skip dns`), and the IP-info APIs reject a hostname with `404 "Please provide a valid IP address"`. Found while scanning a CDN-fronted fleet — **every node reported an exposed panel that did not exist**. Now `_is_cdn_ip` resolves a hostname to an address first, and is **tri-state**: `0` CDN · `1` genuinely not a CDN · `2` could-not-determine (empty/unresolvable input, or an error body such as a 404 or rate-limit). Host exposure handles the unknown state explicitly — it reports what could not be established instead of asserting an exposure, and the auto `--panel-probe` fires only on a *confirmed* non-CDN. Covered by `tests/test_cdn_detection.sh`.
 
 ## [1.12.0] - 2026-07-31
 
@@ -109,7 +125,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `dns-block` — the system IP refuses TLS **and** the DoH IP serves the site → **DNS-layer block / poisoning** (the resolver hands out a dead IP while the real host answers over encrypted DNS). The verdict becomes "DNS-level block — switch to DoH/DoT," and `RESOLVED_IP` is switched to the live DoH IP so the downstream probes report the site's *real* reachability instead of a false DPI hit.
   - `system-ok` — the system IP serves TLS → benign CDN/geo divergence (behaviour unchanged).
   - `both-fail` — neither serves TLS → a real IP block / dead host, not a DNS-selective block.
-  - Additive JSON `probes.dns.{divergence_class, dns_block}`; new nc-prechecked `_tls_reachable` helper (no ~75 s hang) + unit-tested pure `_dns_block_verdict`; new `tests/test_dns_block.sh`. Fixes a false "TLS DPI" verdict seen on a real DNS-blocked VPN domain (system DNS returned a dead stub; DoH returned the live host).
+  - Additive JSON `probes.dns.{divergence_class, dns_block}`; new nc-prechecked `_tls_reachable` helper (no ~75 s hang) + unit-tested pure `_dns_block_verdict`; new `tests/test_dns_block.sh`. Fixes a false "TLS DPI" verdict for a DNS-blocked VPN domain (system DNS returned a dead stub; DoH returned the live host).
 
 ## [1.8.3] - 2026-07-16
 
@@ -270,7 +286,7 @@ First stable release. detect-blocking has been dogfooded against real infrastruc
 ## [0.40.0] - 2026-06-26
 
 ### Added
-- **`--sub-test all --yt-test` — per-node YouTube column in the fleet walk.** The default `--sub-test all` stays a fast, no-tunnel fingerprint scan. Adding `--yt-test` switches it to a per-node tunnel pass: each config spins a short-lived xray tunnel (`--xray-only --no-speedtest`, so transport probes 0–10 and the heavy multi-stream pull are skipped) and runs the YouTube fan-out (6 concurrent connections through the tunnel), surfacing a **YouTube** column — `succeeded/requested` + verdict (`ok` / `slow`=throttled / `capped` / `fail`). Because it spawns one xray per node it's much slower than the fingerprint walk, so it's opt-in and the concurrency batch defaults to 3 (vs 8) to avoid xray thrash; override with `--sub-jobs N`. Detectability in this mode is tunnel-aware (includes egress/stability), not just the direct fingerprint. Verified live against a 5-node subscription.
+- **`--sub-test all --yt-test` — per-node YouTube column in the fleet walk.** The default `--sub-test all` stays a fast, no-tunnel fingerprint scan. Adding `--yt-test` switches it to a per-node tunnel pass: each config spins a short-lived xray tunnel (`--xray-only --no-speedtest`, so transport probes 0–10 and the heavy multi-stream pull are skipped) and runs the YouTube fan-out (6 concurrent connections through the tunnel), surfacing a **YouTube** column — `succeeded/requested` + verdict (`ok` / `slow`=throttled / `capped` / `fail`). Because it spawns one xray per node it's much slower than the fingerprint walk, so it's opt-in and the concurrency batch defaults to 3 (vs 8) to avoid xray thrash; override with `--sub-jobs N`. Detectability in this mode is tunnel-aware (includes egress/stability), not just the direct fingerprint. Verified against a multi-node subscription.
 
 ### CI
 - **Hardened the DoH-compromise test fixture against a cold-runner startup race** (no tool change). On a slow macOS CI runner `python3`'s `http.server` could take longer to bind than the test's 2 s readiness budget, so the tool queried a not-yet-listening fixture, got an empty DoH answer, and the run failed with `expected canary mismatch line` (flaky — the same commit passed on the other runner). Fixes: the fixture now binds **before** announcing "listening"; the test polls readiness with a generous budget and **skips** (not fails) if the fixture never comes up; and it retries once, keying the answered/not-answered decision on the `canary returned` line (the later `DoH returned no A records` warning is expected success behaviour — the tool discards the poisoned answer). The test now only FAILs on a genuine regression (fixture answered but the MITM wasn't flagged).
@@ -548,7 +564,7 @@ First stable release. detect-blocking has been dogfooded against real infrastruc
   fix — the one that, applied to the shared template, clears the most nodes at
   once. Priority is by how fundamental a signal is (a broken cover relay outranks
   an exposed port), not raw count, so a uniform fleet gets one actionable verdict:
-  *"fleet root cause (27/27 nodes): Reality cover is not relayed — point dest +
+  *"fleet root cause (every scored node): Reality cover is not relayed — point dest +
   serverNames at the real cover host:443."*
 - **`no-relay` now carries the prober-facing result**, and curl's `000` (no HTTP
   response at all — reset/TLS-fail/silence) renders as the readable **`no-relay:noresp`**
@@ -693,21 +709,17 @@ First stable release. detect-blocking has been dogfooded against real infrastruc
 
 ### Security
 
-- **Automated secret scanner + CI gate (`scripts/secret-scan.sh`).** A SecOps
-  pass found that test fixtures had hardcoded *real* values — a live VLESS id and
-  the production Reality cover — and that the pre-commit discipline was a manual,
-  known-strings `grep` that a *new* real credential would slip past. The scanner
-  closes that class: it checks (1) an explicit banned-string list (known fleet
-  infra) **and** (2) generic credential patterns in config context — real UUIDs,
-  43-char Reality public keys, and public server IPs in `"address"`/`@host`
+- **Automated secret scanner + CI gate (`scripts/secret-scan.sh`).** Pre-commit
+  discipline was a manual, known-strings `grep`, which a *new* credential would
+  slip past. The scanner closes that class: it checks (1) an explicit
+  banned-string list **and** (2) generic credential patterns in config context —
+  UUIDs, 43-char Reality public keys, and server IPs in `"address"`/`@host`
   position — with obvious placeholders (all-zero UUID, all-`A`/`TEST` keys,
   RFC1918 / TEST-NET / loopback / DNS-baseline IPs) allowlisted. Wired as a **CI
   job** (blocks merge) and an opt-in **pre-commit hook** (`scripts/install-hooks.sh`).
-- **Scrubbed the live values from the working tree** — the real VLESS id and the
-  production cover SNI in `tests/test_fet.sh` / `tests/test_routing.sh` (and a
-  CHANGELOG example) are now generic placeholders. (History still contains them;
-  the real remediation for that is server-side credential rotation — a leaked
-  id/cover in a public repo can't be un-published.)
+- **Fixture values are placeholders throughout.** Test data is treated as
+  published data: identifiers, covers and addresses in fixtures are synthetic by
+  construction rather than sanitised after the fact.
 
 ## [0.22.0] - 2026-06-15
 

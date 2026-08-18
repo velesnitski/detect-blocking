@@ -149,8 +149,8 @@
       "status": "skipped"
     },
     "xray_clock": {
-      "skew_seconds": 0,
-      "status": "ok"
+      "skew_seconds": "<masked>",
+      "status": "<masked>"
     },
     "xray_cover": {
       "chain_valid": null,

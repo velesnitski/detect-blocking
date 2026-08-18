@@ -665,30 +665,32 @@ fingerprint walk (batch defaults to 3; `--sub-jobs N` to change):
 ./detect_blocking.sh --subscription 'https://example.com/sub/<token>' --sub-test all --yt-test
 ```
 
+<!-- data-guard: illustrative sample -->
 ```
-== Subscription fleet scan — 28 configs (fingerprint-only, no tunnel) ==
+== Subscription fleet scan — 4 configs (fingerprint-only, no tunnel) ==
   fp = deployment template (same fp = same server build); per-node signals are in the 'signal matrix' below
   #   remarks         server:port                cover              detect       fp
   0   Auto            edge01.example.net:443     www.microsoft.com  100/critical abcdef01
-  7   Country B       edge07.example.net:443     news.example.io    70/critical  abcdef01
-  9   Country C       edge09.example.net:8443    cdn.example.io     60/high      a1b2c3d4
-  fleet detectability: 27 critical · 1 high · 0 moderate · 0 low · 0 unreachable …
+  1   Region A        edge02.example.net:443     www.microsoft.com  100/critical abcdef01
+  2   Region B        edge03.example.net:443     news.example.io    70/critical  abcdef01
+  3   Region C        edge04.example.net:8443    cdn.example.io     60/high      a1b2c3d4
+  fleet detectability: 3 critical · 1 high · 0 moderate · 0 low · 0 unreachable …
   signal matrix (x = signal fired; rows grouped by identical signal-set, most common first; 'total' = nodes per signal):
     nodes                         SS CI CN NR TP SI NX CO NP UT EX
-    [0-6,8,10-27] (26)            x  x  x  x  x  x  .  x  .  x  x
-    [7] (1)                       x  x  x  .  .  .  x  .  .  x  x
-    [9] (1)                       .  .  .  .  .  .  .  x  x  .  x
-    total                         27 27 27 26 26 26 1  27 1  27 28
+    [0-1] (2)                     x  x  x  x  x  x  .  x  .  x  x
+    [2] (1)                       x  x  x  .  .  .  x  .  .  x  x
+    [3] (1)                       .  .  .  .  .  .  .  x  x  .  x
+    total                         3  3  3  2  2  2  1  3  1  3  4
     legend: SS=self-signed CI=chain-invalid CN=cn!=sni NR=no-relay TP=tls-parity SI=sni!=ip NX=sni-nxdomain CO=cover-obscure NP=non443 UT=utls-rare EX=exposed
   remediation plan (fixes ranked by nodes affected; a node may need several):
-    1. [27 node(s): 0-6,8-27] Reality cover not relayed / cover-cert invalid — point Reality dest + serverNames at the real cover host:443 (server-side; clears self-signed/chain/cn/no-relay/parity at once)
-    2. [28 node(s): 0-27] Management/SSH port(s) open on the VPN IP — firewall so only 443 is reachable from outside
-    3. [4 node(s): 7,9,16,22] Cover SNI does not resolve or is a low-quality/self-owned domain — use a real, resolvable, popular HTTPS cover the server relays to
-    4. [1 node(s): 9] Listener on a non-standard port — move it to 443
+    1. [3 node(s): 0-2] Reality cover not relayed / cover-cert invalid — point Reality dest + serverNames at the real cover host:443 (server-side; clears self-signed/chain/cn/no-relay/parity at once)
+    2. [4 node(s): 0-3] Management/SSH port(s) open on the VPN IP — firewall so only 443 is reachable from outside
+    3. [2 node(s): 2,3] Cover SNI does not resolve or is a low-quality/self-owned domain — use a real, resolvable, popular HTTPS cover the server relays to
+    4. [1 node(s): 3] Listener on a non-standard port — move it to 443
   bottom line:
-    · uniformity: 2 deployment template(s); abcdef01 covers 27/28 scored nodes — a server-side template fix touches most of the fleet at once
-    · single-probe identifiable: 28/28 present a self-signed/mismatched cover cert — one unauthenticated TLS connection to the listener is enough to flag the IP
-    · residual after fix #1 (relay the cover): exposed(28) cover-obscure(27) non443(1) — cleared by fixes #2+
+    · uniformity: 2 deployment template(s); abcdef01 covers 3/4 scored nodes — a server-side template fix touches most of the fleet at once
+    · single-probe identifiable: 3/4 present a self-signed/mismatched cover cert — one unauthenticated TLS connection to the listener is enough to flag the IP
+    · residual after fix #1 (relay the cover): exposed(4) cover-obscure(3) non443(1) — cleared by fixes #2+
   deep-test any server (tunnel + throughput + stability) with: --sub-test N
 ```
 

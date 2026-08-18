@@ -60,6 +60,15 @@ canon() {
               | .probes.xray_protocol.status        = "<masked>"
               | .probes.xray_protocol.failure_kind  = "<masked>"
            else . end)
+      # The clock probe fetches a live HTTPS `Date` header and reports
+      # `local_epoch - server_epoch`. That is a property of this machine and this
+      # moment — it lands on 0/-1/+1 depending on the second boundary and RTT — and
+      # `status` follows from the same fetch (`unknown` wherever the header is
+      # unreachable). Both describe the environment, not the emitter.
+      | (if (.probes.xray_clock? // empty) | type == "object"
+           then .probes.xray_clock.skew_seconds = "<masked>"
+              | .probes.xray_clock.status       = "<masked>"
+           else . end)
       '
 }
 

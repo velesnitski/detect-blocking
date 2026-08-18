@@ -40,7 +40,7 @@
 
 set -u
 
-readonly DETECT_BLOCKING_VERSION="1.13.0"
+readonly DETECT_BLOCKING_VERSION="1.14.0"
 
 # ============================================================================
 # FILE MAP — single-file by design (copy & run, no install). Jump to a section
@@ -4606,7 +4606,7 @@ probe_subscription_walk() {
   fi
 
   # Probe the fleet CONCURRENTLY in batches of $jobs (each _walk_one writes its own
-  # row file → no shared state, no interleaved output). A 28-node fleet goes from
+  # row file → no shared state, no interleaved output). A large fleet goes from
   # minutes to seconds; --sub-jobs 1 forces serial. In YT mode each job spawns a
   # full tunnel, so default to a smaller batch (3) to avoid xray thrash.
   local _defjobs=8; [ "$yt_mode" = 1 ] && _defjobs=3

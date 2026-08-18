@@ -9,7 +9,7 @@
 # Before 1.12.1 it did not: a failed lookup collapsed into "not a CDN" and produced a
 # false takeover verdict on CDN-fronted hosts. That fired routinely, because the
 # caller passes VPN_HOST when probe 1 has not run (--only xray / --skip dns) and the
-# IP-info APIs 404 on a hostname. Found on a live 16-node CDN-fronted fleet: every
+# IP-info APIs 404 on a hostname. Found on a CDN-fronted fleet: every
 # node reported an exposed panel that did not exist.
 set -u
 

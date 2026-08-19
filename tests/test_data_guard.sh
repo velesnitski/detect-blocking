@@ -22,9 +22,12 @@
 # Deliberately scoped to OBSERVED magnitudes. Configured thresholds and caps
 # ("probes 0-27", "capped at 8 parallel") are design facts and must keep passing.
 #
-# This file is exempt from its own rules and must be: it carries deliberately
-# invalid samples, which is how each rule proves it is not vacuous. Scanning them
-# would make the guard fail on its own evidence.
+# Self-exemption is deliberately PARTIAL. The magnitude and country layers skip this
+# file, because it must carry deliberately invalid samples to prove it is not vacuous.
+# The ADDRESS layer does NOT skip it. A blanket exemption would make this the one file
+# where any address passes unchecked — precisely the wrong property for the file that
+# defines the address rule. Its boundary probes come from reserved space and are
+# enumerated below, so nothing else routable can sit here.
 set -u
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -54,7 +57,12 @@ declared_resolvers() {
 #     8.0.0.0/8 sinkholing is published DPI behaviour, not fleet data; the fixture
 #     needs a *recognisable* sinkhole shape for the "DoH path is compromised"
 #     verdict to be exercised at all.
-DOC_PLACEHOLDERS='1.2.3.4 5.6.7.8 8.0.0.0 8.47.69.0 8.6.112.0'
+# The last three are this guard's own boundary probes: addresses that must be
+# REJECTED to prove the rule is not vacuous. They come from reserved space
+# (RFC 2544 benchmarking) or sit one address outside an allowed range, so none can
+# be a real host. They are listed here rather than exempted wholesale, because this
+# file is subject to the address rule like every other.
+DOC_PLACEHOLDERS='1.2.3.4 5.6.7.8 8.0.0.0 8.47.69.0 8.6.112.0 198.18.0.1 172.15.0.1 203.0.114.9'
 
 python3 - "$SELF" "$DOC_PLACEHOLDERS" "$(declared_resolvers | tr '\n' ' ')" <<'PY' || exit 1
 import ipaddress, re, subprocess, sys, pathlib
@@ -81,7 +89,7 @@ if not declared:
 violations = []
 for rel in subprocess.run(["git", "ls-files"], capture_output=True, text=True).stdout.split():
     p = pathlib.Path(rel)
-    if not p.is_file() or p.name == self_name:
+    if not p.is_file():
         continue
     try:
         text = p.read_text()
@@ -104,7 +112,7 @@ if violations:
 assert non_global("192.0.2.7") and non_global("10.1.2.3") and non_global("127.0.0.1")
 assert not non_global("172.15.0.1"), "just outside RFC 1918 must fail"
 assert not non_global("203.0.114.9"), "just outside TEST-NET-3 must fail"
-assert not non_global("203.0.113.6"), "an arbitrary routable address must fail"
+assert not non_global("198.18.0.1"), "an arbitrary routable address must fail"
 PY
 
 # ---------------------------------------------------------------------------

@@ -95,6 +95,12 @@ jobs:
         run: bash tests/test_smoke.sh
         timeout-minutes: 2
 
+      - name: Repo data guard (addresses / magnitudes / country footprint)
+        # Cheap and network-free, so it belongs in the fast job rather than the
+        # main-only full suite: a real address or a fleet magnitude should fail on
+        # the dev push that introduces it, not at merge time.
+        run: bash tests/test_data_guard.sh
+
       - name: DoH-compromise simulation
         run: bash tests/test_doh_compromise.sh
         timeout-minutes: 2

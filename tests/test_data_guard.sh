@@ -118,8 +118,8 @@ PY
 # ---------------------------------------------------------------------------
 # Layer 2 — magnitudes
 # ---------------------------------------------------------------------------
-# Scoped to docs, tests and the script's own comments: every magnitude leak found
-# in this repo's audit sat in one of the three.
+# Scoped to docs, tests and the script's own comments — the three places prose about
+# scale tends to accumulate.
 SELF="$SELF" python3 - <<'PY' || exit 1
 import os, re, subprocess, sys, pathlib
 

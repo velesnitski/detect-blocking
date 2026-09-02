@@ -16,7 +16,9 @@ eval "$(awk '/^_sni_keyword_hit\(\)/,/^}/' "$SCRIPT")"
 
 # ---- must FLAG: protocol vocabulary ----
 for s in myvpn.io fast-proxy.net xray.cdn v2ray.test reality.example shadowsocks.io \
-         trojan.host wireguard.net outline.dev unblock.me bypass.it censor.example; do
+         trojan.host wireguard.net outline.dev unblock.me bypass.it censor.example \
+         a.vless.io vmess-cdn.net mtproto.example socks5gate.net obfs-relay.io my-tunnel.co \
+         byedpi.test psiphon.example ultrasurf.io freegate.net singbox.dev sing-box.example; do
   [ "$(_sni_keyword_hit "$s")" = "1" ] || fail "protocol keyword should flag: $s"
 done
 
@@ -30,7 +32,10 @@ done
 
 # ---- must NOT flag: innocent domains that merely CONTAIN the letters ----
 # darkness / networking / workname all contain "rkn"; tsputnik contains "tspu".
+# sockshop / hysteria-band guard the widest of the new terms: a keyword list that
+# fires on an ordinary retailer or a band is one operators learn to ignore.
 for s in workname.com darkness.io networking.dev tsputnik.example \
+         sockshop.com hysteria-band.net rentals.example \
          www.microsoft.com storage.yandexcloud.net m.vk.com github.com ozon.ru avito.ru; do
   [ "$(_sni_keyword_hit "$s")" = "0" ] || fail "innocent domain must NOT flag: $s"
 done

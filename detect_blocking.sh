@@ -6332,7 +6332,9 @@ _sni_keyword_hit() {
   case "$sni_lc" in
     # protocol / circumvention vocabulary — distinctive enough to match anywhere
     *vpn*|*proxy*|*xray*|*v2ray*|*reality*|*shadowsock*|*trojan*|*wireguard*|*outline*\
-    |*censor*|*roskomnadzor*|*zapret*|*unblock*|*bypass*) printf '1'; return 0 ;;
+    |*censor*|*roskomnadzor*|*zapret*|*unblock*|*bypass*\
+    |*vless*|*vmess*|*mtproto*|*socks5*|*obfs*|*tunnel*\
+    |*byedpi*|*psiphon*|*ultrasurf*|*freegate*|*singbox*|*sing-box*) printf '1'; return 0 ;;
     # censor names, label-anchored (start | end | dot | hyphen delimited)
     rkn|rkn.*|*.rkn|*.rkn.*|*-rkn|*-rkn.*|*rkn-*) printf '1'; return 0 ;;
     tspu|tspu.*|*.tspu|*.tspu.*|*-tspu|*-tspu.*|*tspu-*) printf '1'; return 0 ;;

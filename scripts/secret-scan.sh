@@ -29,18 +29,43 @@ if [ -z "$BANNED" ] && [ -r "$SCRIPT_DIR/.banned" ]; then
 fi
 
 # ---- collect files ----
+# The mode is remembered for the empty-set check below: an empty --staged set is a
+# real and benign state, an empty tracked set never is.
+mode=tracked
 files=()
 if [ "${1:-}" = "--staged" ]; then
+  mode=staged
   while IFS= read -r f; do files+=("$f"); done < <(git diff --cached --name-only --diff-filter=ACM 2>/dev/null)
 elif [ "$#" -gt 0 ]; then
+  mode=explicit
   files=("$@")
 else
+  # `git ls-files` is silently empty OUTSIDE a work tree, so a no-arg run from the
+  # wrong directory collected nothing and printed a clean verdict having read not a
+  # single file — a green exit indistinguishable from a real pass. Refuse rather
+  # than infer "clean" from "could not look".
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "secret-scan: NOT INSIDE A GIT WORK TREE — refusing to report clean." >&2
+    echo "  Run it from the repository, or pass the files to scan explicitly." >&2
+    exit 2
+  fi
   # Tracked AND untracked-but-not-ignored: a brand-new file holding a secret is
   # the highest-risk case, yet `git ls-files` alone (tracked only) would skip it
   # until it's staged — so the no-arg scan would give a false "clean".
   while IFS= read -r f; do files+=("$f"); done < <(git ls-files 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
 fi
-[ "${#files[@]}" -eq 0 ] && { echo "secret-scan: nothing to scan"; exit 0; }
+
+if [ "${#files[@]}" -eq 0 ]; then
+  # Nothing staged is legitimate (e.g. a deletions-only commit: --diff-filter=ACM
+  # excludes D). Report it in words that cannot be read as a verdict.
+  if [ "$mode" = staged ]; then
+    echo "secret-scan: no staged additions — nothing was checked." >&2
+    exit 0
+  fi
+  echo "secret-scan: NO FILES TO SCAN — refusing to report clean." >&2
+  echo "  A run that reads zero files is not a clean run. Check the path/arguments." >&2
+  exit 2
+fi
 
 # A non-RFC1918 / non-reserved / non-baseline IPv4 is "public" → suspicious in a config.
 _is_public_ip() {
@@ -55,9 +80,11 @@ _is_public_ip() {
 }
 
 findings=$(mktemp "${TMPDIR:-/tmp}/secret-scan.XXXXXX") || exit 2
+scanned=0
 for f in "${files[@]}"; do
   [ -f "$f" ] || continue
   case "$f" in *secret-scan.sh) continue ;; esac   # don't scan self (holds the banned list)
+  scanned=$((scanned + 1))
   {
     # (1) banned strings, anywhere (only if a list was provided — see above)
     [ -n "$BANNED" ] && grep -niE "$BANNED" "$f" 2>/dev/null | sed "s#^#${f} [banned] #"
@@ -89,15 +116,25 @@ if [ -s "$findings" ]; then
   exit 1
 fi
 rm -f "$findings"
+
+# Collecting paths that all turn out to be unreadable or self-skipped is the same
+# failure as collecting none: the verdict would describe files nobody opened. The
+# count reported below is therefore files actually READ, not files nominated.
+if [ "$scanned" -eq 0 ]; then
+  echo "secret-scan: collected ${#files[@]} path(s) but READ NONE — refusing to report clean." >&2
+  echo "  Every path was missing, a directory, or the scanner itself." >&2
+  exit 2
+fi
+
 # A guard that quietly does nothing is worse than none: it reads green. If the
 # deny-list never loaded, say so on the same line as the verdict — "clean" from a
 # run that only enforced the generic layer is a weaker claim, and the reader
 # cannot tell the two apart otherwise.
 if [ -z "$BANNED" ]; then
-  echo "secret-scan: clean (${#files[@]} file(s) scanned) — LAYER 1 NOT ENFORCED" >&2
+  echo "secret-scan: clean (${scanned} file(s) scanned) — LAYER 1 NOT ENFORCED" >&2
   echo "  The deny-list is unconfigured, so only generic credential patterns ran." >&2
   echo "  Set SECRET_SCAN_BANNED, or create scripts/.banned (see .banned.example)." >&2
   exit 0
 fi
-echo "secret-scan: clean (${#files[@]} file(s) scanned; deny-list enforced)"
+echo "secret-scan: clean (${scanned} file(s) scanned; deny-list enforced)"
 exit 0

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`scripts/secret-scan.sh` could report a clean run having read no files at all.** The no-argument mode builds its file list from `git ls-files`, which is silently empty *outside* a work tree — so invoking the scanner by absolute path from another directory collected nothing, printed `nothing to scan` and exited **0**. A green exit was therefore indistinguishable from a genuine pass, which is the failure this guard exists to prevent: the same "a default standing in for a measurement that never happened" shape the mutation harness tracks. The no-arg mode now checks it is inside a work tree and **refuses** (exit 2) when it is not; an empty file set in tracked or explicit mode likewise refuses instead of passing. `--staged` keeps exiting 0 when nothing is staged — a deletions-only commit is a real and benign state, since `--diff-filter=ACM` excludes deletions — but says *"no staged additions — nothing was checked"* rather than a word that reads like a verdict. Covered by `tests/test_secret_scan.sh`, which also re-asserts the scanner is not vacuous.
+
+### Changed
+- **The scanned-file count now reports files actually read, not files nominated.** The loop skips paths that are missing, are directories, or are the scanner itself, so a run could announce `clean (N file(s) scanned)` for an N it never opened. The count is incremented at the point of reading, and a run that nominates paths but reads none refuses rather than reporting clean.
+
 ## [1.14.0] - 2026-08-18
 
 ### Added

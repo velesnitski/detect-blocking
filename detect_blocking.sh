@@ -54,6 +54,7 @@ readonly DETECT_BLOCKING_VERSION="1.14.0"
 #                  egress,stability,lint,clock,active-probe,fleet,routing,bufferbloat,mtu,
 #                  tls-parity,cover-throttle,detectability(+deployment fingerprint)
 #                  + SNI-privacy/ECH posture (advisory, after 26 — is the cleartext SNI hideable?)
+#                  + cover-SNI censorship (advisory — is the cover blocked BY NAME, or just the IP?)
 #                opt-in scanners: probe_cover_scan (--scan-covers), probe_censor_sweep (--censor-sweep)
 #                non-Xray: probe_hysteria (static Hysteria2/QUIC analysis; auto on a Hysteria2 config)
 #                happ://: import→unwrap, probe_happ_routing (routing-profile lint), probe_happ_crypt (encrypted)
@@ -1292,6 +1293,14 @@ XRAY_PASSIVE_COVER_OBSCURE="" # 1 / 0 — cover SNI resolves to a hosting/VPS ne
 XRAY_PASSIVE_VISION=""       # 1 protected / 0 exposed / "" n/a — VLESS-Reality uses xtls-rprx-vision (anti TLS-in-TLS)
 XRAY_TRANSPORT_MUX=""        # 1 / 0 / "" — mux.cool enabled on the proxy outbound (shape/correlation note vs vision)
 XRAY_DEPLOY_FINGERPRINT=""   # short stable hash of the config's identifying shape (provider match)
+
+# ---- Cover-SNI censorship (differential, advisory, after probe 26 — NOT scored) ----
+# Disambiguates a blocked node IP from a blocked cover serverName — two failures
+# that are indistinguishable in traffic stats (both = zero handshakes) but have
+# opposite fixes (rotate the address vs change the cover).
+COVER_CENSOR_STATUS=""          # skipped / no-origin / self-hosted / clean / sni-blocked / origin-unreachable
+COVER_CENSOR_SNI_PRESENT_OK=""  # 1 / 0 — cover serverName handshakes to its OWN origin
+COVER_CENSOR_CONTROL_OK=""      # 1 / 0 — neutral control SNI handshakes to the same origin
 
 # ---- SNI privacy / ECH posture (advisory, after probe 26 — NOT scored) ----
 # Orthogonal to probe 26's cover-SNI QUALITY: can the SNI be HIDDEN at all
@@ -6759,6 +6768,72 @@ _volume_throttle_suspected() {
 # Emits the volume-throttle advisory when the pattern holds. Advisory only — not
 # folded into the detectability score; the cause is unproven, so it points at the
 # disambiguating re-run rather than asserting a block.
+# Cover-SNI censorship (differential, advisory, direct — no tunnel).
+# Two failures look IDENTICAL in traffic stats — zero handshakes — but have
+# OPPOSITE fixes: a blocked node IP (rotate the address) vs a blocked cover
+# serverName (change the cover). A Reality cover whose name is on the censor's
+# SNI blocklist dies BY NAME at the filter regardless of the node's IP, so a
+# fresh clean address keeps failing and the operator burns addresses chasing an
+# IP block that was never there. This probe tells them apart: hit the cover's
+# OWN public origin (not our node) on the same IP twice — once with the cover
+# serverName, once with a neutral control SNI. Name fails while control succeeds
+# ⇒ the name is filtered on THIS path, independent of the node. Share-safe:
+# booleans / classes only; the cover domain is never printed (as probe 15). The
+# filter is on-path only from inside the target region, so a clean/inconclusive
+# result from elsewhere is reported vantage-limited, never as "safe".
+probe_cover_sni_censored() {
+  local sec sni q=""
+  sec=$(_xray_cfg_field security '.outbounds[0].streamSettings.security')
+  sni=$(_xray_cover_sni)
+  if [ -n "$XRAY_CONFIG" ]; then
+    case "$XRAY_CONFIG" in *\?*) q=${XRAY_CONFIG#*\?}; q=${q%%#*} ;; esac
+    [ -z "$sec" ] && sec=$(_qp "$q" security)
+    [ -z "$sni" ] && sni=$(_qp "$q" sni)
+  fi
+  # Reality-cover concern only — for plain TLS the SNI is the real host.
+  if [ -z "$sni" ] || [ "$sec" != "reality" ] || ! check_cmd openssl; then
+    COVER_CENSOR_STATUS="skipped"; return 0
+  fi
+
+  hdr "Cover-SNI censorship (differential — the name, or just the IP?)"
+
+  # The cover's OWN public origin, resolved independently of our node.
+  local origin
+  origin=$(_resolve_a_records "$sni" 2>/dev/null | _first_word)
+  if [ -z "$origin" ]; then
+    COVER_CENSOR_STATUS="no-origin"
+    warn "the cover serverName has no public A record from here → its origin can't be reached to test; a cover with no live origin is itself a tell (an active prober gets the local fallback, not the real site)"
+    return 0
+  fi
+  if [ "$origin" = "${RESOLVED_IP:-}" ] || [ "$origin" = "${VPN_HOST:-}" ]; then
+    COVER_CENSOR_STATUS="self-hosted"
+    info "the cover serverName resolves to this node itself → no independent origin to differential against (skipped)"
+    return 0
+  fi
+
+  local present control
+  _tls_reachable "$origin" "$sni"      && present=1 || present=0
+  _tls_reachable "$origin" "$FAKE_SNI" && control=1 || control=0
+  COVER_CENSOR_SNI_PRESENT_OK="$present"
+  COVER_CENSOR_CONTROL_OK="$control"
+  info "cover serverName → its own origin: $([ "$present" = 1 ] && echo OK || echo FAIL)"
+  info "neutral control SNI → same origin: $([ "$control" = 1 ] && echo OK || echo FAIL)"
+
+  if [ "$present" = 0 ] && [ "$control" = 1 ]; then
+    COVER_CENSOR_STATUS="sni-blocked"
+    fail "the cover serverName is filtered BY NAME on this path — its own origin refuses only when its SNI is sent; a neutral SNI to the same IP completes"
+    add_verdict cover-sni-censored "Cover SNI is on the censor's SNI blocklist on this path: a node using this cover fails regardless of its IP and looks identical to an IP-block in traffic stats — the fix is to change the cover, not rotate the address. Cross-check probe 3: if the node also dies only on its own serverName, it is confirmed end-to-end."
+  elif [ "$present" = 1 ]; then
+    COVER_CENSOR_STATUS="clean"
+    ok "the cover serverName handshakes to its own origin → not filtered by name on this path; a node failure with this cover is IP / fingerprint, not the name"
+    info "note: a censor's SNI filter is on-path only from inside the target region — from another vantage this clean result is vantage-limited, not proof the cover is safe"
+  else
+    COVER_CENSOR_STATUS="origin-unreachable"
+    warn "neither SNI reaches the cover's origin on this path (origin down, or the path to it is filtered) → not SNI-specific, inconclusive for the name"
+    info "note: conclusive only from inside the target region"
+  fi
+}
+
 probe_volume_synthesis() {
   [ "$XRAY_JSON_STATUS" = "ok" ] || return 0
   XRAY_VOLUME_THROTTLE_HINT=$(_volume_throttle_suspected \
@@ -7466,6 +7541,9 @@ _emit_json() {
     --arg xsp_ech_applies   "$XRAY_SNIPRIV_ECH_APPLIES" \
     --arg xsp_ech_cover     "$XRAY_SNIPRIV_ECH_COVER" \
     --arg xsp_code          "$XRAY_SNIPRIV_CODE" \
+    --arg xcc_status        "$COVER_CENSOR_STATUS" \
+    --arg xcc_present       "$COVER_CENSOR_SNI_PRESENT_OK" \
+    --arg xcc_control       "$COVER_CENSOR_CONTROL_OK" \
     --arg xtr_mux           "$XRAY_TRANSPORT_MUX" \
     --arg xd_deployfp       "$XRAY_DEPLOY_FINGERPRINT" \
     --argjson verdicts      "$verdicts_json" '
@@ -7801,6 +7879,11 @@ _emit_json() {
           ech_published_by_cover: (if $xsp_ech_cover == "1" then true elif $xsp_ech_cover == "0" then false else null end),
           posture: opt($xsp_code)
         },
+        cover_sni_censored: {
+          status: opt($xcc_status),
+          cover_origin_handshake: tri_bool(($xcc_present | tonumber? // -1)),
+          control_sni_handshake: tri_bool(($xcc_control | tonumber? // -1))
+        },
         xray_detectability: {
           status: opt($xd_status),
           score: (if $xd_score == "" then null else ($xd_score | tonumber? // null) end),
@@ -8087,6 +8170,9 @@ fi
 # SNI-privacy / ECH posture — advisory, runs AFTER the probe-26 synthesis (like
 # the volume advisory) so 26 stays the last SCORED probe. Not folded into score.
 { _should_run xray || _should_run xrayjson; } && probe_xray_sni_privacy
+# Cover-SNI censorship (differential): is the cover blocked BY NAME (change the
+# cover) or is it the node IP (rotate it)? Direct, advisory, not scored.
+{ _should_run xray || _should_run xrayjson; } && probe_cover_sni_censored
 # Cross-probe temporal synthesis — runs after the data-plane + sustained-use
 # probes so it can compare early-vs-late tunnel behaviour. Advisory only.
 [ -z "${NO_TUNNEL:-}" ] && _should_run xrayjson && probe_volume_synthesis
